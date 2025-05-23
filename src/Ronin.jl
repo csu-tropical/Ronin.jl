@@ -206,7 +206,7 @@ module Ronin
 
         task_paths::Vector{String} = [""]
         task_list::Vector{String} = [""]
-        task_weights::Vector{Vector} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
+        task_weights::Vector{Matrix{Union{Float32, Missing}}} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
 
         verbose::Bool = true 
         REMOVE_LOW_NCP::Bool = true 
