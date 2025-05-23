@@ -206,7 +206,7 @@ module Ronin
 
         task_paths::Vector{String} = [""]
         task_list::Vector{String} = [""]
-        task_weights::Vector{Matrix{Union{Float32, Missing}}} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
+        task_weights::Vector{Vector{Matrix{Union{Float32, Missing}}}} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
 
         verbose::Bool = true 
         REMOVE_LOW_NCP::Bool = true 
@@ -1475,7 +1475,10 @@ module Ronin
         ##Quick input sanitation check 
         @assert (length(config.model_output_paths) == length(config.feature_output_paths)
                  == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
-    
+        
+        if !(config.HAS_INTERACTIVE_QC)
+            throw("ERROR: Input cfradials must have interactive QC present to train a model. Set config HAS_INTERACTIVE_QC flag to true") 
+        end 
         full_start_time = time() 
         ###Iteratively train models and apply QC_scan with the specified probabilites to train a multi-pass model 
         ###pipeline 
