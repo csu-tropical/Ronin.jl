@@ -2330,7 +2330,7 @@ module Ronin
         
             ###Add information to output h5 file 
             attributes(fid)["Parameters"] = get_task_params(curr_tasks)
-            attributes(fid)["MISSING_FILL_VALUE"] = model_config.FILL_VAL
+            attributes(fid)["MISSING_FILL_VALUE"] = config.FILL_VAL
             println()
             println("WRITING DATA TO FILE OF SHAPE $(size(X))")
             println("X TYPE: $(typeof(X))")
