@@ -24,9 +24,26 @@ end
 ##Returns flattened version of NCP 
 function calc_ncp(data::NCDataset)
     ###Some ternary operator + short circuit trickery here 
-    (("NCP" in keys(data)) ? (return(data["NCP"][:]))
-                        : ("SQI" in keys(data) ||  error("Could Not Find NCP in dataset")))
-    return(data["SQI"][:])
+
+    ###Modifications for new variable names in PICCOLO 
+
+
+    # (("NCP" in keys(data)) ? (return(data["NCP"][:]))
+    #                     : ("SQI" in keys(data) ||  error("Could Not Find NCP in dataset")))
+    # return(data["SQI"][:])
+
+    if "NCP_L2" in keys(data) 
+        println("RETURNING NCP L@2")
+        return(data["NCP_L2"][:])
+    elseif "SQI_L2" in keys(data) 
+        println("RETURNING SQI L2")
+        return(data["SQI_L2"][:])
+    elseif "NCP" in valid_vars 
+        return(data["NCP"][:])
+    elseif "SQI" in valid_vars 
+        return(data["SQI"][:])
+    end 
+    error("Could not find NCP_L2, SQI_L2, NCP, or SQI in Dataset")
 end
 
 function calc_rng(data::NCDataset)
@@ -186,6 +203,17 @@ function calc_aht(cfrad::NCDataset)
     heights = repeat(transpose(cfrad["altitude"][:]), num_ranges, 1)
 
     @inbounds return(map((x,y,z) -> airborne_ht(Float32(x),Float32(y),Float32(z)), elevs, ranges, heights))
+
+end 
+
+"""
+Function used for mapping elevation angle onto a grid
+""" 
+function calc_elv(cfrad::NCDataset)
+
+    num_times = length(cfrad["time"])
+    num_ranges = length(cfrad["range"])
+    repeat(transpose(cfrad["elevation"][:]), num_ranges, 1)
 
 end 
 
