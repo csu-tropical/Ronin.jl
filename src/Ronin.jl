@@ -1745,7 +1745,7 @@ module Ronin
                 NEW_FIELD[init_idxer] = QCED_FIELDS
                 NEW_FIELD = Matrix{Union{Missing, Float32}}(reshape(NEW_FIELD, sweep_dims))
             else 
-                NEW_FIELD = missings(Float16, sweep_dims) 
+                NEW_FIELD = missings(Float32, sweep_dims) 
                 NEW_FIELD_ATTRS = Dict(
                     "units" => input_set[var].attrib["units"],
                     "long_name" => "Random Forest Model QC'ed $(var) field"
