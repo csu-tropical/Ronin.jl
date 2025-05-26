@@ -1756,7 +1756,7 @@ module Ronin
                     ###Key assumption here is that we'll always have units and fill val 
                     ###Rewrite the fill value and attributes as well 
                     input_set[var*config.QC_SUFFIX].attrib["long_name"] = NEW_FIELD_ATTRS["long_name"]
-                    input_set[var*config.QC_SUFFIX].atrrib["units"] = NEW_FIELD_ATTRS["units"]
+                    input_set[var*config.QC_SUFFIX].attrib["units"] = NEW_FIELD_ATTRS["units"]
                     ##Cannot redefine FILL VALUE 
                     #input_set[var*config.QC_SUFFIX].attrib["_FillValue"] = config.FILL_VAL
                 else 
@@ -2293,7 +2293,7 @@ module Ronin
             end 
             
             ###NEED to update this if it's beyond two pass so we can pass it the correct mask
-            X, Y, curr_idx = calculate_features(path, curr_tasks, curr_out, true; 
+            newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true; 
                                 verbose = config.verbose, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP, 
                                 REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, QC_variable = config.QC_var, 
                                 remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
