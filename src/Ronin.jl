@@ -1712,7 +1712,7 @@ module Ronin
                  == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
 
         starttime = time() 
-
+        
         input_set = redirect_stdout(devnull) do
            NCDataset(filepath, "a") 
         end 
@@ -1723,25 +1723,30 @@ module Ronin
             printstyled("QC-ING $(var) in $(filepath)\n", color=:green)
             ##Create new field to reshape QCed field to 
             NEW_FIELD = missings(Float16, sweep_dims) 
-            ##Only modify relevant data based on indexer, everything else should be fill value 
-            QCED_FIELDS = input_set[var][:][init_idxer]
 
-            NEW_FIELD_ATTRS = Dict(
-                "units" => input_set[var].attrib["units"],
-                "long_name" => "Random Forest Model QC'ed $(var) field"
-            )
-                    
-             initial_count = count(.!map(ismissing, QCED_FIELDS))
-             print("INITIAL COUNT: $(initial_count)")
-             ##Apply predictions from model 
-             ##If model predicts 1, this indicates a prediction of meteorological data 
-             QCED_FIELDS = map(x -> Bool(predictions[x[1]]) ? x[2] : missing, enumerate(QCED_FIELDS))
-             final_count = count(.!map(ismissing, QCED_FIELDS))
-             
-             ###Need to reconstruct original 
-             NEW_FIELD = NEW_FIELD[:]
-             NEW_FIELD[init_idxer] = QCED_FIELDS
-             NEW_FIELD = Matrix{Union{Missing, Float32}}(reshape(NEW_FIELD, sweep_dims))
+            if predictions != Vector{Bool}(undef, 0)
+                ##Only modify relevant data based on indexer, everything else should be fill value 
+                QCED_FIELDS = input_set[var][:][init_idxer]
+
+                NEW_FIELD_ATTRS = Dict(
+                    "units" => input_set[var].attrib["units"],
+                    "long_name" => "Random Forest Model QC'ed $(var) field"
+                )
+                        
+                initial_count = count(.!map(ismissing, QCED_FIELDS))
+                print("INITIAL COUNT: $(initial_count)")
+                ##Apply predictions from model 
+                ##If model predicts 1, this indicates a prediction of meteorological data 
+                QCED_FIELDS = map(x -> Bool(predictions[x[1]]) ? x[2] : missing, enumerate(QCED_FIELDS))
+                final_count = count(.!map(ismissing, QCED_FIELDS))
+                
+                ###Need to reconstruct original 
+                NEW_FIELD = NEW_FIELD[:]
+                NEW_FIELD[init_idxer] = QCED_FIELDS
+                NEW_FIELD = Matrix{Union{Missing, Float32}}(reshape(NEW_FIELD, sweep_dims))
+            else 
+                NEW_FIELD = missings(Float16, sweep_dims) 
+            end 
 
             try 
                 defVar(input_set, var * config.QC_SUFFIX, NEW_FIELD, ("range", "time"), fillvalue = config.FILL_VAL; attrib=NEW_FIELD_ATTRS)
@@ -1773,8 +1778,6 @@ module Ronin
         end     
         close(input_set)
     end 
-
-
 
   
 
@@ -1892,6 +1895,12 @@ module Ronin
                 else 
                     feature_mask = [true true; false false]
                 end 
+
+
+                ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file 
+                if sum(feature_mask == 0) 
+                    break 
+                end 
                 
                 ###Need to actually pass the QC mask 
                 ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds 
@@ -1900,73 +1909,80 @@ module Ronin
                     QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
                     mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
                 final_idxer = indexer 
-    
-                curr_model = models[i]
-                curr_proba = config.met_probs[i]
-                ###Here's where we need to modify. The ONLY gates that will go on to the next pass
-                ### will be the ones between the thresholds, (inclusive on both ends)
-                met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
-                curr_probs[indexer] .= met_probs[:]
                 
-                met_threshold = maximum(curr_proba) 
-                nmd_threshold = minimum(curr_proba)
+                ###If there are no gates that meet the basic QC thresholds now, we're once again done. 
+                if sum(indexer != 0) 
+
+                    curr_model = models[i]
+                    curr_proba = config.met_probs[i]
+                    ###Here's where we need to modify. The ONLY gates that will go on to the next pass
+                    ### will be the ones between the thresholds, (inclusive on both ends)
+
+                    met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                    curr_probs[indexer] .= met_probs[:]
+                    
+                    met_threshold = maximum(curr_proba) 
+                    nmd_threshold = minimum(curr_proba)
+            
+                    if i == 1
+                        init_idxer = copy(indexer)
+                        curr_Y = copy(Y)
+                        ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on 
+                        final_predictions = fill(false, sum(indexer))
+                            ###Set gates below predicted threshold to non-met 
+                        final_predictions[met_probs .< nmd_threshold] .= false
+                        final_predictions[met_probs .> met_threshold] .= true 
         
-                if i == 1
-                    init_idxer = copy(indexer)
-                    curr_Y = copy(Y)
-                    ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on 
-                    final_predictions = fill(false, sum(indexer))
-                        ###Set gates below predicted threshold to non-met 
-                    final_predictions[met_probs .< nmd_threshold] .= false
-                    final_predictions[met_probs .> met_threshold] .= true 
-    
-                elseif i == config.num_models
-                    
-                    ###Some weird syntax here because Julia doesn't like double indexing 
-                    ###Grab spots in the scan where the gates were both passing minimum quality control thresholds 
-                    ###and also have passed previous passes. Do this to ensure dimensional consistency with the 
-                    ###final prediction vector. 
-                    valid_idxs = indexer[init_idxer]
-                    ###Grab locations in the prediction vector where this pass is being applied.
-                    curr_preds = final_predictions[valid_idxs]
+                    elseif i == config.num_models
+                        ###Some weird syntax here because Julia doesn't like double indexing 
+                        ###Grab spots in the scan where the gates were both passing minimum quality control thresholds 
+                        ###and also have passed previous passes. Do this to ensure dimensional consistency with the 
+                        ###final prediction vector. 
+                        valid_idxs = indexer[init_idxer]
+                        ###Grab locations in the prediction vector where this pass is being applied.
+                        curr_preds = final_predictions[valid_idxs]
+                        ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done! 
+                        curr_preds[met_probs .>= met_threshold] .= true
+                        curr_preds[met_probs .<  nmd_threshold] .= false
+                        ###Reassign 
+                        final_predictions[valid_idxs] .= curr_preds
+                    else 
+                        ###Indexer has NOT yet been applied so index in to the existing predictions 
+                        valid_idxs = indexer[init_idxer]
+                        ###Grab locations in the prediction vector where this pass is being applied.
+                        curr_preds = final_predictions[valid_idxs]
+                        curr_preds[met_probs .< nmd_threshold] .= false
+                        curr_preds[met_probs .> met_threshold] .= true 
 
-                    ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done! 
-                    curr_preds[met_probs .>= met_threshold] .= true
-                    curr_preds[met_probs .<  nmd_threshold] .= false
-                    ###Reassign 
-                    final_predictions[valid_idxs] .= curr_preds
-                else 
-                    ###Indexer has NOT yet been applied so index in to the existing predictions 
-                    valid_idxs = indexer[init_idxer]
-                    ###Grab locations in the prediction vector where this pass is being applied.
-                    curr_preds = final_predictions[valid_idxs]
-                    curr_preds[met_probs .< nmd_threshold] .= false
-                    curr_preds[met_probs .> met_threshold] .= true 
+                        final_predictions[valid_idxs] .= curr_preds
 
-                    final_predictions[valid_idxs] .= curr_preds
-
-                end
-                close(f)
-                ###Probably need to remove this for speed purposes... keep it in memory, 
-                ###clear it for the next scan. Just pass it to QC_mask 
-                ###If this wasn't the last pass, need to write a mask for the gates to be predicted upon in the next iteration 
-                if i < config.num_models 
-                    gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
-                    
-                    if sum(gates_of_interest) == 0 
-                        break 
+                    end
+                    close(f)
+                    ###Probably need to remove this for speed purposes... keep it in memory, 
+                    ###clear it for the next scan. Just pass it to QC_mask 
+                    ###If this wasn't the last pass, need to write a mask for the gates to be predicted upon in the next iteration 
+                    if i < config.num_models 
+                        gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
+                        new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                        ###If there are no gates of interest, write out the mask as ALL MISSINGS 
+                        if sum(gates_of_interest) == 0 
+                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
+                        else 
+                            @assert length(gates_of_interest) == sum(indexer) 
+            
+                            indexer[indexer] .= gates_of_interest 
+                            new_mask[indexer] .= 1. 
+                            new_mask = reshape(new_mask, scan_dims)
+            
+                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
+                        end 
                     end 
-
-                    @assert length(gates_of_interest) == sum(indexer) 
-    
-                    indexer[indexer] .= gates_of_interest 
-                    new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                    new_mask[indexer] .= 1. 
-                    new_mask = reshape(new_mask, scan_dims)
-    
-                    write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
-                    
+                else 
+                    ###If the sum of the indexer is zero, we're done. There's nothing to predict upon. 
+                    ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction 
+                    break 
                 end 
+
             
             end 
             
@@ -1975,33 +1991,41 @@ module Ronin
             if QC_mode 
                 QC_scan(config, file, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
             else 
-                ##Add indexer to the indexer list 
-                push!(init_idxers, init_idxer)    
-                ###Add verification to full array 
-                values = vcat(values, curr_Y)  
-                ##We only care about the probabilities where the indexer is 
-                total_met_probs = vcat(total_met_probs, curr_probs[:][init_idxer])
-                ##First need to determine the differenc between the initial indexer and the full scan? 
-        
-                            # ###init_indexer contains the gates in the scan that did not meet the basic quality control thresholds. 
-                            # ###A space will be needed in the predictions for each positive value here. 
-                            # ###Difference of final_indxer and init_index contains gates that were marked as non-meteorological throughout the course 
-                            # ###of applying the composite model. The final prediction then is ONLY on the gates that are still valid 
-                            # ###in final_idxer 
-                            # ###We are interested in returning the predictions and the validation for a set of gates 
-                            # curr_predictions = fill(false, (sum(init_idxer))) 
-                            # ###The only gates the final pass of the model applied a prediction to will be those where 
-                            # ###BOTH the final indexer and the initial indexer flagged as valid. Assign the model predictions to these gates.
-                            # pred_idxer = (final_idxer[init_idxer] .== true)
-                            # curr_predictions[pred_idxer] = final_predictions 
-        
-                ###Add on to final predictions 
-                ###Prediction vector has been interatively constructed so will comport with the verification 
-                predictions = vcat(predictions, final_predictions)
+                if final_predictions != Vector{Bool}(undef, 0)
+                    ##Add indexer to the indexer list 
+                    push!(init_idxers, init_idxer)    
+                    ###Add verification to full array 
+                    values = vcat(values, curr_Y)  
+                    ##We only care about the probabilities where the indexer is 
+                    total_met_probs = vcat(total_met_probs, curr_probs[:][init_idxer])
+                    ##First need to determine the differenc between the initial indexer and the full scan? 
+            
+                                # ###init_indexer contains the gates in the scan that did not meet the basic quality control thresholds. 
+                                # ###A space will be needed in the predictions for each positive value here. 
+                                # ###Difference of final_indxer and init_index contains gates that were marked as non-meteorological throughout the course 
+                                # ###of applying the composite model. The final prediction then is ONLY on the gates that are still valid 
+                                # ###in final_idxer 
+                                # ###We are interested in returning the predictions and the validation for a set of gates 
+                                # curr_predictions = fill(false, (sum(init_idxer))) 
+                                # ###The only gates the final pass of the model applied a prediction to will be those where 
+                                # ###BOTH the final indexer and the initial indexer flagged as valid. Assign the model predictions to these gates.
+                                # pred_idxer = (final_idxer[init_idxer] .== true)
+                                # curr_predictions[pred_idxer] = final_predictions 
+            
+                    ###Add on to final predictions 
+                    ###Prediction vector has been interatively constructed so will comport with the verification 
+                    predictions = vcat(predictions, final_predictions)
+                end 
             end 
     
         end 
         
+
+        if predictions == Vector{Bool}(undef, 0)
+            throw("ERROR: NO GATES IN INPUT DATASET MET BASIC QC THRESHOLDS")
+        end 
+
+
         if write_predictions_out
             h5open(prediction_outfile, "w") do f 
                 write_dataset(f, "Predictions", predictions)
