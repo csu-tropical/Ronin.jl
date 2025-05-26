@@ -1722,7 +1722,7 @@ module Ronin
         for var in config.VARS_TO_QC
             printstyled("QC-ING $(var) in $(filepath)\n", color=:green)
             ##Create new field to reshape QCed field to 
-            NEW_FIELD = missings(Float16, sweep_dims) 
+            NEW_FIELD = missings(Float32, sweep_dims) 
 
             if predictions != Vector{Bool}(undef, 0)
                 ##Only modify relevant data based on indexer, everything else should be fill value 
