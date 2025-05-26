@@ -1750,6 +1750,8 @@ module Ronin
                     "units" => input_set[var].attrib["units"],
                     "long_name" => "Random Forest Model QC'ed $(var) field"
                 )
+                initial_count = 0 
+                final_count = 0 
             end 
 
             try 
