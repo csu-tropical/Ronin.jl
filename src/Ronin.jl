@@ -1911,7 +1911,7 @@ module Ronin
                 final_idxer = indexer 
                 
                 ###If there are no gates that meet the basic QC thresholds now, we're once again done. 
-                if sum(indexer != 0) 
+                if sum(indexer) != 0 
 
                     curr_model = models[i]
                     curr_proba = config.met_probs[i]
