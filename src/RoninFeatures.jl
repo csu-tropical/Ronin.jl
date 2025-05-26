@@ -38,9 +38,9 @@ function calc_ncp(data::NCDataset)
     elseif "SQI_L2" in keys(data) 
         println("RETURNING SQI L2")
         return(data["SQI_L2"][:])
-    elseif "NCP" in valid_vars 
+    elseif "NCP" in keys(data) 
         return(data["NCP"][:])
-    elseif "SQI" in valid_vars 
+    elseif "SQI" in keys(data) 
         return(data["SQI"][:])
     end 
     error("Could not find NCP_L2, SQI_L2, NCP, or SQI in Dataset")
