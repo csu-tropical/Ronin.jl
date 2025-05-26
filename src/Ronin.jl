@@ -1898,7 +1898,7 @@ module Ronin
 
 
                 ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file 
-                if sum(feature_mask == 0) 
+                if sum(feature_mask) == 0 
                     break 
                 end 
                 
