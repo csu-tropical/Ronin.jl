@@ -1859,10 +1859,10 @@ module Ronin
             end 
             
             ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask 
-            init_idxer = Matrix{Bool}(undef, 0, 1)
+            init_idxer = Vector{Bool}(undef, 0)
             ###Keep indexer returned by the last pass of the model. This will describe where predictions 
             ###are made on the last set of gates 
-            final_idxer = Matrix{Bool}(undef, 0, 1)
+            final_idxer = Vector{Bool}(undef, 0)
             
             ###Current verification, final predictions, and probabilites 
             curr_Y = Vector{Bool}(undef, 0)
