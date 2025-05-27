@@ -2312,7 +2312,7 @@ module Ronin
 
 
 
-        newX = X = Matrix{Float64}(undef,0,output_cols)
+        newX = X = Matrix{Float32}(undef,0,output_cols)
         newY = Y = Matrix{Int64}(undef, 0,1) 
         idxs = Vector{}(undef,0)
         
@@ -2335,7 +2335,7 @@ module Ronin
                 valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
                 print("RESULTANT GATES: $(sum(valid_idxs))")
                 ##Create mask field, fill it, and then write out
-                new_mask = Matrix{Union{Missing, Float64}}(missings(dims))[:]
+                new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
                 
                 ##We only care about gates that have met the base QC thresholds, so first index 
                 ##by indexer returned from calculate_features, and then set the gates between
@@ -2350,7 +2350,7 @@ module Ronin
                 write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"))
             end 
 
-            X = vcat(X, newX)::Matrix{Float64}
+            X = vcat(X, newX)::Matrix{Float32}
             Y = vcat(Y, newY)::Matrix{Int64}
 
         end 
