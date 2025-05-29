@@ -1231,10 +1231,10 @@ module Ronin
     Returns a DataFrame with each row containing info about a regression for a specific λ, the values of the regression coefficients 
         for each input feature, and the Root Mean Square Error of the resultant regression. 
     """
-    function get_feature_importance(input_file_path::String, λs::Vector{Float32}; pred_threshold::Float32 = .5f0)
+    function get_feature_importance(input_file_path::String, λs::Vector{Float64}; pred_threshold::Float64 = .5)
 
 
-        MLJ.@load LogisticClassifier pkg=MLJLinearModels
+        LogisticClassifier = MLJ.@load LogisticClassifier pkg=MLJLinearModels
 
         training_data = h5open(input_file_path)
         
@@ -2264,6 +2264,8 @@ module Ronin
                                 false_positives = scores[5],
                                 true_negatives = scores[6],
                                 false_negatives = scores[7],
+                                MD_retained_frac = scores[4] / (scores[4] + scores[7])
+                                NMD_removed_frac = scores[6] / (scores[6] + socres[5]) 
         )
 
         return retval 
@@ -2284,12 +2286,23 @@ module Ronin
                 ###Otherwise, we need to mask out the features we want to apply the model to on the next pass 
         @assert curr_model_num <= config.num_models
 
-        curr_model = load_object(config.model_output_paths[curr_model_num]) 
-        curr_metprobs = config.met_probs[curr_model_num]
-        curr_tasks = config.task_paths[curr_model_num]
-        curr_weights = config.task_weights[curr_model_num]
-        curr_out = config.feature_output_paths[curr_model_num] 
-        output_cols = get_num_tasks(curr_tasks)
+        ###If this is the 0th, we're just constructing the features for the first pass and don't need to do much other work 
+        ###This is basically useful for when we don't have a trained model and want to just get the initial set of features 
+        if curr_model_num > 0
+            curr_model = load_object(config.model_output_paths[curr_model_num]) 
+            curr_metprobs = config.met_probs[curr_model_num]
+            curr_tasks = config.task_paths[curr_model_num]
+            curr_weights = config.task_weights[curr_model_num]
+            curr_out = config.feature_output_paths[curr_model_num] 
+            output_cols = get_num_tasks(curr_tasks)
+        else 
+            curr_model = "" 
+            curr_metprobs = "" 
+            curr_tasks = config.task_paths[begin]
+            curr_weights = config.task_weights[begin]
+            curr_out = config.feature_output_paths[begin] 
+            output_cols = get_num_tasks(curr_tasks)
+        end 
 
         paths = Vector{String}() 
         file_path = config.input_path
@@ -2329,7 +2342,7 @@ module Ronin
                                 remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
                                 write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
         
-            if curr_model_num < config.num_models 
+            if (curr_model_num < config.num_models) && (curr_model_num > 0)
                 met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
                 ###Probabilities inclusive on both ends 
                 valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
