@@ -407,13 +407,15 @@ module Ronin
                     ###We wish to calculate features on where the mask is NON MISSING 
                     currmask = Matrix{Bool}(.! map(ismissing, cfrad[mask_name][:,:]))
                     (newX, newY, newIdx) = process_single_file(cfrad, argument_file; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, REMOVE_LOW_NCP = REMOVE_LOW_NCP, NCP_THRESHOLD = NCP_THRESHOLD, 
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                                                REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=SIG_QUALITY_VAR, 
                                                 REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
                                                 replace_missing=replace_missing, feature_mask = currmask, mask_features = true, weight_matrixes=weight_matrixes)
                     
                 else 
                     (newX, newY, newIdx) = process_single_file(cfrad, argument_file; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, REMOVE_LOW_NCP = REMOVE_LOW_NCP, NCP_THRESHOLD = NCP_THRESHOLD, 
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                                                REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=SIG_QUALITY_VAR,
                                                 REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
                                                 replace_missing=replace_missing, weight_matrixes=weight_matrixes)
                 end 
@@ -1571,7 +1573,8 @@ module Ronin
                 end 
 
                 X,Y = calculate_features(config.input_path, currt, out, config.HAS_INTERACTIVE_QC; 
-                                    verbose = config.verbose, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP,NCP_THRESHOLD=config.NCP_THRESHOLD, 
+                                    verbose = config.verbose, 
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
                                     REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var, 
                                     remove_variable = config.remove_var, replace_missing = config.replace_missing,
                                     write_out = config.write_out, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
@@ -1627,7 +1630,8 @@ module Ronin
                     
                     ###NEED to update this if it's beyond two pass so we can pass it the correct mask
                     X, Y, idxer = calculate_features(path, currt, out, true; 
-                                        verbose = config.verbose, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP, NCP_THRESHOLD=config.NCP_THRESHOLD,
+                                        verbose = config.verbose, 
+                                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
                                         REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var, 
                                         remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
                                         write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
