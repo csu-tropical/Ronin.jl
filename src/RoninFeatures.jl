@@ -404,15 +404,20 @@ HAS_INTERACTIVE_QC::Bool = false
 If the scan has already had a human apply quality control to it, set to `true`. Otherwise, `false`
 
 ```julia 
-REMOVE_LOW_NCP::Bool = false
+REMOVE_LOW_SIG_QUALITY::Bool = false
 ```
 Whether or not to ignore gates that do not meet a minimum NCP/SQI threshold. If `true`, these gates will be
 set to `false` in `indexer`, and features/verification will not be calculated for them. 
 
 ```julia 
-NCP_THRESHOLD::Float32 = .2
+SIG_QUALITY_THRESHOLD::Float32 = .2
 ```
 Theshold at or below which to remove data 
+
+```julia
+SIG_QUALITY_VAR
+```
+Name of variable in cfradials containing information about signal quality 
 
 ```julia 
 REMOVE_HIGH_PGG::Bool = false
