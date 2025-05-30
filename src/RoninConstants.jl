@@ -56,7 +56,7 @@ func_regex::Regex = r"(\w{1,})\((\w{1,})\)"
 ###List of functions currently implemented in the module
 valid_funcs::Array{String} = ["AVG", "ISO", "STD"]
 valid_derived_params::Array{String} = ["AHT", "PGG", "RNG", "NRG", "ELV"]
-FILL_VAL::Float32 = -32000.f0
+FILL_VAL::Int16 = typemin(Int16)
 RADAR_FILE_PREFIX::String = "cfrad"
 
 ##Whether or not to replace a MISSING value with FILL in the spatial calculations 

@@ -98,9 +98,10 @@ module Ronin
     Whether to print out timing information, etc. 
 
     ```julia
-    REMOVE_LOW_NCP::Bool = true
+    REMOVE_LOW_SIG_QUALITY::Bool = true
     ```
-    Whether to automatically remove gates that do not meet a basic NCP threshold 
+    Whether to automatically remove gates that do not meet a basic Signal Quality threshold. 
+    Variable used to determine this specified in `SIG_QUALITY_VAR`
 
     ```julia
     REMOVE_HIGH_PGG::Bool = true
@@ -180,7 +181,7 @@ module Ronin
     If true, will remove/overwrite existing files when internal functionality attempts to write new data to them 
 
     ```julia 
-    NCP_THRESHOLD::Float32 = .2
+    SIG_QUALITY_THRESHOLD::Float32 = .2
     ```
     If REMOVE_LOW_NCP is set to true, threshold at or below which to remove data. 
 
@@ -188,6 +189,12 @@ module Ronin
     PGG_THRESHOLD::Float32 = 1.
     ```
     If REMOVE_HIGH_PGG is set to true, threshold at or above which to remove data. 
+
+    ```julia 
+    SIGNAL_QUALITY_VAR::String = "NCP" 
+    ```
+    Name of variable in cfradial file representing signal quality. Most commonly 
+    "NCP" or "SQI" 
 
     """
     Base.@kwdef mutable struct ModelConfig
@@ -209,12 +216,12 @@ module Ronin
         task_weights::Vector{Vector{Matrix{Union{Float32, Missing}}}} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
 
         verbose::Bool = true 
-        REMOVE_LOW_NCP::Bool = true 
+        REMOVE_LOW_SIG_QUALITY::Bool = true 
         REMOVE_HIGH_PGG::Bool = true 
         HAS_INTERACTIVE_QC::Bool = false 
         QC_var::String = "VG"
         remove_var::String = "VV" 
-        FILL_VAL::Float32 = FILL_VAL 
+        FILL_VAL::Real = FILL_VAL 
         replace_missing::Bool = false 
         write_out::Bool = true 
         QC_mask::Bool = false 
@@ -231,13 +238,16 @@ module Ronin
 
         overwrite_output::Bool = false 
 
-        NCP_THRESHOLD::Float32 = .2f0
+        SIG_QUALITY_THRESHOLD::Float32 = .2f0
         PGG_THRESHOLD::Float32 = 1.f0  
+
+        SIG_QUALITY_VAR::String = "NCP" 
         
     end 
 
     """ 
-    Helper function to compute balanced weights according to the algoirthm described in https://scikit-learn.org/stable/modules/generated/sklearn.utils.class_weight.compute_class_weight.html
+        Helper function to compute balanced weights according to the
+        algoirthm described in https://scikit-learn.org/stable/modules/generated/sklearn.utils.class_weight.compute_class_weight.html
 
     """
     function compute_balanced_class_weights(samples::Vector{<:Real})
@@ -295,15 +305,20 @@ module Ronin
     If true, will print out timing information as each file is processed 
 
     ```julia
-    REMOVE_LOW_NCP::Bool=false
+    REMOVE_LOW_SIG_QUALITY::Bool=false
     ```
 
     If true, will ignore gates with Normalized Coherent Power/Signal Quality Index below a threshold specified in RQCFeatures.jl
 
     ```julia 
-    NCP_THRESHOLD::Float32 = .2
+    SIG_QUALITY_THRESHOLD::Float32 = .2
     ```
     Theshold at or below which to remove data 
+
+    ```julia
+    SIG_QUALITY_VAR::String = "NCP"
+    ```
+    Name of variable containing signal quality parameter 
 
     ```julia
     REMOVE_HIGH_PGG::Bool=false
@@ -350,8 +365,9 @@ module Ronin
         weights are discarded, and so dummy/placeholder matrixes may be used. 
     """
     function calculate_features(input_loc::String, argument_file::String, output_file::String, HAS_INTERACTIVE_QC::Bool; 
-        verbose::Bool=false, REMOVE_LOW_NCP::Bool = false, NCP_THRESHOLD::Float32 = .2f0, REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32=1.f0,
-         QC_variable::String = "VG", remove_variable::String = "VV", 
+        verbose::Bool=false, REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP", 
+        REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32=1.f0,
+        QC_variable::String = "VG", remove_variable::String = "VV", 
         replace_missing::Bool = false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String = "", return_idxer::Bool=false, 
         weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
 
@@ -513,15 +529,19 @@ module Ronin
     If true, will print out timing information as each file is processed 
 
     ```julia
-    REMOVE_LOW_NCP::Bool = false 
+    REMOVE_LOW_SIG_QUALITY::Bool = false 
     ```
-
     If true, will ignore gates with Normalized Coherent Power/Signal Quality Index below a threshold specified in RQCFeatures.jl
     
     ```julia 
-    NCP_THRESHOLD::Float32 = .2
+    SIG_QUALITY_THRESHOLD::Float32 = .2
     ```
     Theshold at or below which to remove data 
+
+    ```
+    SIG_QUALITY_VAR::String = "NCP"
+    ```
+    Name of variable containin signal quality information 
 
     ```julia
     REMOVE_HIGH_PGG::Bool = false
@@ -558,7 +578,7 @@ module Ronin
     """
     function calculate_features(input_loc::String, tasks::Vector{String}, weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}
         ,output_file::String, HAS_INTERACTIVE_QC::Bool; verbose::Bool=false,
-         REMOVE_LOW_NCP = false, NCP_THRESHOLD::Float32 = .2f0, REMOVE_HIGH_PGG = false, PGG_THRESHOLD::Float32=.1f0, QC_variable::String = "VG", remove_variable::String = "VV", 
+         REMOVE_LOW_SIG_QUALITY = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP", REMOVE_HIGH_PGG = false, PGG_THRESHOLD::Float32=.1f0, QC_variable::String = "VG", remove_variable::String = "VV", 
          replace_missing::Bool=false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String="", return_idxer::Bool =false)
 
         ##If this is a directory, things get a little more complicated 
@@ -598,13 +618,15 @@ module Ronin
 
                     currmask = Matrix{Bool}(.! map(ismissing, cfrad[mask_name][:,:]))
                     (newX, newY, indexer) = process_single_file(cfrad, tasks, weight_matrixes; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, REMOVE_LOW_NCP = REMOVE_LOW_NCP, NCP_THRESHOLD = NCP_THRESHOLD,
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                                                REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = SIG_QUALITY_VAR,
                                                 REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD = PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
                                                 replace_missing=replace_missing, feature_mask = currmask, mask_features = true)
                     
                 else 
                     (newX, newY, indexer) = process_single_file(cfrad, tasks, weight_matrixes; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, REMOVE_LOW_NCP = REMOVE_LOW_NCP, NCP_THRESHOLD=NCP_THRESHOLD,
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                                                REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = SIG_QUALITY_VAR,
                                                 REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
                                                 replace_missing=replace_missing)
                 end 
@@ -850,7 +872,31 @@ module Ronin
     verbose::Bool = false 
     ````
     Whether to output timing and scan information
-    
+
+    ```julia
+    REMOVE_HIGH_PGG::Bool = true 
+    ```
+    Whether or not to remove gates with a specified value of Probability of Ground Gate (PGG) from consideration 
+    ```julia 
+    PGG_THRESHOLD::Float32 = 1.f0
+    ```
+    Threshold at or above to remove data from consideration 
+
+    ```julia 
+    REMOVE_LOW_SIG_QUALITY::Bool = true 
+    ```
+    Whether or not to remove gates with a specified value of signal quality from consideration 
+
+    ```julia 
+    SIG_QUALITY_THRESHOLD::Float32 = .2f0 
+    ```
+    Signal quality threshold to remove data at 
+
+    ```julia
+    SIG_QUALITY_VAR::String = "NCP" 
+    ```
+    Name of variable representing signal quality 
+
     ```julia
     output_probs::Bool = false
     ```
@@ -860,158 +906,161 @@ module Ronin
     ```
     What to name the probability variable in the cfradial file 
     """
-    function QC_scan(file_path::String, config_file_path::String, model_path::String; VARIABLES_TO_QC::Vector{String}= ["ZZ", "VV"],
-                     QC_suffix::String = "_QC", indexer_var::String="VV", decision_threshold::Tuple{Float32, Float32} = (.5f0, 1.f0), output_mask::Bool = true,
-                     mask_name::String = "QC_MASK_2", verbose::Bool=false, REMOVE_HIGH_PGG::Bool = true, PGG_THRESHOLD = 1., REMOVE_LOW_NCP::Bool = true, NCP_THRESHOLD=.2,
-                     output_probs::Bool = false, prob_varname::String = "")
+    ### Currently deprecated 
+    # function QC_scan(file_path::String, config_file_path::String, model_path::String; VARIABLES_TO_QC::Vector{String}= ["ZZ", "VV"],
+    #                  QC_suffix::String = "_QC", indexer_var::String="VV", decision_threshold::Tuple{Float32, Float32} = (.5f0, 1.f0), output_mask::Bool = true,
+    #                  mask_name::String = "QC_MASK_2", verbose::Bool=false, REMOVE_HIGH_PGG::Bool = true, PGG_THRESHOLD::Float32 = 1.f0, 
+    #                  REMOVE_LOW_SIG_QUALITY::Bool = true, SIG_QUALITY_THRESHOLD::Float32=.2f0, SIG_QUALITY_VAR::String="NCP"
+    #                  output_probs::Bool = false, prob_varname::String = "")
 
-        new_model = load_object(model_path) 
+    #     new_model = load_object(model_path) 
 
-        paths = Vector{String}() 
-        if isdir(file_path) 
-            paths = parse_directory(file_path)
-        else 
-            paths = [file_path]
-        end 
+    #     paths = Vector{String}() 
+    #     if isdir(file_path) 
+    #         paths = parse_directory(file_path)
+    #     else 
+    #         paths = [file_path]
+    #     end 
         
 
-        for path in paths 
-            ##Open in append mode so output variables can be written 
-            input_cfrad = redirect_stdout(devnull) do
-                NCDataset(path, "a")
-            end 
+    #     for path in paths 
+    #         ##Open in append mode so output variables can be written 
+    #         input_cfrad = redirect_stdout(devnull) do
+    #             NCDataset(path, "a")
+    #         end 
 
-            cfrad_dims = (input_cfrad.dim["range"], input_cfrad.dim["time"])
+    #         cfrad_dims = (input_cfrad.dim["range"], input_cfrad.dim["time"])
 
-            ###Will generally NOT return Y, but only (X, indexer)
-            ###Todo: What do I need to do for parsed args here 
-            starttime=time()
-            X, Y, indexer = process_single_file(input_cfrad, config_file_path; REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, REMOVE_LOW_NCP = REMOVE_LOW_NCP, remove_variable=indexer_var)
-            ##Load saved RF model 
-            ##assume that default SYMBOL for saved model is savedmodel
-            ##For binary classifications, 1 will be at index 2 in the predictions matrix 
-            met_predictions = DecisionTree.predict_proba(new_model, X)[:, 2]
-            predictions = (met_predictions .> decision_threshold[1]) .& (met_predictions .<= decision_threshold[2])
-            printstyled("RETAINING GATES BETWEEN $(decision_threshold[1]) and $(decision_threshold[2]) PROBABILITY \n ", color=:yellow)
+    #         ###Will generally NOT return Y, but only (X, indexer)
+    #         ###Todo: What do I need to do for parsed args here 
+    #         starttime=time()
+    #         X, Y, indexer = process_single_file(input_cfrad, config_file_path; REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, 
+    #                                     REMOVE_LOW_NCP = REMOVE_LOW_NCP, remove_variable=indexer_var)
+    #         ##Load saved RF model 
+    #         ##assume that default SYMBOL for saved model is savedmodel
+    #         ##For binary classifications, 1 will be at index 2 in the predictions matrix 
+    #         met_predictions = DecisionTree.predict_proba(new_model, X)[:, 2]
+    #         predictions = (met_predictions .> decision_threshold[1]) .& (met_predictions .<= decision_threshold[2])
+    #         printstyled("RETAINING GATES BETWEEN $(decision_threshold[1]) and $(decision_threshold[2]) PROBABILITY \n ", color=:yellow)
 
-            ##QC each variable in VARIALBES_TO_QC
-            for var in VARIABLES_TO_QC
+    #         ##QC each variable in VARIALBES_TO_QC
+    #         for var in VARIABLES_TO_QC
 
-                ##Create new field to reshape QCed field to 
-                NEW_FIELD = missings(Float32, cfrad_dims) 
+    #             ##Create new field to reshape QCed field to 
+    #             NEW_FIELD = missings(Float32, cfrad_dims) 
 
-                ##Only modify relevant data based on indexer, everything else should be fill value 
-                QCED_FIELDS = input_cfrad[var][:][indexer]
+    #             ##Only modify relevant data based on indexer, everything else should be fill value 
+    #             QCED_FIELDS = input_cfrad[var][:][indexer]
 
-                NEW_FIELD_ATTRS = Dict(
-                    "units" => input_cfrad[var].attrib["units"],
-                    "long_name" => "Random Forest Model QC'ed $(var) field",
-                    "probabilities" => " $(decision_threshold[1]) < p <= $(decision_threshold[2])"
-                )
+    #             NEW_FIELD_ATTRS = Dict(
+    #                 "units" => input_cfrad[var].attrib["units"],
+    #                 "long_name" => "Random Forest Model QC'ed $(var) field",
+    #                 "probabilities" => " $(decision_threshold[1]) < p <= $(decision_threshold[2])"
+    #             )
 
-                ##Set MISSINGS to fill value in current field
+    #             ##Set MISSINGS to fill value in current field
                 
-                initial_count = count(.!map(ismissing, QCED_FIELDS))
-                ##Apply predictions from model 
-                ##If model predicts 1, this indicates a prediction of meteorological data 
-                QCED_FIELDS = map(x -> Bool(predictions[x[1]]) ? x[2] : missing, enumerate(QCED_FIELDS))
-                final_count = count(.!map(ismissing, QCED_FIELDS))
+    #             initial_count = count(.!map(ismissing, QCED_FIELDS))
+    #             ##Apply predictions from model 
+    #             ##If model predicts 1, this indicates a prediction of meteorological data 
+    #             QCED_FIELDS = map(x -> Bool(predictions[x[1]]) ? x[2] : missing, enumerate(QCED_FIELDS))
+    #             final_count = count(.!map(ismissing, QCED_FIELDS))
                 
-                ###Need to reconstruct original 
-                NEW_FIELD = NEW_FIELD[:]
-                NEW_FIELD[indexer] = QCED_FIELDS
-                NEW_FIELD = reshape(NEW_FIELD, cfrad_dims)
+    #             ###Need to reconstruct original 
+    #             NEW_FIELD = NEW_FIELD[:]
+    #             NEW_FIELD[indexer] = QCED_FIELDS
+    #             NEW_FIELD = reshape(NEW_FIELD, cfrad_dims)
                 
 
-                try 
-                    defVar(input_cfrad, var * QC_suffix, NEW_FIELD, ("range", "time"), fillvalue = FILL_VAL; attrib=NEW_FIELD_ATTRS)
-                catch e
-                    ###Simply overwrite the variable 
-                    if e.msg == "NetCDF: String match to name in use"
-                        if verbose
-                            println("Already exists... overwriting") 
-                        end 
-                        input_cfrad[var*QC_suffix][:,:] = NEW_FIELD 
-                    else 
-                        throw(e)
-                    end 
-                end 
+    #             try 
+    #                 defVar(input_cfrad, var * QC_suffix, NEW_FIELD, ("range", "time"), fillvalue = FILL_VAL; attrib=NEW_FIELD_ATTRS)
+    #             catch e
+    #                 ###Simply overwrite the variable 
+    #                 if e.msg == "NetCDF: String match to name in use"
+    #                     if verbose
+    #                         println("Already exists... overwriting") 
+    #                     end 
+    #                     input_cfrad[var*QC_suffix][:,:] = NEW_FIELD 
+    #                 else 
+    #                     throw(e)
+    #                 end 
+    #             end 
 
-                if verbose
-                    println("\r\nPROCESSING: $(path)")
-                    println("\r\nCompleted in $(time()-starttime ) seconds")
-                    println()
-                    printstyled("REMOVED $(initial_count - final_count) PRESUMED NON-METEORLOGICAL DATAPOINTS\n", color=:green)
-                    println("FINAL COUNT OF DATAPOINTS IN $(var): $(final_count)")
-                end 
+    #             if verbose
+    #                 println("\r\nPROCESSING: $(path)")
+    #                 println("\r\nCompleted in $(time()-starttime ) seconds")
+    #                 println()
+    #                 printstyled("REMOVED $(initial_count - final_count) PRESUMED NON-METEORLOGICAL DATAPOINTS\n", color=:green)
+    #                 println("FINAL COUNT OF DATAPOINTS IN $(var): $(final_count)")
+    #             end 
 
-            end 
+    #         end 
 
-            if output_mask
+    #         if output_mask
 
-                MASK = fill(-1, cfrad_dims)[:]
-                MASK[indexer] = predictions 
-                MASK = reshape(MASK, cfrad_dims)
+    #             MASK = fill(-1, cfrad_dims)[:]
+    #             MASK[indexer] = predictions 
+    #             MASK = reshape(MASK, cfrad_dims)
 
-                try
-                    if verbose 
-                        println("Writing Mask")
-                    end 
+    #             try
+    #                 if verbose 
+    #                     println("Writing Mask")
+    #                 end 
 
-                    NEW_FIELD_ATTRS = Dict(
-                    "units" => "Unitless",
-                    "long_name" => "Ronin Quality Control mask"
-                    )   
-                    defVar(input_cfrad, mask_name, MASK, ("range", "time"), fillvalue=-1; attrib=NEW_FIELD_ATTRS)
-                catch e
+    #                 NEW_FIELD_ATTRS = Dict(
+    #                 "units" => "Unitless",
+    #                 "long_name" => "Ronin Quality Control mask"
+    #                 )   
+    #                 defVar(input_cfrad, mask_name, MASK, ("range", "time"), fillvalue=-1; attrib=NEW_FIELD_ATTRS)
+    #             catch e
 
-                ###Simply overwrite the variable 
-                    if e.msg == "NetCDF: String match to name in use"
-                        if verbose 
-                            println("Already exists... overwriting") 
-                        end 
-                        input_cfrad[mask_name][:,:] =  MASK 
-                    else 
-                        throw(e)
-                    end 
-                end
-            end 
+    #             ###Simply overwrite the variable 
+    #                 if e.msg == "NetCDF: String match to name in use"
+    #                     if verbose 
+    #                         println("Already exists... overwriting") 
+    #                     end 
+    #                     input_cfrad[mask_name][:,:] =  MASK 
+    #                 else 
+    #                     throw(e)
+    #                 end 
+    #             end
+    #         end 
 
-            if output_probs 
+    #         if output_probs 
 
-                NEW = fill(-1, cfrad_dims)[:]
-                NEW[indexer] = met_predictions
-                NEW = reshape(NEW, cfrad_dims)
+    #             NEW = fill(-1, cfrad_dims)[:]
+    #             NEW[indexer] = met_predictions
+    #             NEW = reshape(NEW, cfrad_dims)
 
-                try
-                    if verbose 
-                        println("Writing Probabilites to $(prob_varname)")
-                    end 
+    #             try
+    #                 if verbose 
+    #                     println("Writing Probabilites to $(prob_varname)")
+    #                 end 
 
-                    NEW_FIELD_ATTRS = Dict(
-                    "units" => "Unitless",
-                    "long_name" => "Ronin Decision Tree Probabilities"
-                    )   
-                    defVar(input_cfrad, prob_varname, MASK, ("range", "time"), fillvalue=-1; attrib=NEW_FIELD_ATTRS)
-                catch e
+    #                 NEW_FIELD_ATTRS = Dict(
+    #                 "units" => "Unitless",
+    #                 "long_name" => "Ronin Decision Tree Probabilities"
+    #                 )   
+    #                 defVar(input_cfrad, prob_varname, MASK, ("range", "time"), fillvalue=-1; attrib=NEW_FIELD_ATTRS)
+    #             catch e
 
-                ###Simply overwrite the variable 
-                    if e.msg == "NetCDF: String match to name in use"
-                        if verbose 
-                            println("Already exists... overwriting") 
-                        end 
-                        input_cfrad[prob_varname][:,:] =  MASK 
-                    else 
-                        throw(e)
-                    end 
-                end
+    #             ###Simply overwrite the variable 
+    #                 if e.msg == "NetCDF: String match to name in use"
+    #                     if verbose 
+    #                         println("Already exists... overwriting") 
+    #                     end 
+    #                     input_cfrad[prob_varname][:,:] =  MASK 
+    #                 else 
+    #                     throw(e)
+    #                 end 
+    #             end
             
-            close(input_cfrad)
+    #         close(input_cfrad)
 
-            end 
+    #         end 
 
-        end 
-    end 
+    #     end 
+    # end 
 
 
 
@@ -1371,91 +1420,92 @@ module Ronin
     ```
     Which gates were misclassified as non-meteorological data relative to interactive QC 
     """
-    function error_characteristics(file_path::String, config_file_path::String, model_path::String;
-        indexer_var::String="VV", QC_variable::String="VG", decision_threshold::Float32 = .5f0, write_out::Bool=false,
-        output_name::String="Model_Error_Characteristics.h5")
+    ## Deprecated? 
+    # function error_characteristics(file_path::String, config_file_path::String, model_path::String;
+    #     indexer_var::String="VV", QC_variable::String="VG", decision_threshold::Float32 = .5f0, write_out::Bool=false,
+    #     output_name::String="Model_Error_Characteristics.h5")
 
 
-        ###We can probably refactor this honestly, just do predict with model 
-        ###Do we need to reconstruct the original scans? Probably not..... 
+    #     ###We can probably refactor this honestly, just do predict with model 
+    #     ###Do we need to reconstruct the original scans? Probably not..... 
        
-        new_model = load_object(model_path) 
+    #     new_model = load_object(model_path) 
 
 
-        paths = Vector{String}() 
+    #     paths = Vector{String}() 
         
-        if isdir(file_path) 
-            paths = parse_directory(file_path)
-        else 
-            paths = [file_path]
-        end 
+    #     if isdir(file_path) 
+    #         paths = parse_directory(file_path)
+    #     else 
+    #         paths = [file_path]
+    #     end 
 
-        tasks = get_task_params(config_file_path)
+    #     tasks = get_task_params(config_file_path)
 
-        X = Matrix{Float32}(undef,0,length(tasks))
-        Y = Matrix{Int32}(undef,0,1) 
-        indexer = Matrix{Int32}(undef,0,1)
-        predictions = Matrix{Int32}(undef, 0, 1) 
+    #     X = Matrix{Float32}(undef,0,length(tasks))
+    #     Y = Matrix{Int32}(undef,0,1) 
+    #     indexer = Matrix{Int32}(undef,0,1)
+    #     predictions = Matrix{Int32}(undef, 0, 1) 
 
-        for path in paths   
+    #     for path in paths   
 
-            input_cfrad = redirect_stdout(devnull) do
-               NCDataset(path, "a")
-            end 
+    #         input_cfrad = redirect_stdout(devnull) do
+    #            NCDataset(path, "a")
+    #         end 
 
-            cfrad_dims = (input_cfrad.dim["range"], input_cfrad.dim["time"])
-            ###Todo: What do I need to do for parsed args here 
-            println("\r\nPROCESSING: $(path)")
-            starttime=time()
-            try
+    #         cfrad_dims = (input_cfrad.dim["range"], input_cfrad.dim["time"])
+    #         ###Todo: What do I need to do for parsed args here 
+    #         println("\r\nPROCESSING: $(path)")
+    #         starttime=time()
+    #         try
             
-                Xn, Yn, indexern = process_single_file(input_cfrad, config_file_path; REMOVE_HIGH_PGG = true, QC_variable = QC_variable,
-                                                            REMOVE_LOW_NCP = true, remove_variable=indexer_var, HAS_INTERACTIVE_QC = true)
-                println("\r\nCompleted in $(time()-starttime ) seconds")
+    #             Xn, Yn, indexern = process_single_file(input_cfrad, config_file_path; REMOVE_HIGH_PGG = true, QC_variable = QC_variable,
+    #                                                         REMOVE_LOW_NCP = true, remove_variable=indexer_var, HAS_INTERACTIVE_QC = true)
+    #             println("\r\nCompleted in $(time()-starttime ) seconds")
 
-                    ##Load saved RF model 
-                ##assume that default SYMBOL for saved model is savedmodel
-                ##For binary classifications, 1 will be at index 2 in the predictions matrix 
-                met_predictions = DecisionTree.predict_proba(new_model, Xn)[:, 2]
-                predictionsn = met_predictions .> decision_threshold
+    #                 ##Load saved RF model 
+    #             ##assume that default SYMBOL for saved model is savedmodel
+    #             ##For binary classifications, 1 will be at index 2 in the predictions matrix 
+    #             met_predictions = DecisionTree.predict_proba(new_model, Xn)[:, 2]
+    #             predictionsn = met_predictions .> decision_threshold
 
-                ###If we wish to return features for error diagnostics, we simply return X which is the features array, 
-                ###Y which are the correct values, the indexer which shows where data was taken out and where it was not, 
-                ###and the model predictions 
+    #             ###If we wish to return features for error diagnostics, we simply return X which is the features array, 
+    #             ###Y which are the correct values, the indexer which shows where data was taken out and where it was not, 
+    #             ###and the model predictions 
 
-                X  = vcat(X, Xn)
-                Y  = vcat(Y, Yn)
-                indexer = vcat(indexer, indexern)
-                predictions = vcat(predictions, predictionsn)
+    #             X  = vcat(X, Xn)
+    #             Y  = vcat(Y, Yn)
+    #             indexer = vcat(indexer, indexern)
+    #             predictions = vcat(predictions, predictionsn)
             
-            catch e
-                printstyled("POSSIBLE ERROR WITH FILE AT: $(path)...\nCONTINUING\n", color=:red)
-            end 
+    #         catch e
+    #             printstyled("POSSIBLE ERROR WITH FILE AT: $(path)...\nCONTINUING\n", color=:red)
+    #         end 
             
-        end 
+    #     end 
 
-        false_positives_idx = (predictions .== 1) .& (Y .== 0)
-        false_negatives_idx = (predictions .== 0) .& (Y .== 1)
+    #     false_positives_idx = (predictions .== 1) .& (Y .== 0)
+    #     false_negatives_idx = (predictions .== 0) .& (Y .== 1)
 
 
-        if write_out
-            println("Writing Data to $(output_name)")
+    #     if write_out
+    #         println("Writing Data to $(output_name)")
     
-            h5open(output_name, "w") do f
-                f["X"] = X[:,:]
-                f["Y"] = Y[:]
-                f["indexer"] = Vector{Int32}(indexer[:])
-                f["predictions"] = Vector{Int32}(predictions[:])
-                f["false_positive_index"] = Vector{Int32}(false_positives_idx[:])
-                f["false_negatives_idx"] = Vector{Int32}(false_negatives_idx[:])
-                attributes(f)["FEATURE_NAMES"] = tasks 
-            end
+    #         h5open(output_name, "w") do f
+    #             f["X"] = X[:,:]
+    #             f["Y"] = Y[:]
+    #             f["indexer"] = Vector{Int32}(indexer[:])
+    #             f["predictions"] = Vector{Int32}(predictions[:])
+    #             f["false_positive_index"] = Vector{Int32}(false_positives_idx[:])
+    #             f["false_negatives_idx"] = Vector{Int32}(false_negatives_idx[:])
+    #             attributes(f)["FEATURE_NAMES"] = tasks 
+    #         end
     
-            printstyled("Successfully Output Model Evaluation Data to $(output_name)\n", color=:green) 
-        end 
+    #         printstyled("Successfully Output Model Evaluation Data to $(output_name)\n", color=:green) 
+    #     end 
 
-        return (X, Y, indexer, predictions, false_positives_idx, false_negatives_idx) 
-    end 
+    #     return (X, Y, indexer, predictions, false_positives_idx, false_negatives_idx) 
+    # end 
 
 
 
@@ -1470,6 +1520,9 @@ module Ronin
     config::ModelConfig
     ```
     Struct containing configuration info for model training 
+
+    #Returns 
+        -None 
     """
     function train_multi_model(config::ModelConfig)
         ##Quick input sanitation check 
@@ -1608,7 +1661,6 @@ module Ronin
     
     """
     `QC_scan(input_cfrad::String, features::Matrix{Float32}, indexer::Vector{Bool}, config::ModelConfig, iter::Int64)`
-
 
     """
     function QC_scan(input_cfrad::String, features::Matrix{Float32}, indexer::Vector{Bool}, config::ModelConfig, iter::Int64)
@@ -1911,7 +1963,8 @@ module Ronin
                 ###Need to actually pass the QC mask 
                 ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds 
                 X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
-                    , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP, NCP_THRESHOLD = config.NCP_THRESHOLD, 
+                    , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, 
+                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
                     QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
                     mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
                 final_idxer = indexer 
@@ -2110,7 +2163,7 @@ module Ronin
     """
     
     function write_field(filepath::String, fieldname::String, NEW_FIELD; overwrite::Bool = true, 
-                attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::Float32 = FILL_VAL)
+                attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::T = FILL_VAL) where T <: Real
         
         if ! isfile(filepath) 
             ds = NCDataset(filepath, "c") 
@@ -2187,6 +2240,18 @@ module Ronin
         `evaluate_model(config::ModelConfig)`
 
         Returns a row of a DataFrame with a variety of metrics about a given model. 
+
+        #Arguments 
+
+        ```julia 
+        config::ModelConfig
+        ```
+        Struct containing information about model training 
+
+        ```julia 
+        models_trained::Bool = false 
+        ```
+
     """
     function evaluate_model(config::ModelConfig; models_trained::Bool = false)
 
@@ -2337,29 +2402,30 @@ module Ronin
             
             ###NEED to update this if it's beyond two pass so we can pass it the correct mask
             newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true; 
-                                verbose = config.verbose, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP, 
-                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, QC_variable = config.QC_var, 
+                                verbose = config.verbose,
+                                REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var, 
                                 remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
                                 write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
         
             if (curr_model_num < config.num_models) && (curr_model_num > 0)
-                met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
-                ###Probabilities inclusive on both ends 
-                valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
-                print("RESULTANT GATES: $(sum(valid_idxs))")
-                ##Create mask field, fill it, and then write out
-                new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-                
-                ##We only care about gates that have met the base QC thresholds, so first index 
-                ##by indexer returned from calculate_features, and then set the gates between
-                ##the specified probability levels to valid in the mask. The next model pass will 
-                ##thus only be calculated upon these features. 
-                idxer = curr_idx[1][:]
-                ###Determine where the gates that meet basic QC threshold are between the met thresholds and assign
-                idxer[idxer] .= Vector{Bool}(valid_idxs)
-                new_mask[idxer] .= 1.
-                new_mask = reshape(new_mask, dims)
 
+                new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+
+                if (sum(curr_idx) > 0)
+                    met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                    ###Probabilities inclusive on both ends 
+                    valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
+                    ##Create mask field, fill it, and then write out      
+                    ##We only care about gates that have met the base QC thresholds, so first index 
+                    ##by indexer returned from calculate_features, and then set the gates between
+                    ##the specified probability levels to valid in the mask. The next model pass will 
+                    ##thus only be calculated upon these features. 
+                    idxer = curr_idx[1][:]
+                    idxer[idxer] .= Vector{Bool}(valid_idxs)
+                    new_mask[idxer] .= 1.
+                end 
+                new_mask = reshape(new_mask, dims)
                 write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"))
             end 
 
@@ -2370,6 +2436,10 @@ module Ronin
 
         ##Write broader pass features to disk 
         if write_out
+            
+            if size(Y)[1] == 0 
+                throw("Error in concstruct_next_pass_features. No gates met thresholds of current sweep.")
+            end 
 
             println("OUTPUTTING DATA IN HDF5 FORMAT TO FILE: $(curr_out)")
             fid = h5open(curr_out, "w")
@@ -2387,9 +2457,6 @@ module Ronin
         end
 
     end 
-
-
-
 
 
 
@@ -2455,9 +2522,6 @@ module Ronin
             if i < config.num_models 
 
                 currmodel = load_object(model) 
-
-
-
                 ###IMPORTANT: FOR THE INDEXING HERE, WE PROBABLY DON'T EVEN NEED TO DO THE COMPARISON ON THE PREDICTIONS. 
                 ###NEXT PASS SHOULD ALREADY BE WRITTEN TO A MASK 
                 input_data = h5open(config.feature_output_paths[i]) 
@@ -2513,7 +2577,9 @@ module Ronin
             end 
 
         end 
+
         ret
+
     end
 
 

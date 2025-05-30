@@ -20,31 +20,35 @@ function missing_avg(data)
     mean(skipmissing(data))
 end 
 
+### Returns flattened version of signal quality variable
+function calc_SIG(cfrad::NCDataset, varname::String)
+    return(cfrad[varname][:]) 
+end 
 
-##Returns flattened version of NCP 
-function calc_ncp(data::NCDataset)
-    ###Some ternary operator + short circuit trickery here 
+# ##Returns flattened version of NCP 
+# function calc_ncp(data::NCDataset)
+#     ###Some ternary operator + short circuit trickery here 
 
-    ###Modifications for new variable names in PICCOLO 
+#     ###Modifications for new variable names in PICCOLO 
 
 
-    # (("NCP" in keys(data)) ? (return(data["NCP"][:]))
-    #                     : ("SQI" in keys(data) ||  error("Could Not Find NCP in dataset")))
-    # return(data["SQI"][:])
+#     # (("NCP" in keys(data)) ? (return(data["NCP"][:]))
+#     #                     : ("SQI" in keys(data) ||  error("Could Not Find NCP in dataset")))
+#     # return(data["SQI"][:])
 
-    if "NCP_L2" in keys(data) 
-        println("RETURNING NCP L@2")
-        return(data["NCP_L2"][:])
-    elseif "SQI_L2" in keys(data) 
-        println("RETURNING SQI L2")
-        return(data["SQI_L2"][:])
-    elseif "NCP" in keys(data) 
-        return(data["NCP"][:])
-    elseif "SQI" in keys(data) 
-        return(data["SQI"][:])
-    end 
-    error("Could not find NCP_L2, SQI_L2, NCP, or SQI in Dataset")
-end
+#     if "NCP_L2" in keys(data) 
+#         println("RETURNING NCP L@2")
+#         return(data["NCP_L2"][:])
+#     elseif "SQI_L2" in keys(data) 
+#         println("RETURNING SQI L2")
+#         return(data["SQI_L2"][:])
+#     elseif "NCP" in keys(data) 
+#         return(data["NCP"][:])
+#     elseif "SQI" in keys(data) 
+#         return(data["SQI"][:])
+#     end 
+#     error("Could not find NCP_L2, SQI_L2, NCP, or SQI in Dataset")
+# end
 
 function calc_rng(data::NCDataset)
     return(repeat(data["range"][:], 1, length(data["time"])))
@@ -440,19 +444,22 @@ For spatial parameters, whether or not to replace `missings` values with `FILL_V
 
 # Returns: 
 
-    -X: Array that is dimensioned (num_gates x num_features) where num_gates is the number of valid 
-        (non-missing, meeting NCP/PGG thresholds) the function finds, and num_features is the 
+    -X::Matrix{Float32}: Matrix that is dimensioned (num_gates x num_features) where num_gates is the number of valid 
+        (non-missing, meeting NCP/PGG thresholds, non-masked) gates the function finds, and num_features is the 
         number of features specified in the argument file to calculate. 
 
-    -Y: IF HAS_INTERACTIVE_QC == true, will return Y, array containing 1 if a datapoint was retained 
-        during interactive QC, and 0 otherwise. 
+    -Y::Matrix{Bool} : IF HAS_INTERACTIVE_QC == true, will return Y, array containing 1 if a datapoint was retained 
+        during interactive QC, and 0 otherwise. Dimensioned as (num_gates x 1)
 
-    -INDEXER: Based on remove_variable as described above, contains boolean array specifiying
-                where in the scan features valid data and where does not. 
+    -INDEXER::Vector{Bool} : Based on remove_variable as described above, contains boolean array specifiying
+                where in the scan features valid data and where does not. Will also contain `false` where 
+                values in `feature_mask` are false. 
 """
 function process_single_file(cfrad::NCDataset, argfile_path::String; 
-    HAS_INTERACTIVE_QC::Bool = false, REMOVE_LOW_NCP::Bool = false, NCP_THRESHOLD::Float32 = .2f0, REMOVE_HIGH_PGG::Bool = false,
-    PGG_THRESHOLD::Float32 = 1.f0,  QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
+    HAS_INTERACTIVE_QC::Bool = false, 
+    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP", 
+    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
+     QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
     mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;], 
         weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
 
@@ -474,9 +481,11 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
 
     ###Array to hold PGG for indexing  
     PGG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
+    SIG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
 
     PGG_Completed_Flag = false 
-    NCP_Completed_Flag = false 
+    SIG_Completed_Flag = false 
+
     add_weight_matrix = (weight_matrixes != [Matrix{Union{Missing, Float32}}(undef, 0,0)]) & (length(weight_matrixes) == length(tasks))
     ### 
     if (! add_weight_matrix) & (weight_matrixes != [Matrix{Union{Missing, Float32}}(undef, 0,0)])
@@ -534,7 +543,6 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
                 raw = @eval $func($cfrad[$var][:,:]; weights=$weight_matrix, window = $window_size )[:]
             end 
 
-
             filled = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
         
             any(isnan, filled) ? throw("NAN ERROR") : 
@@ -558,14 +566,14 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
                 PGG = X[:, i]
             end 
 
-            if (task == "NCP" || task == "SQI") 
-                NCP_Completed_Flag = true 
-                NCP = X[:, i]
-            end 
-
             calc_length = time() - startTime 
         
         ###Otherwise it's just a variable from the cfrad 
+        elseif (task == "SIG") 
+            SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
+            SIG_Completed_Flag = true 
+            calc_length = time() - startTime 
+
         else 
             startTime = time() 
             X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in cfrad[task][:]]
@@ -592,6 +600,8 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
         ###This is a little confusing, but basically currently the INDEXER contains whether or not 
         ###the value is missing in the original scan. If so, we can already say it's not a valid gate.
         ###If non-missing, just do whatever the QC_mask says 
+
+        ##If gate is marked as missing, invalid, so set to false. Otherwise 
         INDEXER = [INDEXER[i] ? false : maskval for (i, maskval) in enumerate(feature_mask[:])]
     else 
         INDEXER = .! INDEXER
@@ -599,19 +609,19 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
 
     ###This got a little confusing so adding a comment here. 
     ###INDEXER now contains a value of true for valid indices (meeting basic QC thresholds + non missing)
-    ###and false for invaldi indicies.  
+    ###and false for invalid indicies.  
     
     starttime=time()
 
     ###Do we need a check for where stuff is equal fill val here? 
-    if (REMOVE_LOW_NCP)
+    if (REMOVE_LOW_SIG_QUALITY)
         ###Remove data that does not equal or exceed minimum NCP threshold 
         ###Only need to do this for indicies that are true in INDEXER, as this is only remaining valid data
-        if (NCP_Completed_Flag) 
-            INDEXER[INDEXER] = [x <= NCP_THRESHOLD ? false : true for x in NCP[INDEXER]]
+        if (SIG_Completed_Flag) 
+            INDEXER[INDEXER] = [x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         else 
-            NCP = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_ncp(cfrad)[:]]
-            INDEXER[INDEXER] = [ x <= NCP_THRESHOLD ? false : true for x in NCP[INDEXER]]
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_SIG(cfrad, SIG_QUALITY_VAR)[:]]
+            INDEXER[INDEXER] = [ x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end 
     end
 
@@ -648,19 +658,35 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
 
         return(X, Y, INDEXER)
     else
-
         return(X, false, INDEXER)
     end 
 end 
 
 
 
-
+"""
 ###Multiple dispatch version of process_single_file that allows user to specify a vector of weight matrixes 
 ###In this case will also pass the tasks to complete as a vector 
 ###weight_matrixes are also implicitly the window size 
+
+# Returns: 
+
+-X::Matrix{Float32}: Matrix that is dimensioned (num_gates x num_features) where num_gates is the number of valid 
+    (non-missing, meeting NCP/PGG thresholds, non-masked) gates the function finds, and num_features is the 
+    number of features specified in the argument file to calculate. 
+
+-Y::Matrix{Bool} : IF HAS_INTERACTIVE_QC == true, will return Y, array containing 1 if a datapoint was retained 
+    during interactive QC, and 0 otherwise. Dimensioned as (num_gates x 1)
+
+-INDEXER::Vector{Bool} : Based on remove_variable as described above, contains boolean array specifiying
+            where in the scan features valid data and where does not. Will also contain `false` where 
+            values in `feature_mask` are false. 
+
+"""
 function process_single_file(cfrad::NCDataset, tasks::Vector{String}, weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}; 
-    HAS_INTERACTIVE_QC::Bool = false, REMOVE_LOW_NCP::Bool = false, NCP_THRESHOLD::Float32 = .2f0, REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
+    HAS_INTERACTIVE_QC::Bool = false,
+     REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String = "NCP",
+     REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
     QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool = false, mask_features::Bool=false, feature_mask::Matrix{Bool} = [true true ; false false])
 
 
@@ -679,9 +705,10 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String}, weight_mat
 
     ###Array to hold PGG for indexing  
     PGG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
+    SIG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
 
     PGG_Completed_Flag = false 
-    NCP_Completed_Flag = false 
+    SIG_Completed_Flag = false 
 
     for (i, task) in enumerate(tasks)
 
@@ -740,14 +767,13 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String}, weight_mat
                 PGG = X[:, i]
             end 
 
-            if (task == "NCP" || task == "SQI") 
-                NCP_Completed_Flag = true 
-                NCP = X[:, i]
-            end 
-
             calc_length = time() - startTime 
         
         ###Otherwise it's just a variable from the cfrad 
+        elseif (task == "SIG") 
+            SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
+            SIG_Completed_Flag = true 
+            calc_length = time() - startTime 
         else 
             startTime = time() 
             X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in cfrad[task][:]]
@@ -777,13 +803,13 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String}, weight_mat
     
     starttime=time()
 
-    if (REMOVE_LOW_NCP)
+    if (REMOVE_LOW_SIG_QUALITY)
         ##Calculate NCP and set values that are below the threshold to invalid in the indexer 
-        if (NCP_Completed_Flag) 
-            INDEXER[INDEXER] = [x <= NCP_THRESHOLD ? false : true for x in NCP[INDEXER]]
+        if (SIG_Completed_Flag) 
+            INDEXER[INDEXER] = [x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         else 
-            NCP = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_ncp(cfrad)[:]]
-            INDEXER[INDEXER] = [ x <= NCP_THRESHOLD ? false : true for x in NCP[INDEXER]]
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, SIG_QUALITY_VAR)[:]]
+            INDEXER[INDEXER] = [ x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end 
     end
 
