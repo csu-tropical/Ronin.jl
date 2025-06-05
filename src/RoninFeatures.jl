@@ -21,7 +21,7 @@ function missing_avg(data)
 end 
 
 ### Returns flattened version of signal quality variable
-function calc_SIG(cfrad::NCDataset, varname::String)
+function calc_sig(cfrad::NCDataset, varname::String)
     return(cfrad[varname][:]) 
 end 
 
@@ -561,24 +561,26 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
         elseif (task in valid_derived_params)
 
             startTime = time() 
+            ###Included here for code clarity purposes, it's not really a 
+            ###bona-fide derived parameter but wiht the way the files are setup wanted to
+            ###include it in the list of derived parameters. 
+            if (task == "SIG") 
+                SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
+                SIG_Completed_Flag = true 
+            else
+                func = Symbol(func_prefix * lowercase(task))
+                raw = @eval $func($cfrad)[:]
+                X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
 
-            func = Symbol(func_prefix * lowercase(task))
-            raw = @eval $func($cfrad)[:]
-            X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
-
-            if (task == "PGG")
-                PGG_Completed_Flag = true
-                PGG = X[:, i]
+                if (task == "PGG")
+                    PGG_Completed_Flag = true
+                    PGG = X[:, i]
+                end 
+                
             end 
 
-            calc_length = time() - startTime 
-        
+            calc_length = time() - startTime
         ###Otherwise it's just a variable from the cfrad 
-        elseif (task == "SIG") 
-            SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
-            SIG_Completed_Flag = true 
-            calc_length = time() - startTime 
-
         else 
             startTime = time() 
             X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in cfrad[task][:]]
@@ -625,7 +627,7 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
         if (SIG_Completed_Flag) 
             INDEXER[INDEXER] = [x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         else 
-            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_SIG(cfrad, SIG_QUALITY_VAR)[:]]
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, SIG_QUALITY_VAR)[:]]
             INDEXER[INDEXER] = [ x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end 
     end
@@ -763,22 +765,24 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String}, weight_mat
 
             startTime = time() 
 
-            func = Symbol(func_prefix * lowercase(task))
-            raw = @eval $func($cfrad)[:]
-            X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
+            ###This is a little wonky, but it's included here for code clarity. 
+            if (task == "SIG") 
+                SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
+                SIG_Completed_Flag = true 
+            else
+                func = Symbol(func_prefix * lowercase(task))
+                raw = @eval $func($cfrad)[:]
+                X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
 
-            if (task == "PGG")
-                PGG_Completed_Flag = true
-                PGG = X[:, i]
+                if (task == "PGG")
+                    PGG_Completed_Flag = true
+                    PGG = X[:, i]
+                end 
             end 
 
             calc_length = time() - startTime 
         
         ###Otherwise it's just a variable from the cfrad 
-        elseif (task == "SIG") 
-            SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
-            SIG_Completed_Flag = true 
-            calc_length = time() - startTime 
         else 
             startTime = time() 
             X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in cfrad[task][:]]
