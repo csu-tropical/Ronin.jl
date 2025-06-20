@@ -2335,7 +2335,7 @@ module Ronin
                                 true_negatives = scores[6],
                                 false_negatives = scores[7],
                                 MD_retained_frac = scores[4] / (scores[4] + scores[7]),
-                                NMD_removed_frac = scores[6] / (scores[6] + socres[5]) 
+                                NMD_removed_frac = scores[6] / (scores[6] + scores[5]) 
         )
 
         return retval 
