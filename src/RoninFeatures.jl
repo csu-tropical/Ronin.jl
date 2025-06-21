@@ -146,7 +146,11 @@ end
 
 ##Calculate the windowed standard deviation of a given variablevariable 
 function calc_std(var::AbstractMatrix{Union{Missing, Float32}}; weights = std_weights, window = std_window)
-    mapwindow((x) -> _weighted_func(x, weights, missing_std), var, window, border=Fill(missing))
+
+    rows, cols = size(var)
+    out = Matrix{Float32}(undef, rows, cols) 
+    mapwindow!((x) -> _weighted_func(x, weights, missing_std), out, var, window, border=Fill(missing))
+    out 
 end 
 
 ##Calculate the windowed standard deviation of a given variablevariable 
@@ -166,8 +170,10 @@ function calc_avg(var::Matrix{Union{Missing, Float32}}; weights = avg_weights, w
     if ( REPLACE_MISSING_WITH_FILL)
         @inbounds var[map(ismissing, var)] .= FILL_VAL
     end 
-
-    @inbounds mapwindow((x) -> _weighted_func(x, weights, missing_avg), var, window, border=Fill(missing))
+    rows, cols = size(var) 
+    out = Matrix{Float32}(undef, rows, cols) 
+    @inbounds mapwindow!((x) -> _weighted_func(x, weights, missing_avg), out, var, window, border=Fill(missing))
+    out 
 end
 
 function calc_avg(var::Matrix{}; weights = avg_weights, window = avg_window)
@@ -622,6 +628,8 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
 
     ###Do we need a check for where stuff is equal fill val here? 
     if (REMOVE_LOW_SIG_QUALITY)
+
+    	println("DATAPOINTS BEFORE SIGNAL QUALITY THRESHOLDING APPLIED: $(sum(INDEXER))") 
         ###Remove data that does not equal or exceed minimum NCP threshold 
         ###Only need to do this for indicies that are true in INDEXER, as this is only remaining valid data
         if (SIG_Completed_Flag) 
@@ -630,10 +638,11 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
             SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, SIG_QUALITY_VAR)[:]]
             INDEXER[INDEXER] = [ x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end 
+	println("DATAPOINTS AFTER SIGNAL QUALITY THRESHOLD APPLIED: $(sum(INDEXER))") 
     end
 
     if (REMOVE_HIGH_PGG)
-        
+       println("DATATPOINTS BEFORE PGG REMOVAL $(sum(INDEXER))")  
         ###Remove data that is not equal to or less than maximum probability of ground gate 
         ###Only need to do this for indicies that are true in INDEXER, as this is only remaining valid data
         if (PGG_Completed_Flag)
@@ -642,6 +651,7 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
             PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
             INDEXER[INDEXER] = [x >= PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         end
+	println("DATAPIONTS AFTER PGG REMOVAL $(sum(INDEXER)))") 
 
     end
 

@@ -1966,14 +1966,16 @@ module Ronin
                 end 
                 
                 ###Need to actually pass the QC mask 
-                ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds 
+                ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
+		
                 X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
                     , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, 
                     REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
                     QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
                     mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
                 final_idxer = indexer 
-                
+                println("SUM OF INDEXER: $(sum(indexer))")
+		println("SHAPE OF X: $(size(X))") 
                 ###If there are no gates that meet the basic QC thresholds now, we're once again done. 
                 if sum(indexer) != 0 
 
