@@ -429,6 +429,7 @@ module Ronin
             catch e
                 if isa(e, DimensionMismatch)
                     printstyled(Base.stderr, "POSSIBLE ERRONEOUS CFRAD DIMENSIONS... SKIPPING $(path)\n"; color=:red)
+                    continue 
                 else 
                     printstyled(Base.stderr, "UNRECOVERABLE ERROR\n"; color=:red)
                     throw(e)
@@ -643,6 +644,7 @@ module Ronin
             catch e
                 if isa(e, DimensionMismatch)
                     printstyled(Base.stderr, "POSSIBLE ERRONEOUS CFRAD DIMENSIONS... SKIPPING $(path)\n"; color=:red)
+                    continue 
                 else 
                     printstyled(Base.stderr, "UNRECOVERABLE ERROR\n"; color=:red)
                     close(fid)
