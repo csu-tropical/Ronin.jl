@@ -1718,7 +1718,6 @@ module Ronin
         end 
 
         sweep_dims = (dimsize(input_set["range"]).range, dimsize(input_set["time"]).time)
-
         for var in config.VARS_TO_QC
             printstyled("QC-ING $(var) in $(filepath)\n", color=:green)
             ##Create new field to reshape QCed field to 
@@ -1856,6 +1855,10 @@ module Ronin
             push!(models, load_object(path))
         end 
         
+	weight_vec = config.task_weights 
+	max_weight_dims = maximum(map(size, vcat(weight_vec...)))
+	min_rows = round(Int32, ceil(max_weight_dims[1] / 2))
+	min_cols = round(Int32, ceil(max_weight_dims[2] / 2))
         ###Need to do this file by file so that the spatial context of gates is maintained 
         for file in files
             
@@ -1863,6 +1866,10 @@ module Ronin
             scan_dims = NCDataset(file) do f
                 (dimsize(f["range"]).range, dimsize(f["time"]).time)
             end 
+	    if (scan_dims[1] < min_rows) || (scan_dims[2] < min_cols) 
+		printstyled("ERROR: SWEEP $(file) DOES NOT MEET MINIMUM DIMENSIONS FOR SPECIFIED WEIGHT SIZES. SKIPPING....\n", color=:red)
+		continue 
+	    end 
             
             ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask 
             init_idxer = Vector{Bool}(undef, 0)
@@ -2271,6 +2278,8 @@ module Ronin
 
 
 
+
+  
     """
     `construct_next_pass_features(config::ModelConfig)`
     Function used to iteratively calculate the input features for a multi-pass model. Operates on a sweep-by-sweep basis by taking in 
@@ -2284,12 +2293,23 @@ module Ronin
                 ###Otherwise, we need to mask out the features we want to apply the model to on the next pass 
         @assert curr_model_num <= config.num_models
 
-        curr_model = load_object(config.model_output_paths[curr_model_num]) 
-        curr_metprobs = config.met_probs[curr_model_num]
-        curr_tasks = config.task_paths[curr_model_num]
-        curr_weights = config.task_weights[curr_model_num]
-        curr_out = config.feature_output_paths[curr_model_num] 
-        output_cols = get_num_tasks(curr_tasks)
+        ###If this is the 0th, we're just constructing the features for the first pass and don't need to do much other work 
+        ###This is basically useful for when we don't have a trained model and want to just get the initial set of features 
+        if curr_model_num > 0
+            curr_model = load_object(config.model_output_paths[curr_model_num]) 
+            curr_metprobs = config.met_probs[curr_model_num]
+            curr_tasks = config.task_paths[curr_model_num]
+            curr_weights = config.task_weights[curr_model_num]
+            curr_out = config.feature_output_paths[curr_model_num] 
+            output_cols = get_num_tasks(curr_tasks)
+        else 
+            curr_model = "" 
+            curr_metprobs = "" 
+            curr_tasks = config.task_paths[begin]
+            curr_weights = config.task_weights[begin]
+            curr_out = config.feature_output_paths[begin] 
+            output_cols = get_num_tasks(curr_tasks)
+        end 
 
         paths = Vector{String}() 
         file_path = config.input_path
@@ -2324,29 +2344,30 @@ module Ronin
             
             ###NEED to update this if it's beyond two pass so we can pass it the correct mask
             newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true; 
-                                verbose = config.verbose, REMOVE_LOW_NCP = config.REMOVE_LOW_NCP, 
-                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, QC_variable = config.QC_var, 
+                                verbose = config.verbose,
+                                REMOVE_LOW_NCP=true,
+                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var, 
                                 remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
                                 write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
         
-            if curr_model_num < config.num_models 
-                met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
-                ###Probabilities inclusive on both ends 
-                valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
-                print("RESULTANT GATES: $(sum(valid_idxs))")
-                ##Create mask field, fill it, and then write out
-                new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-                
-                ##We only care about gates that have met the base QC thresholds, so first index 
-                ##by indexer returned from calculate_features, and then set the gates between
-                ##the specified probability levels to valid in the mask. The next model pass will 
-                ##thus only be calculated upon these features. 
-                idxer = curr_idx[1][:]
-                ###Determine where the gates that meet basic QC threshold are between the met thresholds and assign
-                idxer[idxer] .= Vector{Bool}(valid_idxs)
-                new_mask[idxer] .= 1.
-                new_mask = reshape(new_mask, dims)
+            if (curr_model_num < config.num_models) && (curr_model_num > 0)
 
+                new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+
+                if (sum(curr_idx) > 0)
+                    met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                    ###Probabilities inclusive on both ends 
+                    valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
+                    ##Create mask field, fill it, and then write out      
+                    ##We only care about gates that have met the base QC thresholds, so first index 
+                    ##by indexer returned from calculate_features, and then set the gates between
+                    ##the specified probability levels to valid in the mask. The next model pass will 
+                    ##thus only be calculated upon these features. 
+                    idxer = curr_idx[1][:]
+                    idxer[idxer] .= Vector{Bool}(valid_idxs)
+                    new_mask[idxer] .= 1.
+                end 
+                new_mask = reshape(new_mask, dims)
                 write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"))
             end 
 
@@ -2357,6 +2378,10 @@ module Ronin
 
         ##Write broader pass features to disk 
         if write_out
+            
+            if size(Y)[1] == 0 
+                throw("Error in concstruct_next_pass_features. No gates met thresholds of current sweep.")
+            end 
 
             println("OUTPUTTING DATA IN HDF5 FORMAT TO FILE: $(curr_out)")
             fid = h5open(curr_out, "w")
@@ -2373,7 +2398,7 @@ module Ronin
             close(fid)
         end
 
-    end 
+    end  
 
 
 
