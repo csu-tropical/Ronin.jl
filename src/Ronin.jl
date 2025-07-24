@@ -2262,7 +2262,7 @@ module Ronin
         ```
 
     """
-    function evaluate_model(config::ModelConfig; models_trained::Bool = false)
+    function evaluate_model(config::ModelConfig; models_trained::Bool = false, features_calculated::Bool=false)
 
 
         ###This function will not handle the case where the model is trained but the features are not written. 
@@ -2277,6 +2277,10 @@ module Ronin
 
         if ! models_trained 
             train_multi_model(config)
+        elseif ! features_calculated
+            for (i, output_path) in enumerate(config.model_output_paths)
+                construct_next_pass_features(config, i)                        
+            end 
         end 
 
         ###Now, use the calculated features to get the predictions. 
