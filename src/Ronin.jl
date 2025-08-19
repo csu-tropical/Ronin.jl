@@ -1220,7 +1220,7 @@ module Ronin
     
     end 
 
-    
+
 
 
     """
@@ -1458,6 +1458,8 @@ module Ronin
         coef_values = Dict(param => [] for param in params)
         coef_values["λ"] = λs 
         rmses = [] 
+        precisions = [] 
+        recalls    = [] 
 
         for λ in λs
 
@@ -1470,8 +1472,14 @@ module Ronin
             results = pdf(y_pred, [0, 1])
             met_predictions = map(x -> x > pred_threshold ? 0 : 1, results[:, 1])
 
+            n_tru_positives = sum(met_predictions[targets_raw .== 1])
+            n_fal_positives = sum(met_predictions[targets_raw .== 0]) 
+            n_fal_negatives = sum(met_predictions[targets_raw .== 1] .== 0)
+            
             push!(rmses, MLJ.rmse(met_predictions, targets_raw))
-
+            push!(precisions, (n_tru_positives) / (n_tru_positives + n_fal_positives))
+            push!(recalls, (n_tru_positives) / (n_tru_positives + n_fal_negatives))
+            
             for (i, param) in enumerate(params)
                 push!(coef_values[param], coefs[i][2])
             end 
@@ -1480,6 +1488,8 @@ module Ronin
         end 
 
         coef_values["rmse"] = rmses
+        coef_values["precision"] = precisions 
+        coef_values["recall"]    = recalls 
         return(DataFrame(coef_values))
 
     end 
