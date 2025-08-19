@@ -2590,7 +2590,7 @@ module Ronin
 
                 new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
 
-                if (sum(vec(curr_idx)) > 0)
+                if (sum(vec(curr_idx[1])) > 0)
                     met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
                     ###Probabilities inclusive on both ends 
                     valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
