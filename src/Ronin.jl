@@ -1068,6 +1068,161 @@ module Ronin
 
 
 
+    function split_training_testing_validation!(DIR_PATHS::Vector{String}, TRAINING_PATH::String, TESTING_PATH::String, VALIDATION_PATH::String)
+
+        ###TODO  - make sure to ignore .tmp_hawkedit files OTHERWISE WON'T WORK AS EXPECTED 
+        TRAINING_FRAC::Float32 = .72f0
+        VALIDATION_FRAC::Float32 = .08f0
+        TESTING_FRAC:: Float32 = 1.f0 - TRAINING_FRAC - VALIDATION_FRAC
+    
+        ###Assume that each directory represents a different case 
+        NUM_CASES::Int64 = length(DIR_PATHS)
+    
+        ###Do a little input sanitaiton
+        if TRAINING_PATH[end] != '/'
+            TRAINING_PATH = TRAINING_PATH * '/'
+        end
+    
+        if TESTING_PATH[end] != '/'
+            TESTING_PATH = TESTING_PATH * '/'
+        end 
+    
+        for (i, path) in enumerate(DIR_PATHS)
+            if path[end] != '/'
+                DIR_PATHS[i] = path * '/'
+            end
+        end 
+    
+        ###Clean directories and remake them 
+        rm(TESTING_PATH, force = true, recursive = true)
+        rm(TRAINING_PATH, force = true, recursive = true) 
+    
+        mkdir(TESTING_PATH)
+        mkdir(TRAINING_PATH) 
+    
+    
+        TOTAL_SCANS::Int64 = 0 
+    
+        ###Calculate total number of TDR scans 
+        for path in DIR_PATHS
+            TOTAL_SCANS += length(readdir(path))
+        end 
+    
+        ###By convention, we will round the number of training scans down 
+        ###and the number of testing scans up 
+        TRAINING_SCANS::Int64 = Int(floor(TOTAL_SCANS * (TRAINING_FRAC + VALIDATION_FRAC)))
+        VALIDATION_SCANS::Int64 = Int(floor(TRAINING_SCANS * VALIDATION_FRAC))
+        TESTING_SCANS::Int64  = Int(ceil(TOTAL_SCANS * (TESTING_FRAC)))
+    
+        ###Further by convention, will add the remainder on to the last case 
+        ###A couple of notes here: Each case must have a minimum of NUM_TESTING_SCANS_PER_CASE
+        ###in order to ensure each case is represented preportionally 
+        ###This will be the number of scans removed, and the rest from the case will be placed into training
+        NUM_TRAINING_SCANS_PER_CASE::Int64 = TRAINING_SCANS ÷ NUM_CASES
+        TRAINING_REMAINDER::Int64          = TRAINING_SCANS % NUM_CASES 
+    
+        NUM_TESTING_SCANS_PER_CASE::Int64 = TESTING_SCANS ÷ NUM_CASES
+        TESTING_REMAINDER::Int64          = TESTING_SCANS % NUM_CASES 
+    
+        NUM_VALIDATION_SCANS_PER_CASE::Int64 = VALIDATION_SCANS ÷ NUM_CASES 
+        VALIDATION_REMAINDER::Int64       = VALIDATION_SCANS % NUM_CASES 
+    
+    
+        printstyled("\nTOTAL NUMBER OF TDR SCANS ACROSS ALL CASES: $TOTAL_SCANS\n", color=:green)
+        printstyled("TESTING SCANS PER CASE $(NUM_TESTING_SCANS_PER_CASE)\n", color=:orange)
+        printstyled("VALIDATION SCANS PER CASE $(NUM_VALIDATION_SCANS_PER_CASE)\n", color=:red)
+    
+        ###Each sequence of chronological TDR scans will be split as follows
+        ###[[T E S T][T   R   A   I   N][T E S T][T   R   A   I   N][T E S T]]
+        for path in DIR_PATHS
+    
+            contents = readdir(path)
+            num_cfrads = length(contents) 
+    
+            printstyled("NUMBER OF SCANS IN CASE: $(num_cfrads)\n", color=:red)
+            ###Take 1/3rd of NUM_TESTING_SCANS_PER_CASE from beginning, 1/3rd from middle, and 1/3rd from end 
+            ###Need to assume files are ordered chronologically in contents here
+            num_scans_for_training = num_cfrads - NUM_TESTING_SCANS_PER_CASE
+    
+            ###Need to handle a training group size that is odd 
+            training_group_size = num_scans_for_training ÷ 2 
+            training_group_remainder = num_scans_for_training % 2
+            printstyled("TRAINING GROUP SIZE: $(training_group_size) + REMAINDER: $(training_group_remainder)\n", color=:red)
+    
+            ###If the testing_group_size is not divisible by 3, simply take the remainder from the front end (again, by definiton)
+            testing_group_size = NUM_TESTING_SCANS_PER_CASE ÷ 3 
+            testing_remainder = NUM_TESTING_SCANS_PER_CASE % 3
+            printstyled("TESTING GROUP SIZE: $(testing_group_size) + REMAINDER $(testing_remainder)\n", color=:red)
+    
+            ###We will construct an indexer to determine which files are testing files and which 
+            ###files are training files 
+            testing_indexer = fill(false, num_cfrads)
+            
+            ###curr_idx holds the index of the LAST assignment made 
+            curr_idx = 0
+    
+            ###handle first group of testing cases
+            testing_indexer[1:testing_group_size + testing_remainder] .= true 
+            curr_idx = testing_group_size + testing_remainder
+            printstyled("\n INDEXES 1 TO $(curr_idx) ASSIGNED TESTING", color=:green)
+    
+            ###Add one group of training files
+            ###Handle possible remainder here too 
+            printstyled("\n INDEXES $(curr_idx) ", color=:green) 
+            curr_idx = curr_idx + training_group_size + training_group_remainder 
+            printstyled(" TO $(curr_idx) ASSIGNED TRAINING", color=:green) 
+    
+            ###Next group of testing files 
+            printstyled("\n INDEXES $(curr_idx + 1)", color=:green)
+            testing_indexer[curr_idx + 1: curr_idx + testing_group_size] .= true 
+            curr_idx = curr_idx + testing_group_size 
+            printstyled(" TO $(curr_idx) ASSIGNED TESTING", color=:green)
+    
+            ###Final group of training files 
+            printstyled("\n INDEXES $(curr_idx + 1)", color=:green)
+            curr_idx = curr_idx + training_group_size 
+            printstyled(" TO $(curr_idx) ASSIGNED TRAINING", color=:green)   
+    
+            ###Final group of testing files 
+            printstyled("\n INDEXES $(curr_idx + 1)", color=:green)
+            testing_indexer[curr_idx + 1: curr_idx + testing_group_size] .= true 
+            curr_idx = curr_idx + testing_group_size
+            printstyled(" TO $(curr_idx) ASSIGNED TESTING", color=:green)
+    
+            ###Everyting not in testing will be in training 
+            testing_files = contents[testing_indexer]
+            training_files = contents[.!testing_indexer] 
+    
+            printstyled("\nTotal length of case files: $(num_cfrads)\n", color=:red)
+            printstyled("Length of testing files: $(length(testing_files)) - $( (length(testing_files) / (num_cfrads)) ) percent\n" , color=:blue)
+            printstyled("Length of training files: $(length(training_files)) - $( (length(training_files) / (num_cfrads)) ) percent\n", color=:blue)
+    
+            @assert (length(testing_files) + length(training_files) == num_cfrads)
+            
+    
+            ###Grab NUM_VALIDATION_SCANS_PER_CASE random indexes from the training files 
+            validation_idxes = randperm(length(training_files))[1:NUM_VALIDATION_SCANS_PER_CASE]
+            validation_files = training_files[validation_idxes] 
+            training_files   = deleteat!(training_files, sort(validation_idxes)) 
+            #printstyled("\n SßUM OF TESTING AND TRAINING = $(length(testing_files) + length(training_files))\n",color=:green)
+            for file in training_files
+                symlink((path * file), TRAINING_PATH * file)
+            end 
+    
+            for file in validation_files 
+                symlink(joinpath(path, file), joinpath(VALIDATION_PATH, file)) 
+            end 
+    
+            for file in testing_files
+                symlink((path * file), TESTING_PATH * file)
+            end
+        end 
+    
+    end 
+
+    
+
+
     """
     Function to split a given directory or set of directories into training and testing files using the configuration
     described in DesRosiers and Bell 2023. **This function assumes that input directories only contain cfradial files 

@@ -651,7 +651,7 @@ function process_single_file(cfrad::NCDataset, argfile_path::String;
             PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
             INDEXER[INDEXER] = [x >= PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         end
-	println("DATAPIONTS AFTER PGG REMOVAL $(sum(INDEXER)))") 
+	println("DATAPIONTS AFTER PGG REMOVAL $(sum(INDEXER))") 
 
     end
 
