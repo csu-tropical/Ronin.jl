@@ -399,7 +399,7 @@ end
             values in `feature_mask` are false. 
 
 """
-function process_single_file(cfrad::NCDataset, argfile_path::Vector{String}; HAS_INTERACTIVE_QC::Bool = false, 
+function process_single_file(cfrad::NCDataset, argfile_path::String; HAS_INTERACTIVE_QC::Bool = false, 
     REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP", 
     REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
      QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
