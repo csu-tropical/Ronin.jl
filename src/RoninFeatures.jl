@@ -108,6 +108,9 @@ end
 
 function prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimuth)
 
+    if (ismissing(elevation_angle) || ismissing(antenna_range) || ismissing(aircraft_height) || ismissing(azimuth)) 
+        return missing 
+    end 
     ###If range of gate is less than altitude, cannot hit ground
     ###If elevation angle is positive, cannot hit ground 
     if (antenna_range < aircraft_height || elevation_angle > 0)

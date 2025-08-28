@@ -2082,10 +2082,16 @@ module Ronin
         ###Need to do this file by file so that the spatial context of gates is maintained 
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version 
         for file in files
-            
+            curr_starttime = time() 
                 ###Get dimensions 
-            scan_dims = NCDataset(file) do f
-                (dimsize(f["range"]).range, dimsize(f["time"]).time)
+
+            scan_dims = redirect_stdout(devnull) do 
+
+                scan_dims = NCDataset(file) do f
+                    (dimsize(f["range"]).range, dimsize(f["time"]).time)
+                end 
+
+                scan_dims 
             end 
             
             ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask 
@@ -2142,7 +2148,7 @@ module Ronin
                     mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
                 final_idxer = indexer 
                 println("SUM OF INDEXER: $(sum(indexer))")
-		println("SHAPE OF X: $(size(X))") 
+		        println("SHAPE OF X: $(size(X))") 
                 ###If there are no gates that meet the basic QC thresholds now, we're once again done. 
                 if sum(indexer) != 0 
 
@@ -2223,6 +2229,9 @@ module Ronin
             ###Probably put the below into a separate function for code clarity 
             if QC_mode 
                 QC_scan(config, file, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
+                if config.verbose 
+                    printstyled("COMPLETED FULL QC OF $(file) IN $(round((time() - curr_starttime), digits = 2)) SECONDS\n", color=:green) 
+                end 
             else 
                 if final_predictions != Vector{Bool}(undef, 0)
                     ##Add indexer to the indexer list 
@@ -2254,7 +2263,7 @@ module Ronin
         end 
         
 
-        if predictions == Vector{Bool}(undef, 0)
+        if ! QC_mode && predictions == Vector{Bool}(undef, 0)
             throw("ERROR: NO GATES IN INPUT DATASET MET BASIC QC THRESHOLDS")
         end 
 
@@ -2272,6 +2281,7 @@ module Ronin
         if return_probs
             return(predictions, values, init_idxers, total_met_probs)
         elseif QC_mode 
+            
             return 
         else 
             return(predictions, values, init_idxers)
@@ -2339,40 +2349,45 @@ module Ronin
     function write_field(filepath::String, fieldname::String, NEW_FIELD; overwrite::Bool = true, 
                 attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::T = FILL_VAL) where T <: Real
         
+        
+
         if ! isfile(filepath) 
             ds = NCDataset(filepath, "c") 
             close(ds) 
         end 
 
-        Dataset(filepath, "a") do input_set 
-            try 
-                print(input_set)
-                defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
-            catch e
-                println(e)
-                ###Simply overwrite the variable 
-                if e.msg == "NetCDF: String match to name in use" && (overwrite)
-                    if verbose
-                        println("$(fieldname) Already Exists in $(filepath)... overwriting") 
-                    end 
-                    input_set[fieldname][:,:] = NEW_FIELD 
-
-                    if attribs != Dict("" => "")
-                        for key in keys(attribs)
-                            if key == "_FillValue"
-                                continue 
-                            end 
-                            input_set[fieldname].attrib[key] = attribs[key]
-                        end 
-                    end 
-                    ##Copy over new attributes 
-                else 
-                    close(input_set)
-                    throw(e)
-                end 
-            end 
-
+        input_set = redirect_stdout(devnull) do
+            NCDataset(filepath, "a")
         end 
+
+     
+        try 
+            defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
+        catch e
+            println(e)
+            ###Simply overwrite the variable 
+            if e.msg == "NetCDF: String match to name in use" && (overwrite)
+                if verbose
+                    println("$(fieldname) Already Exists in $(filepath)... overwriting") 
+                end 
+                input_set[fieldname][:,:] = NEW_FIELD 
+
+                if attribs != Dict("" => "")
+                    for key in keys(attribs)
+                        if key == "_FillValue"
+                            continue 
+                        end 
+                        input_set[fieldname].attrib[key] = attribs[key]
+                    end 
+                end 
+                ##Copy over new attributes 
+            else 
+                close(input_set)
+                throw(e)
+            end 
+        end 
+
+    
 
     end 
 
