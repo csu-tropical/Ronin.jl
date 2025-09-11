@@ -1,7 +1,8 @@
 
 Ronin (Random forest Optimized Nonmeteorological IdentificatioN) is a package that utilizes a methodology developed by [Dr. Alex DesRosiers and Dr. Michael Bell](https://journals.ametsoc.org/view/journals/aies/aop/AIES-D-23-0064.1/AIES-D-23-0064.1.xml) to remove non-meteorological gates from Doppler radar scans by leveraging machine learning techniques. In its current form, it contains functionality to derive a set of features from input radar data, use these features to train a Random Forest classification model, and apply this model to the raw fields contained within the radar scans. It also has some model evaluation ability. The beginning of this guide will walk through a basic workflow to train a model starting from scratch.  
 
-
+# Package Philosophy 
+Ronin is written around a single model configuration struct, typed as `ModelConfig`. More documentation can be found in the API. All options necessary to define, train, and use a quality control model are contained wihthin it. 
 
 # Single-model Workflow Walkthrough 
 
@@ -108,16 +109,19 @@ Calculates the "isolation" of each gate of the variable with name VAR in the giv
 Calculates the average of each gate of the variable with name VAR in the given radar sweep. By default, gates that contain `missing` values are ignored in this calculation. 
 
 ---
-### **RNG/NRG**
+#### **RNG/NRG**
+---
 Calculates the range of all radar gates (RNG) from the airborne platform, or normalized by altitude (NRG). 
----
-### **PGG**
-**P**robability of **G**round **G**ate - a geometric calculation that gives the probability that a given radar gate is a result of reflection from the ground. 
----
 
-### **AHT**
-**A**ircraft **H**eigh**T** - calculates platform height while factoring in Earth curvature. 
 ---
+#### **PGG**
+**P**robability of **G**round **G**ate - a geometric calculation that gives the probability that a given radar gate is a result of reflection from the ground. 
+___
+
+
+#### **AHT**
+**A**ircraft **H**eigh**T** - calculates platform height while factoring in Earth curvature. 
+______
 
 
 ### **Implementing a new parameter**
