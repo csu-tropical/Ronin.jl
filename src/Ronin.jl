@@ -2204,18 +2204,15 @@ module Ronin
                     if i < config.num_models 
                         gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
                         new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                        ###If there are no gates of interest, write out the mask as ALL MISSINGS 
-                        if sum(gates_of_interest) == 0 
-                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
-                        else 
-                            @assert length(gates_of_interest) == sum(indexer) 
-            
-                            indexer[indexer] .= gates_of_interest 
+                        ###If there are no gates of interest, write out the mask as ALL MISSINGS
+                        ###Otherwise, fill in the gates of interest with 1's
+                        if sum(gates_of_interest) != 0
+                            @assert length(gates_of_interest) == sum(indexer)
+                            indexer[indexer] .= gates_of_interest
                             new_mask[indexer] .= 1. 
-                            new_mask = reshape(new_mask, scan_dims)
-            
-                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
-                        end 
+                        end
+                        new_mask = reshape(new_mask, scan_dims)
+                        write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
                     end 
                 else 
                     ###If the sum of the indexer is zero, we're done. There's nothing to predict upon. 
@@ -2902,19 +2899,16 @@ module Ronin
                         if i < config.num_models 
                             gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
                             new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                            ###If there are no gates of interest, write out the mask as ALL MISSINGS 
-                            if sum(gates_of_interest) == 0 
-                                write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
-                            else 
-                                @assert length(gates_of_interest) == sum(indexer) 
-                
-                                indexer[indexer] .= gates_of_interest 
+                            ###If there are no gates of interest, write out the mask as ALL MISSINGS
+                            ###Otherwise, fill in the gates of interest with 1's
+                            if sum(gates_of_interest) != 0
+                                @assert length(gates_of_interest) == sum(indexer)
+                                indexer[indexer] .= gates_of_interest
                                 new_mask[indexer] .= 1. 
-                                new_mask = reshape(new_mask, scan_dims)
-                
-                                write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
-                            end 
-                        end 
+                            end
+                            new_mask = reshape(new_mask, scan_dims)
+                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
+                         end
                     else 
                         ###If the sum of the indexer is zero, we're done. There's nothing to predict upon. 
                         ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction 
