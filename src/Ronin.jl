@@ -1809,7 +1809,7 @@ module Ronin
                         throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET")) 
                     end 
                     met_probs = met_probs[:, 2]
-                    valid_idxs = (met_probs .> minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
+                    valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
                     print("RESULTANT GATES: $(sum(valid_idxs))")
                     ##Create mask field, fill it, and then write out
                     new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
@@ -2604,7 +2604,7 @@ module Ronin
                 new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
 
                 if (sum(vec(curr_idx[1])) > 0)
-                    met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                    met_probs = DecisionTree.predict_proba(curr_model, newX)[:, 2]
                     ###Probabilities inclusive on both ends 
                     valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
                     ##Create mask field, fill it, and then write out      
@@ -2617,7 +2617,7 @@ module Ronin
                     new_mask[idxer] .= 1.
                 end 
                 new_mask = reshape(new_mask, dims)
-                write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"))
+                write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
             end 
 
             X = vcat(X, newX)::Matrix{Float32}
@@ -2804,6 +2804,8 @@ module Ronin
                 curr_probs = fill(-1.0, scan_dims[:])
     
                 ###For multi-pass models, iteratively construct predictions vector by applying models one at a time 
+                # Initialize QC mask as the original mask specified in the config. This will be updated to be the new mask after each pass of the model, but we need to start with the original mask for the first pass.
+                QC_mask = config.QC_mask
                 for (i, model_path) in enumerate(config.model_output_paths)
                     
     
@@ -2907,7 +2909,7 @@ module Ronin
                                 new_mask[indexer] .= 1. 
                             end
                             new_mask = reshape(new_mask, scan_dims)
-                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
+                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
                          end
                     else 
                         ###If the sum of the indexer is zero, we're done. There's nothing to predict upon. 
