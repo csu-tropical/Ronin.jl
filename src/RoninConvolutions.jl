@@ -1,0 +1,296 @@
+using Statistics
+using Random
+
+"""
+    ConvolutionKernel
+
+Holds a named convolution kernel matrix for spatial feature computation.
+"""
+struct ConvolutionKernel
+    name::String
+    weights::Matrix{Float32}
+end
+
+"""
+    build_kernel_bank(kernel_sizes::Vector{Int})
+
+Build a bank of convolution kernels at the specified scales.
+
+Returns a `Vector{ConvolutionKernel}` containing:
+- Mean kernels at each scale (uniform weights, normalized)
+- Laplacian 3x3 (edge/texture detection)
+- Sobel-like range gradient 3x3
+- Sobel-like azimuth gradient 3x3
+- Gaussian kernels at scales >= 5
+"""
+function build_kernel_bank(kernel_sizes::Vector{Int})
+    bank = ConvolutionKernel[]
+
+    for k in kernel_sizes
+        # Mean kernel (uniform, normalized to sum=1)
+        w = ones(Float32, k, k) ./ Float32(k * k)
+        push!(bank, ConvolutionKernel("mean_$(k)x$(k)", w))
+    end
+
+    # Laplacian 3x3 (edge detector, sum=0 for flat fields)
+    lap = Float32[0 1 0; 1 -4 1; 0 1 0]
+    push!(bank, ConvolutionKernel("laplacian_3x3", lap))
+
+    # Sobel-like range gradient (vertical = range dimension)
+    sobel_range = Float32[-1 -2 -1; 0 0 0; 1 2 1]
+    push!(bank, ConvolutionKernel("sobel_range_3x3", sobel_range))
+
+    # Sobel-like azimuth gradient (horizontal = azimuth dimension)
+    sobel_azi = Float32[-1 0 1; -2 0 2; -1 0 1]
+    push!(bank, ConvolutionKernel("sobel_azi_3x3", sobel_azi))
+
+    for k in kernel_sizes
+        if k >= 5
+            # Gaussian kernel
+            g = _gaussian_kernel(k)
+            push!(bank, ConvolutionKernel("gaussian_$(k)x$(k)", g))
+        end
+    end
+
+    return bank
+end
+
+"""
+    _gaussian_kernel(k::Int; sigma=nothing)
+
+Generate a k x k Gaussian kernel. If sigma is not given, defaults to (k-1)/4.
+"""
+function _gaussian_kernel(k::Int; sigma=nothing)
+    if sigma === nothing
+        sigma = (k - 1) / 4.0
+    end
+    center = (k + 1) / 2.0
+    w = Matrix{Float32}(undef, k, k)
+    for j in 1:k, i in 1:k
+        dx = i - center
+        dy = j - center
+        w[i, j] = Float32(exp(-(dx^2 + dy^2) / (2 * sigma^2)))
+    end
+    w ./= sum(w)
+    return w
+end
+
+"""
+    masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool})
+
+Compute a masked convolution over `data` using `kernel`, only considering gates where `valid` is true.
+
+Returns `(result, valid_fraction)` where:
+- `result[i,j]` = weighted sum of valid neighbors / sum of weights at valid neighbors
+- `valid_fraction[i,j]` = fraction of kernel footprint that had valid data (ISO equivalent)
+
+Missing/invalid gates contribute nothing. Edges are zero-padded (treated as invalid).
+"""
+function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool})
+    nrows, ncols = size(data)
+    kr, kc = size(kernel)
+    hr = kr ÷ 2
+    hc = kc ÷ 2
+
+    result = Matrix{Float32}(undef, nrows, ncols)
+    valid_frac = Matrix{Float32}(undef, nrows, ncols)
+
+    abs_kernel = abs.(kernel)
+
+    @inbounds for j in 1:ncols, i in 1:nrows
+        if !valid[i, j]
+            result[i, j] = Float32(FILL_VAL)
+            valid_frac[i, j] = 0.0f0
+            continue
+        end
+
+        weighted_sum = 0.0f0
+        weight_sum = 0.0f0
+        total_abs_weight = 0.0f0
+
+        for dj in -hc:hc, di in -hr:hr
+            ni = i + di
+            nj = j + dj
+            ki = di + hr + 1
+            kj = dj + hc + 1
+            kw = kernel[ki, kj]
+            akw = abs_kernel[ki, kj]
+
+            total_abs_weight += akw
+
+            if ni >= 1 && ni <= nrows && nj >= 1 && nj <= ncols && valid[ni, nj]
+                weighted_sum += kw * data[ni, nj]
+                weight_sum += akw
+            end
+        end
+
+        if weight_sum > 0.0f0
+            result[i, j] = weighted_sum / weight_sum
+            valid_frac[i, j] = total_abs_weight > 0 ? weight_sum / total_abs_weight : 0.0f0
+        else
+            result[i, j] = Float32(FILL_VAL)
+            valid_frac[i, j] = 0.0f0
+        end
+    end
+
+    return result, valid_frac
+end
+
+"""
+    compute_convolution_features(cfrad, conv_variables::Vector{String},
+                                  kernel_bank::Vector{ConvolutionKernel},
+                                  valid_mask::AbstractMatrix{Bool},
+                                  SIG_QUALITY_VAR::String)
+
+Compute the full convolution feature matrix for a single sweep.
+
+For each variable in `conv_variables` x each kernel in `kernel_bank`, produces 2 columns:
+  1. The convolved value
+  2. The valid fraction (ISO equivalent)
+
+Additionally appends scalar (non-convolved) physical features: AHT, ELV, RNG, NRG.
+
+Returns `(X::Matrix{Float32}, feature_names::Vector{String})` where X is
+(num_range * num_time) x num_features, with FILL_VAL for invalid gates.
+"""
+function compute_convolution_features(cfrad, conv_variables::Vector{String},
+                                       kernel_bank::Vector{ConvolutionKernel},
+                                       valid_mask::AbstractMatrix{Bool},
+                                       SIG_QUALITY_VAR::String)
+
+    nrows, ncols = size(valid_mask)
+    ngates = nrows * ncols
+
+    # Count features: (n_vars * n_kernels * 2) + 4 scalar features
+    n_conv_features = length(conv_variables) * length(kernel_bank) * 2
+    n_scalar_features = 4  # AHT, ELV, RNG, NRG
+    n_total = n_conv_features + n_scalar_features
+
+    X = Matrix{Float32}(undef, ngates, n_total)
+    feature_names = Vector{String}(undef, n_total)
+
+    col = 1
+
+    for varname in conv_variables
+        # Load the variable data
+        raw_data = if varname in keys(cfrad)
+            cfrad[varname][:, :]
+        elseif varname == "PGG"
+            calc_pgg(cfrad)
+        elseif varname == "SIG"
+            reshape(calc_sig(cfrad, SIG_QUALITY_VAR), nrows, ncols)
+        else
+            error("Unknown convolution variable: $varname")
+        end
+
+        # Convert to Float32 matrix, replacing missing/NaN with 0 (masked out by valid_mask)
+        data_f32 = Matrix{Float32}(undef, nrows, ncols)
+        for j in 1:ncols, i in 1:nrows
+            v = raw_data[i, j]
+            data_f32[i, j] = (ismissing(v) || (v isa AbstractFloat && isnan(v))) ? 0.0f0 : Float32(v)
+        end
+
+        for kern in kernel_bank
+            conv_result, vfrac = masked_convolve(data_f32, kern.weights, valid_mask)
+
+            X[:, col] = conv_result[:]
+            feature_names[col] = "$(varname)_$(kern.name)"
+            col += 1
+
+            X[:, col] = vfrac[:]
+            feature_names[col] = "$(varname)_$(kern.name)_vfrac"
+            col += 1
+        end
+    end
+
+    # Scalar physical features
+    aht = calc_aht(cfrad)
+    X[:, col] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in aht[:]]
+    feature_names[col] = "AHT"
+    col += 1
+
+    elv = calc_elv(cfrad)
+    X[:, col] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in elv[:]]
+    feature_names[col] = "ELV"
+    col += 1
+
+    rng = calc_rng(cfrad)
+    X[:, col] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in rng[:]]
+    feature_names[col] = "RNG"
+    col += 1
+
+    nrg = calc_nrg(cfrad)
+    X[:, col] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in nrg[:]]
+    feature_names[col] = "NRG"
+    col += 1
+
+    return X, feature_names
+end
+
+"""
+    select_features(importance_scores::Vector{Float64}, threshold_fraction::Float64)
+
+Given RF feature importance scores, return indices of features whose importance
+is above `threshold_fraction` of the maximum importance.
+
+Used during training to prune low-value features. The returned indices are saved
+with the model for use at inference time.
+"""
+function select_features(importance_scores::Vector{Float64}, threshold_fraction::Float64=0.01)
+    max_imp = maximum(importance_scores)
+    if max_imp <= 0.0
+        return collect(1:length(importance_scores))
+    end
+    threshold = threshold_fraction * max_imp
+    return findall(x -> x >= threshold, importance_scores)
+end
+
+"""
+    compute_rf_feature_importance(ensemble, X::Matrix{Float32}, Y::Vector, n_repeats::Int=5)
+
+Compute permutation-based feature importance for a random forest ensemble.
+For each feature, randomly shuffle that column and measure the drop in accuracy.
+Higher drop = more important feature.
+
+Returns a Vector{Float64} of importance scores (accuracy drop), one per feature.
+"""
+function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector; n_repeats::Int=5)
+    n_samples, n_features = size(X)
+
+    # Baseline accuracy
+    baseline_preds = DecisionTree.predict(model, X)
+    baseline_acc = sum(baseline_preds .== Y) / n_samples
+
+    importances = Vector{Float64}(undef, n_features)
+
+    for f in 1:n_features
+        acc_drops = 0.0
+        original_col = X[:, f]
+
+        for _ in 1:n_repeats
+            # Shuffle the column in-place
+            shuffled = original_col[randperm(n_samples)]
+            X[:, f] = shuffled
+
+            perm_preds = DecisionTree.predict(model, X)
+            perm_acc = sum(perm_preds .== Y) / n_samples
+            acc_drops += (baseline_acc - perm_acc)
+        end
+
+        # Restore original column
+        X[:, f] = original_col
+        importances[f] = acc_drops / n_repeats
+    end
+
+    return importances
+end
+
+"""
+    get_convolution_feature_count(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel})
+
+Return the total number of features that will be produced:
+(n_variables * n_kernels * 2) + 4 scalar features.
+"""
+function get_convolution_feature_count(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel})
+    return length(conv_variables) * length(kernel_bank) * 2 + 4
+end

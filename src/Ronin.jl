@@ -1,6 +1,7 @@
 module Ronin
 
-    include("./RoninFeatures.jl") 
+    include("./RoninFeatures.jl")
+    include("./RoninConvolutions.jl")
     include("./Io.jl")
     include("./DecisionTree/DecisionTree.jl")
  
@@ -22,11 +23,13 @@ module Ronin
     export calc_avg, calc_std, calc_iso, process_single_file 
     export parse_directory, get_num_tasks, get_task_params, remove_validation 
     export calculate_features
-    export split_training_testing! 
+    export split_training_testing!, split_training_testing_validation!
     export QC_scan, get_QC_mask
     export evaluate_model, get_feature_importance, error_characteristics
     export train_multi_model, ModelConfig, composite_prediction, get_contingency, compute_balanced_class_weights
     export multipass_uncertain, write_field, characterize_misclassified_gates, composite_QC
+    export ConvolutionKernel, build_kernel_bank, masked_convolve, compute_convolution_features
+    export select_features, compute_rf_feature_importance, get_convolution_feature_count
 
 
 
@@ -211,7 +214,7 @@ module Ronin
 
         file_preprocessed::Vector{Bool} 
 
-        task_paths::Vector{String} = [""]
+        task_paths::Vector{Union{String, Vector{String}}} = [""]
         task_list::Vector{String} = [""]
         task_weights::Vector{Vector{Matrix{Union{Float32, Missing}}}} = [[Matrix{Union{Float32, Missing}}(undef, 0,0)]]
 
@@ -241,9 +244,14 @@ module Ronin
         SIG_QUALITY_THRESHOLD::Float32 = .2f0
         PGG_THRESHOLD::Float32 = 1.f0  
 
-        SIG_QUALITY_VAR::String = "NCP" 
-        
-    end 
+        SIG_QUALITY_VAR::String = "NCP"
+
+        conv_variables::Vector{String} = ["DBZ", "VEL"]
+        conv_kernel_sizes::Vector{Int} = [3, 5, 7]
+        selected_features::Vector{Int} = Int[]
+        feature_importance_threshold::Float64 = 0.01
+
+    end
 
     """ 
         Helper function to compute balanced weights according to the
@@ -580,9 +588,26 @@ module Ronin
     ```
     Whether or not to write out to file. 
     """
+    ###Dispatch for when tasks are provided directly as a Vector{String} instead of a file path.
+    ###Matches the same positional argument layout as the file-path version so that
+    ###config.task_paths entries of either type dispatch correctly.
+    function calculate_features(input_loc::String, tasks::Vector{String}, output_file::String, HAS_INTERACTIVE_QC::Bool;
+        verbose::Bool=false, REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP",
+        REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32=1.f0,
+        QC_variable::String = "VG", remove_variable::String = "VV",
+        replace_missing::Bool = false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String = "", return_idxer::Bool=false,
+        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
+
+        calculate_features(input_loc, tasks, weight_matrixes, output_file, HAS_INTERACTIVE_QC;
+            verbose=verbose, REMOVE_LOW_SIG_QUALITY=REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD=SIG_QUALITY_THRESHOLD,
+            SIG_QUALITY_VAR=SIG_QUALITY_VAR, REMOVE_HIGH_PGG=REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD,
+            QC_variable=QC_variable, remove_variable=remove_variable, replace_missing=replace_missing,
+            write_out=write_out, QC_mask=QC_mask, mask_name=mask_name, return_idxer=return_idxer)
+    end
+
     function calculate_features(input_loc::String, tasks::Vector{String}, weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}
         ,output_file::String, HAS_INTERACTIVE_QC::Bool; verbose::Bool=false,
-         REMOVE_LOW_SIG_QUALITY = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP", REMOVE_HIGH_PGG = false, PGG_THRESHOLD::Float32=.1f0, QC_variable::String = "VG", remove_variable::String = "VV", 
+         REMOVE_LOW_SIG_QUALITY = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP", REMOVE_HIGH_PGG = false, PGG_THRESHOLD::Float32=.1f0, QC_variable::String = "VG", remove_variable::String = "VV",
          replace_missing::Bool=false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String="", return_idxer::Bool =false)
 
         ##If this is a directory, things get a little more complicated 
@@ -621,19 +646,19 @@ module Ronin
                 if QC_mask
 
                     currmask = Matrix{Bool}(.! map(ismissing, cfrad[mask_name][:,:]))
-                    (newX, newY, indexer) = process_single_file(cfrad, tasks, weight_matrixes; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                    (newX, newY, indexer) = process_single_file(cfrad, tasks;
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC,
                                                 REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = SIG_QUALITY_VAR,
-                                                REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD = PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
-                                                replace_missing=replace_missing, feature_mask = currmask, mask_features = true)
-                    
-                else 
-                    (newX, newY, indexer) = process_single_file(cfrad, tasks, weight_matrixes; 
-                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC, 
+                                                REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD = PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable,
+                                                replace_missing=replace_missing, feature_mask = currmask, mask_features = true, weight_matrixes=weight_matrixes)
+
+                else
+                    (newX, newY, indexer) = process_single_file(cfrad, tasks;
+                                                HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC,
                                                 REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = SIG_QUALITY_VAR,
-                                                REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable, 
-                                                replace_missing=replace_missing)
-                end 
+                                                REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, remove_variable = remove_variable,
+                                                replace_missing=replace_missing, weight_matrixes=weight_matrixes)
+                end
 
                 
                 close(cfrad)
@@ -694,20 +719,180 @@ module Ronin
             end 
         end 
 
-    end 
+    end
 
+
+    """
+        process_single_file_conv(cfrad::NCDataset, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
+                                  feature_mask::Matrix{Bool}=placeholder_mask, mask_features::Bool=false)
+
+    Convolution-mode equivalent of `process_single_file`. Computes convolution features
+    for a single sweep, builds the validity mask and INDEXER, and returns (X, Y, INDEXER).
+    """
+    function process_single_file_conv(cfrad::NCDataset, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
+                                       feature_mask::AbstractMatrix{Bool}=placeholder_mask, mask_features::Bool=false)
+
+        cfrad_dims = (cfrad.dim["range"], cfrad.dim["time"])
+        ngates = cfrad_dims[1] * cfrad_dims[2]
+
+        # Build INDEXER: valid where remove_var is non-missing
+        VT = cfrad[config.remove_var][:]
+        INDEXER = [!ismissing(x) for x in VT]
+
+        if mask_features
+            INDEXER = [INDEXER[i] ? maskval : false for (i, maskval) in enumerate(feature_mask[:])]
+        end
+
+        # PGG thresholding
+        PGG = nothing
+        if config.REMOVE_HIGH_PGG
+            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
+            INDEXER[INDEXER] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
+        end
+
+        # Signal quality thresholding
+        if config.REMOVE_LOW_SIG_QUALITY
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, config.SIG_QUALITY_VAR)[:]]
+            INDEXER[INDEXER] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
+        end
+
+        # Build 2D valid mask for convolutions
+        valid_mask = reshape(copy(INDEXER), cfrad_dims)
+
+        # Determine which variables to convolve (include PGG if not in conv_variables)
+        conv_vars = copy(config.conv_variables)
+
+        # Compute convolution features
+        X_full, feature_names = compute_convolution_features(cfrad, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR)
+
+        # If selected_features is set (inference), subset columns
+        if !isempty(config.selected_features)
+            X_full = X_full[:, config.selected_features]
+        end
+
+        # Subset rows by INDEXER
+        X = X_full[INDEXER, :]
+
+        # Build Y if interactive QC
+        if config.HAS_INTERACTIVE_QC
+            VG = cfrad[config.QC_var][:][INDEXER]
+            VV = cfrad[config.remove_var][:][INDEXER]
+            Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
+            return (X, Y, INDEXER, feature_names)
+        else
+            return (X, false, INDEXER, feature_names)
+        end
+    end
+
+
+    """
+        calculate_features_conv(config::ModelConfig, output_file::String;
+                                 QC_mask::Bool=false, mask_name::String="",
+                                 write_out::Bool=true, return_idxer::Bool=false)
+
+    Convolution-mode feature calculation. Iterates over all files in `config.input_path`
+    and computes convolution features for each sweep.
+    """
+    function calculate_features_conv(config::ModelConfig, output_file::String;
+                                      QC_mask::Bool=false, mask_name::String="",
+                                      write_out::Bool=true, return_idxer::Bool=false)
+
+        paths = isdir(config.input_path) ? parse_directory(config.input_path) : [config.input_path]
+
+        kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+        n_features = get_convolution_feature_count(config.conv_variables, kernel_bank)
+        if !isempty(config.selected_features)
+            n_features = length(config.selected_features)
+        end
+
+        X = Matrix{Float32}(undef, 0, n_features)
+        Y = Matrix{Int64}(undef, 0, 1)
+        idxs = Vector{}(undef, 0)
+        all_feature_names = String[]
+
+        starttime = time()
+
+        for path in paths
+            cfrad = Dataset(path)
+            try
+                pathstarttime = time()
+                dims = (cfrad.dim["range"], cfrad.dim["time"])
+
+                fm = if QC_mask && mask_name != ""
+                    Matrix{Bool}(.!map(ismissing, cfrad[mask_name][:, :]))
+                else
+                    trues(dims)
+                end
+
+                result = process_single_file_conv(cfrad, config, kernel_bank;
+                                                   feature_mask=fm, mask_features=QC_mask)
+                newX = result[1]
+                newY = result[2]
+                indexer = result[3]
+                feature_names = result[4]
+
+                if isempty(all_feature_names)
+                    all_feature_names = feature_names
+                end
+
+                close(cfrad)
+
+                if config.verbose
+                    println("Processed $(path) in $(round(time() - pathstarttime, digits=2)) seconds [conv mode]")
+                end
+
+                X = vcat(X, newX)::Matrix{Float32}
+                if newY !== false
+                    Y = vcat(Y, newY)::Matrix{Int64}
+                end
+                push!(idxs, reshape(indexer, dims))
+
+            catch e
+                if isa(e, DimensionMismatch)
+                    printstyled(Base.stderr, "POSSIBLE ERRONEOUS CFRAD DIMENSIONS... SKIPPING $(path)\n"; color=:red)
+                    continue
+                else
+                    close(cfrad)
+                    throw(e)
+                end
+            end
+        end
+
+        println("COMPLETED PROCESSING $(length(paths)) FILES IN $(round((time() - starttime), digits=2)) SECONDS [conv mode]")
+
+        if write_out
+            println("OUTPUTTING DATA IN HDF5 FORMAT TO FILE: $(output_file)")
+            fid = h5open(output_file, "w")
+            if !isempty(config.selected_features)
+                attributes(fid)["Parameters"] = all_feature_names[config.selected_features]
+            else
+                attributes(fid)["Parameters"] = all_feature_names
+            end
+            attributes(fid)["MISSING_FILL_VALUE"] = FILL_VAL
+            println("WRITING DATA TO FILE OF SHAPE $(size(X))")
+            write_dataset(fid, "X", X)
+            write_dataset(fid, "Y", Y)
+            close(fid)
+        end
+
+        if return_idxer
+            return X, Y, idxs
+        else
+            return X, Y
+        end
+    end
 
 
     """
 
-    Function to train a random forest model using a precalculated set of input and output features (usually output from 
-    `calculate_features`). Returns nothing. 
+    Function to train a random forest model using a precalculated set of input and output features (usually output from
+    `calculate_features`). Returns nothing.
 
-    # Required arguments 
+    # Required arguments
     ```julia
     input_h5::String
     ```
-    Location of input features/targets. Input features are expected to have the name "X", and targets the name "Y". This should be 
+    Location of input features/targets. Input features are expected to have the name "X", and targets the name "Y". This should be
     taken care of automatically if they are outputs from `calculate_features`
 
     ```julia
@@ -1102,12 +1287,12 @@ module Ronin
         mkdir(TRAINING_PATH) 
     
     
-        TOTAL_SCANS::Int64 = 0 
-    
-        ###Calculate total number of TDR scans 
+        TOTAL_SCANS::Int64 = 0
+
+        ###Calculate total number of TDR scans
         for path in DIR_PATHS
-            TOTAL_SCANS += length(readdir(path))
-        end 
+            TOTAL_SCANS += length(filter(f -> startswith(f, RADAR_FILE_PREFIX), readdir(path)))
+        end
     
         ###By convention, we will round the number of training scans down 
         ###and the number of testing scans up 
@@ -1136,9 +1321,9 @@ module Ronin
         ###Each sequence of chronological TDR scans will be split as follows
         ###[[T E S T][T   R   A   I   N][T E S T][T   R   A   I   N][T E S T]]
         for path in DIR_PATHS
-    
-            contents = readdir(path)
-            num_cfrads = length(contents) 
+
+            contents = filter(f -> startswith(f, RADAR_FILE_PREFIX), readdir(path))
+            num_cfrads = length(contents)
     
             printstyled("NUMBER OF SCANS IN CASE: $(num_cfrads)\n", color=:red)
             ###Take 1/3rd of NUM_TESTING_SCANS_PER_CASE from beginning, 1/3rd from middle, and 1/3rd from end 
@@ -1285,27 +1470,27 @@ module Ronin
         mkdir(TRAINING_PATH) 
 
 
-        TOTAL_SCANS::Int64 = 0 
+        TOTAL_SCANS::Int64 = 0
 
-        ###Calculate total number of TDR scans 
+        ###Calculate total number of TDR scans
         for path in DIR_PATHS
-            TOTAL_SCANS += length(readdir(path))
-        end 
+            TOTAL_SCANS += length(filter(f -> startswith(f, RADAR_FILE_PREFIX), readdir(path)))
+        end
 
-        ###By convention, we will round the number of training scans down 
-        ###and the number of testing scans up 
+        ###By convention, we will round the number of training scans down
+        ###and the number of testing scans up
         TRAINING_SCANS::Int64 = Int(floor(TOTAL_SCANS * (TRAINING_FRAC + VALIDATION_FRAC)))
         TESTING_SCANS::Int64  = Int(ceil(TOTAL_SCANS * (TESTING_FRAC)))
 
-        ###Further by convention, will add the remainder on to the last case 
+        ###Further by convention, will add the remainder on to the last case
         ###A couple of notes here: Each case must have a minimum of NUM_TESTING_SCANS_PER_CASE
-        ###in order to ensure each case is represented preportionally 
+        ###in order to ensure each case is represented preportionally
         ###This will be the number of scans removed, and the rest from the case will be placed into training
         NUM_TRAINING_SCANS_PER_CASE::Int64 = TRAINING_SCANS ÷ NUM_CASES
-        TRAINING_REMAINDER::Int64          = TRAINING_SCANS % NUM_CASES 
+        TRAINING_REMAINDER::Int64          = TRAINING_SCANS % NUM_CASES
 
         NUM_TESTING_SCANS_PER_CASE::Int64 = TESTING_SCANS ÷ NUM_CASES
-        TESTING_REMAINDER::Int64          = TESTING_SCANS % NUM_CASES 
+        TESTING_REMAINDER::Int64          = TESTING_SCANS % NUM_CASES
 
 
         printstyled("\nTOTAL NUMBER OF TDR SCANS ACROSS ALL CASES: $TOTAL_SCANS\n", color=:green)
@@ -1315,8 +1500,8 @@ module Ronin
         ###[[T E S T][T   R   A   I   N][T E S T][T   R   A   I   N][T E S T]]
         for path in DIR_PATHS
 
-            contents = readdir(path)
-            num_cfrads = length(contents) 
+            contents = filter(f -> startswith(f, RADAR_FILE_PREFIX), readdir(path))
+            num_cfrads = length(contents)
 
             printstyled("NUMBER OF SCANS IN CASE: $(num_cfrads)\n", color=:red)
             ###Take 1/3rd of NUM_TESTING_SCANS_PER_CASE from beginning, 1/3rd from middle, and 1/3rd from end 
@@ -1695,141 +1880,214 @@ module Ronin
         -None 
     """
     function train_multi_model(config::ModelConfig)
-        ##Quick input sanitation check 
-        @assert (length(config.model_output_paths) == length(config.feature_output_paths)
-                 == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
-        
-        if !(config.HAS_INTERACTIVE_QC)
-            throw("ERROR: Input cfradials must have interactive QC present to train a model. Set config HAS_INTERACTIVE_QC flag to true") 
-        end 
-        full_start_time = time() 
-        ###Iteratively train models and apply QC_scan with the specified probabilites to train a multi-pass model 
-        ###pipeline 
-        for (i, model_path) in enumerate(config.model_output_paths)
-            
-            out = config.feature_output_paths[i] 
-            currt = config.task_paths[i]
-            cw = config.task_weights[i]
+        ##Quick input sanitation check
+        if config.task_mode != "convolution"
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        else
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.mask_names))
+        end
 
-            ##If execution proceeds past the first iteration, a composite model is being created, and 
-            ##so a further mask will be applied to the features 
+        if !(config.HAS_INTERACTIVE_QC)
+            throw("ERROR: Input cfradials must have interactive QC present to train a model. Set config HAS_INTERACTIVE_QC flag to true")
+        end
+        full_start_time = time()
+        ###Iteratively train models and apply QC_scan with the specified probabilites to train a multi-pass model
+        ###pipeline
+        for (i, model_path) in enumerate(config.model_output_paths)
+
+            out = config.feature_output_paths[i]
+
+            # Each pass trains on ALL features; clear any selection from previous pass
+            config.selected_features = Int[]
+
+            ##If execution proceeds past the first iteration, a composite model is being created, and
+            ##so a further mask will be applied to the features
             if i > 1
-                QC_mask = true 
-            else 
-                QC_mask = config.QC_mask 
-            end 
-    
+                QC_mask = true
+            else
+                QC_mask = config.QC_mask
+            end
+
             QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
-    
-            starttime = time() 
-            
+
+            starttime = time()
+
             if config.file_preprocessed[i]
-    
+
                 print("Reading input features from file $(out)...\n")
                 h5open(out) do f
                     X = f["X"][:,:]
                     Y = f["Y"][:,:]
-                end 
-    
-            else
-                printstyled("\nCALCULATING FEATURES FOR PASS: $(i)\n", color=:green)
+                end
 
-                ###Check to see if the features file already exists, if so, delete it so 
-                ###that it may be overwritten 
+            elseif config.task_mode == "convolution"
+                printstyled("\nCALCULATING CONVOLUTION FEATURES FOR PASS: $(i)\n", color=:green)
+
                 if config.write_out & config.overwrite_output
                     isfile(out) ? rm(out) : ""
-                end 
+                end
 
-                X,Y = calculate_features(config.input_path, currt, out, config.HAS_INTERACTIVE_QC; 
-                                    verbose = config.verbose, 
+                X, Y = calculate_features_conv(config, out;
+                                                QC_mask=QC_mask, mask_name=mask_name,
+                                                write_out=config.write_out)
+                printstyled("FINISHED CALCULATING CONVOLUTION FEATURES FOR PASS $(i) in $(round(time() - starttime, digits=3)) seconds...\n", color=:green)
+            else
+                currt = config.task_paths[i]
+                cw = config.task_weights[i]
+
+                printstyled("\nCALCULATING FEATURES FOR PASS: $(i)\n", color=:green)
+
+                if config.write_out & config.overwrite_output
+                    isfile(out) ? rm(out) : ""
+                end
+
+                X,Y = calculate_features(config.input_path, currt, out, config.HAS_INTERACTIVE_QC;
+                                    verbose = config.verbose,
                                     REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
-                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var, 
+                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var,
                                     remove_variable = config.remove_var, replace_missing = config.replace_missing,
                                     write_out = config.write_out, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
                 printstyled("FINISHED CALCULATING FEATURES FOR PASS $(i) in $(round(time() - starttime, digits = 3)) seconds...\n", color=:green)
-            end 
-    
+            end
+
             printstyled("\nTRAINING MODEL FOR PASS: $(i)\n", color=:green)
-            starttime = time() 
-    
+            starttime = time()
+
             class_weights = Vector{Float32}([0.0,1.0])
-            ##Train model based on these features 
+            ##Train model based on these features
             if config.class_weights != ""
-    
+
                 if lowercase(config.class_weights) != "balanced"
                     printstyled("ERROR: UNKNOWN CLASS WEIGHT $(config.class_weights)... \nContinuing with no weighting\n", color=:yellow)
-                else 
-    
+                else
+
                     class_weights = Vector{Float32}(fill(0,length(Y[:,:][:])))
                     weight_dict = compute_balanced_class_weights(Y[:,:][:])
                     for class in keys(weight_dict)
                         class_weights[Y[:,:][:] .== class] .= weight_dict[class]
-                    end 
-    
-                end 
-            end 
-            
+                    end
+
+                end
+            end
+
             printstyled("\n...TRAINING FOR PASS: $(i) ON $(size(X)[1]) GATES...\n", color=:green)
-        
+
             train_model(out, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
-    
-            
+
+            # Feature importance and selection for convolution mode
+            if config.task_mode == "convolution"
+                printstyled("\nCOMPUTING FEATURE IMPORTANCE FOR PASS $(i)...\n", color=:green)
+                curr_model = load_object(model_path)
+                importances = compute_rf_feature_importance(curr_model, X, reshape(Y, length(Y)))
+
+                kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+                n_total = get_convolution_feature_count(config.conv_variables, kernel_bank)
+                feat_names_full = String[]
+                for varname in config.conv_variables
+                    for kern in kernel_bank
+                        push!(feat_names_full, "$(varname)_$(kern.name)")
+                        push!(feat_names_full, "$(varname)_$(kern.name)_vfrac")
+                    end
+                end
+                append!(feat_names_full, ["AHT", "ELV", "RNG", "NRG"])
+
+                # Print importance ranking
+                sorted_idx = sortperm(importances, rev=true)
+                printstyled("\n  FEATURE IMPORTANCE RANKING (Pass $(i)):\n", color=:cyan)
+                for (rank, idx) in enumerate(sorted_idx)
+                    name = idx <= length(feat_names_full) ? feat_names_full[idx] : "feature_$(idx)"
+                    printstyled("    $(rank). $(name): $(round(importances[idx], digits=6))\n", color=:cyan)
+                end
+
+                # Feature selection: prune low-importance features
+                selected = select_features(importances, config.feature_importance_threshold)
+                printstyled("\n  SELECTED $(length(selected))/$(length(importances)) FEATURES above $(config.feature_importance_threshold * 100)% threshold\n", color=:green)
+
+                # Save selected features alongside model
+                JLD2.jldsave(model_path;
+                    model=curr_model,
+                    selected_features=selected,
+                    feature_names=feat_names_full,
+                    importances=importances)
+                printstyled("  Saved model + feature selection to $(model_path)\n", color=:green)
+
+                # Update config for subsequent passes
+                config.selected_features = selected
+            end
+
             ###If this was the last pass, we don't need to write out a mask, and we're done!
-            ###Otherwise, we need to mask out the features we want to apply the model to on the next pass 
+            ###Otherwise, we need to mask out the features we want to apply the model to on the next pass
             if i < config.num_models
 
-                curr_model = load_object(model_path) 
+                curr_model = if config.task_mode == "convolution"
+                    JLD2.load(model_path, "model")
+                else
+                    load_object(model_path)
+                end
                 curr_metprobs = config.met_probs[i]
-    
-                paths = Vector{String}() 
+
+                paths = Vector{String}()
                 file_path = config.input_path
-    
-                if isdir(file_path) 
+
+                if isdir(file_path)
                     paths = parse_directory(file_path)
-                else 
+                else
                     paths = [file_path]
-                end 
-                    
+                end
+
                 for path in paths
-    
+
                     dims = Dataset(path) do f
                         (f.dim["range"], f.dim["time"])
-                    end 
-                    
-                    ###NEED to update this if it's beyond two pass so we can pass it the correct mask
-                    X, Y, idxer = calculate_features(path, currt, out, true; 
-                                        verbose = config.verbose, 
-                                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
-                                        REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var, 
-                                        remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
-                                        write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
-                    
+                    end
+
+                    if config.task_mode == "convolution"
+                        # Use convolution path for mask generation
+                        # The current pass's model was trained on ALL features,
+                        # so clear selected_features to get the full feature set
+                        config_single = deepcopy(config)
+                        config_single.input_path = path
+                        config_single.write_out = false
+                        config_single.selected_features = Int[]
+                        X, Y, idxer_list = calculate_features_conv(config_single, out;
+                                                                     QC_mask=QC_mask, mask_name=mask_name,
+                                                                     write_out=false, return_idxer=true)
+                        idxer = idxer_list
+                    else
+                        currt = config.task_paths[i]
+                        cw = config.task_weights[i]
+                        X, Y, idxer = calculate_features(path, currt, out, true;
+                                            verbose = config.verbose,
+                                            REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
+                                            REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var,
+                                            remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
+                                            write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
+                    end
+
                     met_probs = DecisionTree.predict_proba(curr_model, X)
                     if size(met_probs)[2] < 2
-                        throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET")) 
-                    end 
+                        throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET"))
+                    end
                     met_probs = met_probs[:, 2]
                     valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
                     print("RESULTANT GATES: $(sum(valid_idxs))")
                     ##Create mask field, fill it, and then write out
                     new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-                   
-                    ##We only care about gates that have met the base QC thresholds, so first index 
-                    ##by indexer returned from calculate_features, and then set the gates between
-                    ##the specified probability levels to valid in the mask. The next model pass will 
-                    ##thus only be calculated upon these features. 
+
                     idxer = idxer[1][:]
                     idxer[idxer] .= Vector{Bool}(valid_idxs)
                     new_mask[idxer] .= 1.
                     new_mask = reshape(new_mask, dims)
-        
+
                     write_field(path, config.mask_names[i+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"))
-    
-                end 
-            end   
-        end 
-        printstyled("\n COMPLETED TRAINING MODEL IN $(round(time() - full_start_time, digits = 3)) seconds...\n", color=:green)   
-    end 
+
+                end
+            end
+        end
+        printstyled("\n COMPLETED TRAINING MODEL IN $(round(time() - full_start_time, digits = 3)) seconds...\n", color=:green)
+    end
     
     """
     `QC_scan(input_cfrad::String, features::Matrix{Float32}, indexer::Vector{Bool}, config::ModelConfig, iter::Int64)`
@@ -2056,30 +2314,39 @@ module Ronin
     """
     function composite_prediction(config::ModelConfig; write_predictions_out::Bool = false, prediction_outfile::String="model_predictions.h5", return_probs::Bool=false, QC_mode::Bool=false)
 
-       @assert (length(config.model_output_paths) == length(config.feature_output_paths)
-                 == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
-    
-        ###Let's get the files 
+        if config.task_mode != "convolution"
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        else
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.mask_names))
+        end
+
+        ###Let's get the files
         if isdir(config.input_path)
             files = parse_directory(config.input_path)
         else
             files = [config.input_path]
-        end 
-    
+        end
+
         predictions = Vector{Bool}(undef, 0)
         values = BitVector(undef, 0)
         total_met_probs = Vector{Float32}(undef, 0)
-    
+
         init_idxers = Vector{Vector{Float32}}(undef, 0)
-    
+
         printstyled("LOADING MODELS....\n", color=:green)
         flush(stdout)
-        models = [] 
-    
-    
+        models = []
+
         for path in config.model_output_paths
-            push!(models, load_object(path))
-        end 
+            if config.task_mode == "convolution"
+                model_data = JLD2.load(path)
+                push!(models, model_data["model"])
+            else
+                push!(models, load_object(path))
+            end
+        end
         
         ###Need to do this file by file so that the spatial context of gates is maintained 
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version 
@@ -2111,43 +2378,53 @@ module Ronin
             for (i, model_path) in enumerate(config.model_output_paths)
                 
 
-                currt = config.task_paths[i]
-                cw = config.task_weights[i]
                 ###REFACTOR NOTES: I THINK PROCESS_SINGLE_FILE CLOSES THE FILE SO WILL NEED TO CHANGE THAT
-                ###TO MOVE OUTSIDE LOOP 
-                ###We don't need to write these out, just use them briefly 
+                ###TO MOVE OUTSIDE LOOP
+                ###We don't need to write these out, just use them briefly
                 f = redirect_stdout(devnull) do
                     NCDataset(file, "a")
-                end 
-                
+                end
+
                 if i > 1
-                    QC_mask = true 
-                else 
-                    QC_mask = config.QC_mask 
-                end 
-        
+                    QC_mask = true
+                else
+                    QC_mask = config.QC_mask
+                end
+
                 QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
-    
+
                 if QC_mask
                     feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
-                else 
+                else
                     feature_mask = [true true; false false]
-                end 
+                end
 
 
-                ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file 
-                if sum(feature_mask) == 0 
-                    break 
-                end 
-                
-                ###Need to actually pass the QC mask 
+                ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file
+                if sum(feature_mask) == 0
+                    break
+                end
+
+                ###Need to actually pass the QC mask
                 ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
-		
-                X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
-                    , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, 
-                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                    QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
-                    mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+
+                if config.task_mode == "convolution"
+                    kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+                    config_pred = deepcopy(config)
+                    config_pred.HAS_INTERACTIVE_QC = ((!QC_mode) && config.HAS_INTERACTIVE_QC)
+                    config_pred.selected_features = Int[]
+                    result = process_single_file_conv(f, config_pred, kernel_bank;
+                                                      feature_mask=feature_mask, mask_features=QC_mask)
+                    X, Y, indexer = result[1], result[2], result[3]
+                else
+                    currt = config.task_paths[i]
+                    cw = config.task_weights[i]
+                    X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
+                        , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
+                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                        QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
+                        mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+                end
                 final_idxer = indexer 
                 println("SUM OF INDEXER: $(sum(indexer))")
 		        println("SHAPE OF X: $(size(X))") 
@@ -2363,11 +2640,10 @@ module Ronin
         try
             defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
         catch e
-            println(e)
-            ###Simply overwrite the variable
-            if e.msg == "NetCDF: String match to name in use" && (overwrite)
+            ###If the variable already exists and overwrite is set, simply overwrite it
+            if isa(e, NCDatasets.NetCDFError) && e.msg == "NetCDF: String match to name in use" && overwrite
                 if verbose
-                    println("$(fieldname) Already Exists in $(filepath)... overwriting")
+                    printstyled("$(fieldname) already exists in $(filepath)... overwriting\n", color=:yellow)
                 end
                 input_set[fieldname][:,:] = NEW_FIELD
 
@@ -2379,7 +2655,6 @@ module Ronin
                         input_set[fieldname].attrib[key] = attribs[key]
                     end
                 end
-                ##Copy over new attributes
             else
                 throw(e)
             end

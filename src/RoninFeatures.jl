@@ -251,6 +251,9 @@ function get_num_tasks(params_file; delimeter = ",")
     return num_tasks
 end
 
+"""Return the number of tasks when tasks are already provided as a vector of strings"""
+get_num_tasks(tasks::Vector{String}) = length(tasks)
+
 
 """
 ```julia
@@ -267,10 +270,10 @@ function parse_directory(dir_path::String)
     task_paths = Vector{String}()
 
     for path in paths
-        if path[1:length(RADAR_FILE_PREFIX)] != RADAR_FILE_PREFIX
-            println("ERROR: POTENTIALLY INVALID FILE FORMAT FOR FILE: $(path)")
+        if !startswith(path, RADAR_FILE_PREFIX)
+            println("WARNING: Skipping non-radar file: $(path)")
             continue
-        end 
+        end
         push!(task_paths, dir_path * "/" * path)
     end
     return task_paths 
@@ -378,9 +381,12 @@ function get_task_params(params_file; delimiter = ',')
         end 
     end 
 
-    return task_param_list 
-end 
+    return task_param_list
+end
 
+"""Passthrough when tasks are already provided as a vector of strings"""
+get_task_params(tasks::Vector{String}) = tasks
+get_task_params(tasks::Vector{String}, variablelist) = tasks
 
 
 """

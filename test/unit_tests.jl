@@ -1009,6 +1009,245 @@ end
 
 
 ###############################################################################
+# 9. CONVOLUTION PRE-PROCESSOR TESTS
+###############################################################################
+@testset "RoninConvolutions" begin
+
+    @testset "Kernel bank construction" begin
+        bank = Ronin.build_kernel_bank([3, 5, 7])
+
+        # Expected: 3 mean + 1 laplacian + 1 sobel_range + 1 sobel_azi + 2 gaussian (5x5, 7x7) = 8
+        @test length(bank) == 8
+        @test bank[1].name == "mean_3x3"
+        @test bank[2].name == "mean_5x5"
+        @test bank[3].name == "mean_7x7"
+        @test bank[4].name == "laplacian_3x3"
+        @test bank[5].name == "sobel_range_3x3"
+        @test bank[6].name == "sobel_azi_3x3"
+        @test bank[7].name == "gaussian_5x5"
+        @test bank[8].name == "gaussian_7x7"
+
+        # Mean kernels should sum to ~1
+        @test isapprox(sum(bank[1].weights), 1.0f0, atol=1e-5)
+        @test isapprox(sum(bank[2].weights), 1.0f0, atol=1e-5)
+
+        # Gaussian kernels should sum to ~1
+        @test isapprox(sum(bank[7].weights), 1.0f0, atol=1e-5)
+
+        # Laplacian should have -4 center and 4 neighbors
+        @test bank[4].weights[2, 2] == -4.0f0
+    end
+
+    @testset "Kernel bank with single scale" begin
+        bank = Ronin.build_kernel_bank([3])
+        # 1 mean + 1 laplacian + 1 sobel_range + 1 sobel_azi = 4 (no gaussian for k<5)
+        @test length(bank) == 4
+    end
+
+    @testset "Gaussian kernel properties" begin
+        g = Ronin._gaussian_kernel(5)
+        @test size(g) == (5, 5)
+        @test isapprox(sum(g), 1.0f0, atol=1e-5)
+        # Center should be the maximum
+        @test g[3, 3] == maximum(g)
+        # Should be symmetric
+        @test isapprox(g[1, 1], g[5, 5], atol=1e-6)
+        @test isapprox(g[1, 3], g[5, 3], atol=1e-6)
+    end
+
+    @testset "masked_convolve - uniform data" begin
+        # Uniform data with mean kernel should return the same value everywhere (interior)
+        data = fill(5.0f0, 7, 7)
+        kernel = ones(Float32, 3, 3) ./ 9.0f0
+        valid = trues(7, 7)
+
+        result, vfrac = Ronin.masked_convolve(data, kernel, valid)
+
+        # Interior points should be exactly 5.0
+        @test isapprox(result[4, 4], 5.0f0, atol=1e-4)
+        # Valid fraction for interior should be 1.0
+        @test isapprox(vfrac[4, 4], 1.0f0, atol=1e-4)
+    end
+
+    @testset "masked_convolve - missing data handling" begin
+        data = fill(10.0f0, 5, 5)
+        kernel = ones(Float32, 3, 3) ./ 9.0f0
+        valid = trues(5, 5)
+        valid[3, 3] = false  # Center is invalid
+
+        result, vfrac = Ronin.masked_convolve(data, kernel, valid)
+
+        # Center gate should be FILL_VAL
+        @test result[3, 3] == Float32(Ronin.FILL_VAL)
+        @test vfrac[3, 3] == 0.0f0
+
+        # Neighbor should still be ~10.0 (one of its neighbors is invalid but the rest are valid)
+        @test isapprox(result[3, 2], 10.0f0, atol=0.5)
+        # Valid fraction for neighbor should be < 1.0 (one neighbor missing)
+        @test vfrac[3, 2] < 1.0f0
+        @test vfrac[3, 2] > 0.5f0
+    end
+
+    @testset "masked_convolve - all invalid" begin
+        data = fill(1.0f0, 3, 3)
+        kernel = ones(Float32, 3, 3)
+        valid = falses(3, 3)
+
+        result, vfrac = Ronin.masked_convolve(data, kernel, valid)
+
+        @test all(x -> x == Float32(Ronin.FILL_VAL), result)
+        @test all(x -> x == 0.0f0, vfrac)
+    end
+
+    @testset "masked_convolve - gradient kernel" begin
+        # Linear gradient in range direction
+        data = Matrix{Float32}(undef, 5, 5)
+        for j in 1:5, i in 1:5
+            data[i, j] = Float32(i)  # gradient along first dimension (range)
+        end
+        # Sobel range kernel
+        sobel = Float32[-1 -2 -1; 0 0 0; 1 2 1]
+        valid = trues(5, 5)
+
+        result, _ = Ronin.masked_convolve(data, sobel, valid)
+        # Interior: result should be positive (gradient is increasing in i)
+        @test result[3, 3] > 0.0f0
+    end
+
+    @testset "select_features" begin
+        importances = [0.5, 0.001, 0.3, 0.0005, 0.1]
+        selected = Ronin.select_features(importances, 0.01)
+        # Threshold is 0.01 * 0.5 = 0.005
+        # Features above: [1] 0.5, [3] 0.3, [5] 0.1 → indices 1, 3, 5
+        @test 1 in selected
+        @test 3 in selected
+        @test 5 in selected
+        @test !(2 in selected)
+        @test !(4 in selected)
+    end
+
+    @testset "select_features - all zeros" begin
+        importances = [0.0, 0.0, 0.0]
+        selected = Ronin.select_features(importances, 0.01)
+        # All zeros: should return all indices
+        @test selected == [1, 2, 3]
+    end
+
+    @testset "get_convolution_feature_count" begin
+        bank = Ronin.build_kernel_bank([3, 5])
+        vars = ["DBZ", "VEL"]
+        count = Ronin.get_convolution_feature_count(vars, bank)
+        # bank has 5 kernels (3 mean-like: mean_3x3, mean_5x5 + laplacian + sobel_range + sobel_azi + gaussian_5x5 = 6)
+        # Actually: 2 mean + 1 lap + 1 sobel_r + 1 sobel_a + 1 gaussian = 6
+        # Features: 2 vars * 6 kernels * 2 (value + vfrac) + 4 scalar = 28
+        @test count == 2 * length(bank) * 2 + 4
+    end
+
+    @testset "compute_rf_feature_importance" begin
+        Random.seed!(42)
+        n = 200
+        X = randn(Float32, n, 4)
+        # Only feature 1 matters for classification
+        labels = [X[i, 1] > 0 ? 1 : 0 for i in 1:n]
+
+        clf = Ronin.DecisionTree.RandomForestClassifier(n_trees=20, max_depth=8, rng=42)
+        Ronin.DecisionTree.fit!(clf, X, labels)
+
+        importances = Ronin.compute_rf_feature_importance(clf, copy(X), labels; n_repeats=3)
+        @test length(importances) == 4
+        # Feature 1 should have the highest importance
+        @test argmax(importances) == 1
+    end
+
+    @testset "Convolution features on synthetic cfrad" begin
+        cfrad_path = joinpath(test_scratchspace, "test_conv.nc")
+        create_test_cfrad(cfrad_path; range_dim=10, time_dim=8, seed=42)
+
+        NCDataset(cfrad_path) do ds
+            bank = Ronin.build_kernel_bank([3, 5])
+            valid_mask = trues(10, 8)
+            X, names = Ronin.compute_convolution_features(ds, ["DBZ"], bank, valid_mask, "NCP")
+
+            # Expected: 1 var * 6 kernels * 2 + 4 scalar = 16 features
+            @test size(X, 1) == 10 * 8  # ngates
+            @test size(X, 2) == length(bank) * 2 + 4
+            @test length(names) == size(X, 2)
+
+            # Feature names should include expected patterns
+            @test any(n -> occursin("mean_3x3", n), names)
+            @test any(n -> occursin("vfrac", n), names)
+            @test "AHT" in names
+            @test "ELV" in names
+            @test "RNG" in names
+            @test "NRG" in names
+
+            # No NaN values in output
+            @test !any(isnan, X)
+        end
+
+        rm(cfrad_path)
+    end
+
+    @testset "process_single_file_conv" begin
+        cfrad_path = joinpath(test_scratchspace, "test_conv_psf.nc")
+        create_test_cfrad(cfrad_path; range_dim=10, time_dim=8, seed=42)
+
+        NCDataset(cfrad_path) do ds
+            config = ModelConfig(
+                num_models = 1,
+                model_output_paths = ["test.jld2"],
+                met_probs = [(0.1f0, 0.9f0)],
+                feature_output_paths = ["test.h5"],
+                input_path = cfrad_path,
+                task_mode = "convolution",
+                file_preprocessed = [false],
+                HAS_INTERACTIVE_QC = true,
+                QC_var = "VG",
+                remove_var = "VV",
+                conv_variables = ["DBZ"],
+                conv_kernel_sizes = [3],
+                REMOVE_LOW_SIG_QUALITY = false,
+                REMOVE_HIGH_PGG = false,
+                SIG_QUALITY_VAR = "NCP",
+            )
+            bank = Ronin.build_kernel_bank([3])
+            X, Y, indexer, feat_names = Ronin.process_single_file_conv(ds, config, bank)
+
+            @test size(X, 1) == sum(indexer)  # rows match valid gates
+            @test size(X, 2) == Ronin.get_convolution_feature_count(["DBZ"], bank)
+            @test size(Y, 1) == sum(indexer)
+            @test !any(isnan, X)
+        end
+
+        rm(cfrad_path)
+    end
+
+    @testset "Feature selection round-trip" begin
+        # Simulate: compute importance, select, verify subset
+        importances = [0.5, 0.001, 0.3, 0.0005, 0.1, 0.002, 0.4, 0.0001]
+        selected = Ronin.select_features(importances, 0.01)
+
+        # Using selected as column indices
+        X_full = randn(Float32, 100, 8)
+        X_subset = X_full[:, selected]
+        @test size(X_subset, 2) == length(selected)
+        @test size(X_subset, 2) < 8
+    end
+
+    @testset "Convolution determinism" begin
+        data = Float32.(reshape(1:25, 5, 5))
+        kernel = ones(Float32, 3, 3) ./ 9.0f0
+        valid = trues(5, 5)
+
+        r1, v1 = Ronin.masked_convolve(data, kernel, valid)
+        r2, v2 = Ronin.masked_convolve(data, kernel, valid)
+        @test r1 == r2
+        @test v1 == v2
+    end
+end
+
+
+###############################################################################
 # Cleanup
 ###############################################################################
 @testset "Cleanup test scratch space" begin
