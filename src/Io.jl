@@ -51,29 +51,28 @@ function remove_validation(input_dataset::String; training_output::String="train
     training_out = h5open(training_output, "w")
     
     
-    try 
+    try
         write_dataset(validation_out, "X", X[validation_indexer, :])
         write_dataset(validation_out, "Y", Y[validation_indexer, :])
         attributes(validation_out)["MISSING_FILL_VALUE"] = FILL_VAL
         attributes(validation_out)["Parameters"] = params
 
-
         write_dataset(training_out, "X", X[test_indexer, :])
         write_dataset(training_out, "Y", Y[test_indexer, :])
         attributes(training_out)["MISSING_FILL_VALUE"] = FILL_VAL
         attributes(training_out)["Parameters"] = params
-    catch 
-        println("ERROR: CLOSING FILES") 
-    finally 
+    catch e
+        printstyled("ERROR in remove_validation: $(e)\n", color=:red)
+        rethrow(e)
+    finally
         close(currset)
         close(validation_out)
         close(training_out)
-        return 
-    end 
+    end
 
-    if remove_orignal
+    if remove_original
         rm(input_dataset)
-    end 
+    end
 
 end
 

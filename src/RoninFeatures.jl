@@ -113,7 +113,7 @@ function prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimut
     end 
     ###If range of gate is less than altitude, cannot hit ground
     ###If elevation angle is positive, cannot hit ground 
-    if (antenna_range < aircraft_height || elevation_angle > 0)
+    if (antenna_range < aircraft_height || elevation_angle >= 0)
         return 0. 
     end 
     elevation_rad, azimuth_rad = map((x) -> deg2rad(x), (elevation_angle, azimuth))
@@ -135,8 +135,8 @@ function prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimut
         return 1.
     else
         
-        beamaxis = sqrt(elevation_offset * elevation_offset)
-        gprob = exp(-0.69314718055995*(beamaxis/beamwidth))
+        beamaxis = abs(elevation_offset)
+        gprob = exp(-0.69314718055995*(beamaxis/beamwidth)^2)
         
         if (gprob>1.0)
             return 1.
@@ -611,9 +611,10 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
             ###Included here for code clarity purposes, it's not really a 
             ###bona-fide derived parameter but wiht the way the files are setup wanted to
             ###include it in the list of derived parameters. 
-            if (task == "SIG") 
+            if (task == "SIG")
                 SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
-                SIG_Completed_Flag = true 
+                SIG_Completed_Flag = true
+                X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in SIG[:]]
             else
                 func = Symbol(func_prefix * lowercase(task))
                 raw = @eval $func($cfrad)[:]

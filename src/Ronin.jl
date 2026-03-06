@@ -1841,12 +1841,13 @@ module Ronin
             NCDataset(input_cfrad, "a") 
         end 
         new_model = load_object(config.model_output_paths[iter])
-        decision_threshold = config.met_probs[iter] 
+        decision_threshold = config.met_probs[iter]
+        met_threshold = maximum(decision_threshold)
         cfrad_dims = (input_set.dim["range"], input_set.dim["time"])
-        
+
         VARIABLES_TO_QC = config.VARS_TO_QC
         met_predictions = DecisionTree.predict_proba(new_model, features)[:, 2]
-        predictions = met_predictions .> decision_threshold
+        predictions = met_predictions .> met_threshold
         starttime=time() 
         
         ##QC each variable in VARIALBES_TO_QC
@@ -2359,35 +2360,34 @@ module Ronin
         end 
 
      
-        try 
+        try
             defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
         catch e
             println(e)
-            ###Simply overwrite the variable 
+            ###Simply overwrite the variable
             if e.msg == "NetCDF: String match to name in use" && (overwrite)
                 if verbose
-                    println("$(fieldname) Already Exists in $(filepath)... overwriting") 
-                end 
-                input_set[fieldname][:,:] = NEW_FIELD 
+                    println("$(fieldname) Already Exists in $(filepath)... overwriting")
+                end
+                input_set[fieldname][:,:] = NEW_FIELD
 
                 if attribs != Dict("" => "")
                     for key in keys(attribs)
                         if key == "_FillValue"
-                            continue 
-                        end 
+                            continue
+                        end
                         input_set[fieldname].attrib[key] = attribs[key]
-                    end 
-                end 
-                ##Copy over new attributes 
-            else 
-                close(input_set)
+                    end
+                end
+                ##Copy over new attributes
+            else
                 throw(e)
-            end 
-        end 
+            end
+        finally
+            close(input_set)
+        end
 
-    
-
-    end 
+    end
 
 
 
