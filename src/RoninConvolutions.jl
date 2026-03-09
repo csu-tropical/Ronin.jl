@@ -137,6 +137,76 @@ function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::
 end
 
 """
+    load_conv_variable(cfrad, varname::String, valid_mask::AbstractMatrix{Bool},
+                       SIG_QUALITY_VAR::String)
+
+Load or compute a 2D variable for convolution. Supports:
+  - Raw CfRadial variables: "DBZ", "VEL", etc.
+  - Derived variables: "PGG", "SIG"
+  - Prior-pass met probability: "met_prob_pass_1", etc.
+  - Spatial features: "AVG(var)", "ISO(var)", "STD(var)"
+    These are computed with the valid_mask applied so that masked gates
+    are treated as missing — spatial statistics reflect the filtered data.
+
+Returns a 2D matrix (nrows × ncols) with missing values where data is unavailable.
+"""
+function load_conv_variable(cfrad, varname::AbstractString, valid_mask::AbstractMatrix{Bool},
+                            SIG_QUALITY_VAR::AbstractString)
+    nrows, ncols = size(valid_mask)
+
+    # Check for spatial function syntax: AVG(var), ISO(var), STD(var)
+    spatial_match = match(r"^(AVG|ISO|STD)\((\w+)\)$", varname)
+    if spatial_match !== nothing
+        func_name = spatial_match.captures[1]
+        inner_var = spatial_match.captures[2]
+
+        # Recursively load the inner variable (supports e.g. ISO(PGG), AVG(SIG))
+        inner_data = load_conv_variable(cfrad, inner_var, valid_mask, SIG_QUALITY_VAR)
+
+        # Apply mask: set invalid gates to missing so spatial calculations
+        # reflect the filtered data landscape (neighbors that were removed
+        # become missing, changing AVG/STD/ISO values for remaining gates)
+        masked_data = Matrix{Union{Missing, Float32}}(undef, nrows, ncols)
+        for j in 1:ncols, i in 1:nrows
+            v = inner_data[i, j]
+            if !valid_mask[i, j] || ismissing(v) || (v isa AbstractFloat && isnan(v))
+                masked_data[i, j] = missing
+            else
+                masked_data[i, j] = Float32(v)
+            end
+        end
+
+        if func_name == "AVG"
+            return calc_avg(masked_data)
+        elseif func_name == "ISO"
+            return calc_iso(masked_data)
+        elseif func_name == "STD"
+            return calc_std(masked_data)
+        end
+    end
+
+    # Direct variable lookup
+    if varname in keys(cfrad)
+        return cfrad[varname][:, :]
+    elseif varname == "PGG"
+        return calc_pgg(cfrad)
+    elseif varname == "SIG"
+        return reshape(calc_sig(cfrad, SIG_QUALITY_VAR), nrows, ncols)
+    elseif startswith(varname, "met_prob_pass_")
+        if varname in keys(cfrad)
+            return cfrad[varname][:, :]
+        else
+            @warn "$(varname) not found in CfRadial — filling with zeros"
+            return zeros(Union{Missing, Float32}, nrows, ncols)
+        end
+    else
+        error("Unknown convolution variable: $(varname). " *
+              "Supported: CfRadial field names, PGG, SIG, met_prob_pass_<N>, " *
+              "AVG(<var>), ISO(<var>), STD(<var>)")
+    end
+end
+
+"""
     compute_convolution_features(cfrad, conv_variables::Vector{String},
                                   kernel_bank::Vector{ConvolutionKernel},
                                   valid_mask::AbstractMatrix{Bool},
@@ -172,16 +242,8 @@ function compute_convolution_features(cfrad, conv_variables::Vector{String},
     col = 1
 
     for varname in conv_variables
-        # Load the variable data
-        raw_data = if varname in keys(cfrad)
-            cfrad[varname][:, :]
-        elseif varname == "PGG"
-            calc_pgg(cfrad)
-        elseif varname == "SIG"
-            reshape(calc_sig(cfrad, SIG_QUALITY_VAR), nrows, ncols)
-        else
-            error("Unknown convolution variable: $varname")
-        end
+        # Load or compute the variable data
+        raw_data = load_conv_variable(cfrad, varname, valid_mask, SIG_QUALITY_VAR)
 
         # Convert to Float32 matrix, replacing missing/NaN with 0 (masked out by valid_mask)
         data_f32 = Matrix{Float32}(undef, nrows, ncols)

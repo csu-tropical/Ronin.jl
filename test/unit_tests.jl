@@ -1234,6 +1234,72 @@ end
         @test size(X_subset, 2) < 8
     end
 
+    @testset "load_conv_variable - spatial features" begin
+        cfrad_path = joinpath(test_scratchspace, "test_conv_spatial.nc")
+        create_test_cfrad(cfrad_path; range_dim=10, time_dim=8, seed=42)
+
+        NCDataset(cfrad_path) do ds
+            valid_mask = trues(10, 8)
+
+            # ISO(DBZ) should return a 2D matrix of isolation values
+            iso_result = Ronin.load_conv_variable(ds, "ISO(DBZ)", valid_mask, "NCP")
+            @test size(iso_result) == (10, 8)
+            @test !any(ismissing, iso_result)
+
+            # AVG(DBZ) should return a 2D matrix of averaged values
+            avg_result = Ronin.load_conv_variable(ds, "AVG(DBZ)", valid_mask, "NCP")
+            @test size(avg_result) == (10, 8)
+
+            # STD(DBZ) should return a 2D matrix
+            std_result = Ronin.load_conv_variable(ds, "STD(DBZ)", valid_mask, "NCP")
+            @test size(std_result) == (10, 8)
+
+            # ISO should be all zeros when all gates are valid (no missing neighbors
+            # within the data, though border effects may produce non-zero values)
+            @test !any(isnan, Float32.(iso_result))
+
+            # Derived inner variable: ISO(PGG) should work
+            iso_pgg = Ronin.load_conv_variable(ds, "ISO(PGG)", valid_mask, "NCP")
+            @test size(iso_pgg) == (10, 8)
+
+            # With mask applied, ISO values should change
+            masked = copy(valid_mask)
+            masked[5, 4] = false
+            masked[5, 5] = false
+            iso_masked = Ronin.load_conv_variable(ds, "ISO(DBZ)", masked, "NCP")
+            # Gates near the masked region should have higher isolation
+            # (more missing neighbors) compared to the unmasked version
+            @test iso_masked[5, 3] >= iso_result[5, 3]
+        end
+
+        rm(cfrad_path)
+    end
+
+    @testset "Spatial features in compute_convolution_features" begin
+        cfrad_path = joinpath(test_scratchspace, "test_conv_spatial2.nc")
+        create_test_cfrad(cfrad_path; range_dim=10, time_dim=8, seed=42)
+
+        NCDataset(cfrad_path) do ds
+            bank = Ronin.build_kernel_bank([3])
+            valid_mask = trues(10, 8)
+
+            # Include ISO(DBZ) alongside raw DBZ
+            vars = ["DBZ", "ISO(DBZ)"]
+            X, names = Ronin.compute_convolution_features(ds, vars, bank, valid_mask, "NCP")
+
+            # 2 vars * 4 kernels * 2 columns + 4 scalar = 20
+            @test size(X, 2) == 2 * length(bank) * 2 + 4
+            @test size(X, 1) == 10 * 8
+
+            # Feature names should include ISO(DBZ) prefixed entries
+            @test any(n -> startswith(n, "ISO(DBZ)_"), names)
+            @test any(n -> startswith(n, "DBZ_"), names)
+            @test !any(isnan, X)
+        end
+
+        rm(cfrad_path)
+    end
+
     @testset "Convolution determinism" begin
         data = Float32.(reshape(1:25, 5, 5))
         kernel = ones(Float32, 3, 3) ./ 9.0f0
@@ -1246,6 +1312,148 @@ end
     end
 end
 
+
+###############################################################################
+# 6. Model Metadata and Inspection
+###############################################################################
+
+@testset "load_model_with_metadata" begin
+    @testset "jldsave format with metadata" begin
+        model_path = joinpath(test_scratchspace, "test_model_meta.jld2")
+        isfile(model_path) && rm(model_path)
+
+        # Create a simple RF model
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 4)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 4)
+
+        selected = [1, 3, 4]
+        recommended = [1, 3]
+        feat_names = ["DBZ_mean_3x3", "VEL_mean_3x3", "SIG_mean_3x3", "AHT"]
+        imps = [0.05, 0.001, 0.03, 0.02]
+
+        JLD2.jldsave(model_path;
+            model=model,
+            selected_features=selected,
+            recommended_features=recommended,
+            feature_names=feat_names,
+            importances=imps)
+
+        md = Ronin.load_model_with_metadata(model_path, "convolution")
+        @test md.model isa Ronin.DecisionTree.Ensemble
+        @test md.selected_features == [1, 3, 4]
+        @test md.recommended_features == [1, 3]
+        @test md.feature_names == feat_names
+        @test md.importances == imps
+
+        rm(model_path)
+    end
+
+    @testset "save_object format (no metadata)" begin
+        model_path = joinpath(test_scratchspace, "test_model_plain.jld2")
+        isfile(model_path) && rm(model_path)
+
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 4)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 4)
+
+        save_object(model_path, model)
+
+        md = Ronin.load_model_with_metadata(model_path, "convolution")
+        @test md.model isa Ronin.DecisionTree.Ensemble
+        @test md.selected_features == Int[]
+        @test md.recommended_features == Int[]
+        @test md.feature_names == String[]
+        @test md.importances == Float64[]
+
+        rm(model_path)
+    end
+
+    @testset "non-convolution mode" begin
+        model_path = joinpath(test_scratchspace, "test_model_noconv.jld2")
+        isfile(model_path) && rm(model_path)
+
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 4)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 4)
+        save_object(model_path, model)
+
+        md = Ronin.load_model_with_metadata(model_path, "")
+        @test md.model isa Ronin.DecisionTree.Ensemble
+        @test md.selected_features == Int[]
+        @test md.recommended_features == Int[]
+
+        rm(model_path)
+    end
+end
+
+@testset "inspect_model_configuration" begin
+    @testset "jldsave format with full metadata" begin
+        model_path = joinpath(test_scratchspace, "test_inspect.jld2")
+        isfile(model_path) && rm(model_path)
+
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 3)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 3)
+
+        JLD2.jldsave(model_path;
+            model=model,
+            selected_features=Int[],
+            recommended_features=[1, 3],
+            feature_names=["DBZ_mean_3x3", "VEL_laplacian_3x3", "AHT"],
+            importances=[0.05, 0.001, 0.03])
+
+        buf = IOBuffer()
+        Ronin.inspect_model_configuration(model_path; io=buf)
+        output = String(take!(buf))
+
+        @test occursin("MODEL CONFIGURATION", output)
+        @test occursin("FEATURE NAMES", output)
+        @test occursin("DBZ_mean_3x3", output)
+        @test occursin("TRAINED ON: all features", output)
+        @test occursin("RECOMMENDED FEATURES", output)
+        @test occursin("2 / 3", output) || occursin("2/3", output)
+        @test occursin("FEATURE IMPORTANCES", output)
+
+        rm(model_path)
+    end
+
+    @testset "save_object format" begin
+        model_path = joinpath(test_scratchspace, "test_inspect_plain.jld2")
+        isfile(model_path) && rm(model_path)
+
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 3)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 3)
+        save_object(model_path, model)
+
+        buf = IOBuffer()
+        Ronin.inspect_model_configuration(model_path; io=buf)
+        output = String(take!(buf))
+
+        @test occursin("MODEL CONFIGURATION", output)
+        @test occursin("save_object", output)
+
+        rm(model_path)
+    end
+
+    @testset "nonexistent file" begin
+        buf = IOBuffer()
+        Ronin.inspect_model_configuration("/nonexistent/path.jld2"; io=buf)
+        output = String(take!(buf))
+        @test occursin("File not found", output)
+    end
+end
 
 ###############################################################################
 # Cleanup
