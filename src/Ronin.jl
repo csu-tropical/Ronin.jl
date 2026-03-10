@@ -88,19 +88,23 @@ module Ronin
                 recommended = get(data, "recommended_features", Int[])
                 feat_names = get(data, "feature_names", String[])
                 imps = get(data, "importances", Float64[])
+                conv_vars = get(data, "conv_variables", String[])
                 return (model=model, selected_features=selected,
                         recommended_features=recommended,
-                        feature_names=feat_names, importances=imps)
+                        feature_names=feat_names, importances=imps,
+                        conv_variables=conv_vars)
             else
                 return (model=data, selected_features=Int[],
                         recommended_features=Int[],
-                        feature_names=String[], importances=Float64[])
+                        feature_names=String[], importances=Float64[],
+                        conv_variables=String[])
             end
         else
             model = load_object(path)
             return (model=model, selected_features=Int[],
                     recommended_features=Int[],
-                    feature_names=String[], importances=Float64[])
+                    feature_names=String[], importances=Float64[],
+                    conv_variables=String[])
         end
     end
 
@@ -151,6 +155,15 @@ module Ronin
             println(io, "    Type: $(typeof(m))")
             if hasproperty(m, :trees)
                 println(io, "    Trees: $(length(m.trees))")
+            end
+        end
+
+        # Convolution variables
+        if haskey(data, "conv_variables")
+            cv = data["conv_variables"]
+            if !isempty(cv)
+                printstyled(io, "\n  CONV VARIABLES ($(length(cv))):\n", color=:cyan)
+                println(io, "    $(cv)")
             end
         end
 
@@ -2216,14 +2229,16 @@ module Ronin
             printstyled("X TYPE: $(typeof(X))\n", color=:blue)
             train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
 
-            # If training on a feature subset, re-save model with selected_features metadata
-            # so inference knows which columns to use
-            if config.task_mode == "convolution" && !isempty(config.selected_features)
+            # Re-save model with metadata (conv_variables, selected_features)
+            if config.task_mode == "convolution"
                 curr_model = load_model(model_path, config.task_mode)
-                printstyled("  Model trained on $(length(config.selected_features)) selected features (subset)\n", color=:green)
+                if !isempty(config.selected_features)
+                    printstyled("  Model trained on $(length(config.selected_features)) selected features (subset)\n", color=:green)
+                end
                 JLD2.jldsave(model_path;
                     model=curr_model,
-                    selected_features=config.selected_features)
+                    selected_features=config.selected_features,
+                    conv_variables=config.conv_variables)
             end
 
             # Feature importance and selection for convolution mode
@@ -2265,7 +2280,8 @@ module Ronin
                     selected_features=Int[],
                     recommended_features=recommended,
                     feature_names=feat_names_full,
-                    importances=importances)
+                    importances=importances,
+                    conv_variables=config.conv_variables)
                 printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
             end
 
@@ -2575,13 +2591,16 @@ module Ronin
         printstyled("\n...TRAINING FOR PASS: $(pass) ON $(size(X)[1]) GATES...\n", color=:green)
         train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
 
-        # If training on a feature subset, re-save model with selected_features metadata
-        if config.task_mode == "convolution" && !isempty(config.selected_features)
+        # Re-save model with metadata (conv_variables, selected_features)
+        if config.task_mode == "convolution"
             curr_model = load_model(model_path, config.task_mode)
-            printstyled("  Model trained on $(length(config.selected_features)) selected features (subset)\n", color=:green)
+            if !isempty(config.selected_features)
+                printstyled("  Model trained on $(length(config.selected_features)) selected features (subset)\n", color=:green)
+            end
             JLD2.jldsave(model_path;
                 model=curr_model,
-                selected_features=config.selected_features)
+                selected_features=config.selected_features,
+                conv_variables=config.conv_variables)
         end
 
         ## Feature importance and selection for convolution mode
@@ -2749,7 +2768,8 @@ module Ronin
                 selected_features=Int[],
                 recommended_features=recommended,
                 feature_names=feat_names_full,
-                importances=importances)
+                importances=importances,
+                conv_variables=config.conv_variables)
             printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
         end
     end
@@ -3263,10 +3283,12 @@ module Ronin
         models = []
         model_selected_features = Vector{Vector{Int}}()
 
+        model_conv_variables = Vector{Vector{String}}()
         for path in config.model_output_paths
             md = load_model_with_metadata(path, config.task_mode)
             push!(models, md.model)
             push!(model_selected_features, md.selected_features)
+            push!(model_conv_variables, md.conv_variables)
         end
 
         ###Need to do this file by file so that the spatial context of gates is maintained
@@ -3334,6 +3356,9 @@ module Ronin
                     config_pred = deepcopy(config)
                     config_pred.HAS_INTERACTIVE_QC = ((!QC_mode) && config.HAS_INTERACTIVE_QC)
                     config_pred.selected_features = model_selected_features[i]
+                    if !isempty(model_conv_variables[i])
+                        config_pred.conv_variables = model_conv_variables[i]
+                    end
                     result = process_single_file_conv(f, config_pred, kernel_bank;
                                                       feature_mask=feature_mask, mask_features=QC_mask)
                     X, Y, indexer = result[1], result[2], result[3]
@@ -3397,21 +3422,26 @@ module Ronin
 
                     end
                     close(f)
-                    ###Probably need to remove this for speed purposes... keep it in memory,
-                    ###clear it for the next scan. Just pass it to QC_mask
-                    ###If this wasn't the last pass, need to write a mask for the gates to be predicted upon in the next iteration
+                    ###If this wasn't the last pass, write met_prob and mask for the next pass
                     if i < config.num_models
+                        ## Write met_prob_pass_<i> so the next pass can use it as a feature
+                        met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                        met_prob_field[indexer] .= met_probs
+                        met_prob_field = reshape(met_prob_field, scan_dims)
+                        write_field(file, "met_prob_pass_$(i)", met_prob_field,
+                            attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                            fillval=config.FILL_VAL)
+
+                        ## Write mask for gates between thresholds
                         gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
                         new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                        ###If there are no gates of interest, write out the mask as ALL MISSINGS
-                        ###Otherwise, fill in the gates of interest with 1's
                         if sum(gates_of_interest) != 0
                             @assert length(gates_of_interest) == sum(indexer)
                             indexer[indexer] .= gates_of_interest
                             new_mask[indexer] .= 1.
                         end
                         new_mask = reshape(new_mask, scan_dims)
-                        write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob theresholds"), fillval=config.FILL_VAL)
+                        write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
                     end
                 else
                     ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.

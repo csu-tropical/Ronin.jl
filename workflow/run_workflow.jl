@@ -45,9 +45,9 @@
 
 RUN_SPLIT_DATA          = false   # Step 1:  one-time data split
 RUN_TRAINING            = false   # Step 2:  train ALL passes from scratch (ignores TRAIN_PASS)
-RUN_EVALUATION          = false   # Step 2a: evaluate on testing set
+RUN_EVALUATION          = true   # Step 2a: evaluate on testing set
 RUN_IMPORTANCE          = false   # Step 3:  compute feature importance
-RUN_RETRAIN             = false   # Step 4:  retrain with pruned features
+RUN_RETRAIN             = false  # Step 4:  retrain with pruned features
 RUN_RETRAIN_EVALUATION  = false   # Step 4a: evaluate retrained model
 RUN_GENERATE_MASKS      = false   # Step 4b: generate met_prob/masks from trained pass
 RUN_TRAIN_NEXT_PASS     = false   # Step 4c: train next pass using existing prior pass
