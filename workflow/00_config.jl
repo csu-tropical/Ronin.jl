@@ -30,12 +30,12 @@ EXPERIMENT_NOTES = "Lots of parameters and trees"
 ##=============================================================================
 
 CASE_PATHS = [
-    "/path/to/sweeps",
+    "/Users/mmbell/Science/ronin_testing/tm_swps",
 ]
 
-TRAINING_PATH   = "/path/to/sweeps/TRAINING/"
-TESTING_PATH    = "/path/to/sweeps/TESTING/"
-VALIDATION_PATH = "/path/to/sweeps/VALIDATION/"
+TRAINING_PATH   = "/Users/mmbell/Science/ronin_testing/tm_swps/TRAINING/"
+TESTING_PATH    = "/Users/mmbell/Science/ronin_testing/tm_swps/TESTING/"
+VALIDATION_PATH = "/Users/mmbell/Science/ronin_testing/tm_swps/VALIDATION/"
 
 ##=============================================================================
 ## SECTION 3: MODEL PARAMETERS
@@ -48,15 +48,15 @@ VALIDATION_PATH = "/path/to/sweeps/VALIDATION/"
 ##       2 = two-pass (recommended)
 ##       3+ = additional refinement passes
 ##-----------------------------------------------------------------------------
-num_models = 1
+num_models = 2
 
 ##-----------------------------------------------------------------------------
 ## 3b. Meteorological probability thresholds
 ##     met_probs_train: thresholds used during training (controls pass-to-pass masks)
 ##     met_probs_test:  thresholds used during inference/evaluation
 ##-----------------------------------------------------------------------------
-met_probs_train = [(0.1f0, 0.8f0), (0.1f0, 0.999f0)]
-met_probs_test  = [(0.1f0, 0.99f0), (0.1f0, 0.999f0)]
+met_probs_train = [(0.05f0, 0.95f0), (0.1f0, 0.99f0)]
+met_probs_test  = [(0.05f0, 0.95f0), (0.1f0, 0.95f0)]
 
 ##-----------------------------------------------------------------------------
 ## 3c. Signal quality filtering
@@ -93,6 +93,24 @@ conv_variables = ["DBZ", "VEL", "SIG", "PGG", "WIDTH", "AVG(VEL)", "STD(VEL)", "
 conv_kernel_sizes = [3, 5, 7]
 feature_importance_threshold = 0.01
 
+##-----------------------------------------------------------------------------
+## 3f-ii. Feature importance performance tuning
+##
+##     n_importance_repeats: number of random shuffles per feature (default 3)
+##       Higher = more stable estimates, lower = faster. 3 is sufficient for
+##       screening; increase to 5-10 for final feature selection.
+##
+##     importance_subsample_fraction: fraction of training gates to evaluate on
+##       (default 1.0 = all gates). For exploration use 0.1-0.3, for final
+##       decisions use 0.5-1.0. 100K+ gates is statistically sufficient.
+##
+##     For multi-threaded speedup, start Julia with:
+##       julia --threads=auto
+##       or: JULIA_NUM_THREADS=8 julia
+##-----------------------------------------------------------------------------
+n_importance_repeats = 3
+importance_subsample_fraction = 0.3
+
 ## --- Hand-crafted features (uncomment to use instead) ---
 # task_mode = ""
 # pass_1_tasks = ["DBZ", "STD(DBZ)", "ISO(DBZ)", "PGG", "SIG"]
@@ -105,15 +123,35 @@ feature_importance_threshold = 0.01
 # weights_tot = [task_1_weights, task_2_weights]
 
 ##-----------------------------------------------------------------------------
-## 3g. Selected features (for retrain step)
+## 3g. Per-pass feature configuration
 ##
-##     Leave empty for initial training (02_train.jl uses all features).
-##     After running 03_importance.jl and reviewing the recommended features,
-##     paste the recommended indices here, then run 04_retrain.jl.
+##     Each pass can have its own conv_variables and selected_features.
+##     Pass 2+ typically adds "met_prob_pass_N" as a predictor.
 ##
-##     Example: SELECTED_FEATURES = [1, 3, 5, 7, 12, 14, 18, 22, 25, 30]
+##     PASS_CONFIG is a Dict mapping pass number → overrides.
+##     Any pass not listed uses the defaults (conv_variables, Int[]).
+##     Set selected_features after running importance for that pass.
+##
+##     The config.conv_variables and config.selected_features are updated
+##     automatically by configure_pass! before each pass operation.
 ##-----------------------------------------------------------------------------
-SELECTED_FEATURES = Int[]
+PASS_CONFIG = Dict(
+    1 => (
+        conv_variables = conv_variables,
+        selected_features = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 27, 29, 31, 33,
+            35, 37, 39, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 77,
+            79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 99, 101, 103, 105, 107, 109, 111,
+            113, 115, 117, 119, 123, 125, 127, 129, 130, 131, 132],
+    ),
+    2 => (
+        conv_variables = vcat(conv_variables, ["met_prob_pass_1"]),
+        selected_features = Int[],   # train on all features initially
+    ),
+)
+
+## For backward compatibility: SELECTED_FEATURES sets Pass 1 if PASS_CONFIG[1]
+## is not defined. Prefer using PASS_CONFIG above for new configurations.
+SELECTED_FEATURES = get(PASS_CONFIG, 1, (selected_features=Int[],)).selected_features
 
 ##-----------------------------------------------------------------------------
 ## 3h. QC and output settings
@@ -177,6 +215,8 @@ if task_mode == "convolution"
     config_kwargs[:conv_kernel_sizes] = conv_kernel_sizes
     config_kwargs[:feature_importance_threshold] = feature_importance_threshold
     config_kwargs[:selected_features] = SELECTED_FEATURES
+    config_kwargs[:n_importance_repeats] = n_importance_repeats
+    config_kwargs[:importance_subsample_fraction] = importance_subsample_fraction
 else
     config_kwargs[:task_paths] = task_paths
     config_kwargs[:task_weights] = weights_tot
@@ -188,3 +228,31 @@ config = make_config(;
     experiment_name = EXPERIMENT_NAME,
     config_kwargs...
 )
+
+"""
+    configure_pass!(config, pass; pass_config=PASS_CONFIG)
+
+Apply per-pass settings (conv_variables, selected_features) to config before
+running a pass-specific operation. Reads from the PASS_CONFIG dict defined
+in 00_config.jl.
+
+If the pass has no entry in PASS_CONFIG, defaults to the base conv_variables
+with empty selected_features (train on all features).
+"""
+function configure_pass!(config, pass; pass_config=PASS_CONFIG)
+    if haskey(pass_config, pass)
+        pc = pass_config[pass]
+        if hasproperty(pc, :conv_variables)
+            config.conv_variables = pc.conv_variables
+        end
+        if hasproperty(pc, :selected_features)
+            config.selected_features = pc.selected_features
+        end
+    else
+        config.conv_variables = conv_variables
+        config.selected_features = Int[]
+    end
+    printstyled("  Pass $(pass) config: $(length(config.conv_variables)) conv_variables, " *
+                "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features\n",
+                color=:cyan)
+end

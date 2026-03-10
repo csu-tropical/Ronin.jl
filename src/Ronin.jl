@@ -32,6 +32,7 @@ module Ronin
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
     export run_evaluation, sweep_pass2_met_probs
     export load_model_with_metadata, inspect_model_configuration
+    export compute_importance, generate_pass_masks
 
 
 
@@ -449,6 +450,8 @@ module Ronin
         selected_features::Vector{Int} = Int[]
         feature_importance_threshold::Float64 = 0.01
         compute_feature_importance::Bool = true
+        n_importance_repeats::Int = 3
+        importance_subsample_fraction::Float64 = 1.0
 
     end
 
@@ -1188,39 +1191,37 @@ module Ronin
 
         X = read(radar_data["X"])[row_subset , col_subset]
         Y = read(radar_data["Y"])[:][row_subset]
+        close(radar_data)
+
+        train_model(X, Y, model_location; verify=verify, verify_out=verify_out,
+                    n_trees=n_trees, max_depth=max_depth, class_weights=class_weights)
+    end
+
+    function train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
+                        verify::Bool=false, verify_out::String="model_verification.h5",
+                        n_trees::Int = 21, max_depth::Int=14, class_weights::Vector{Float32} = Vector{Float32}([1.f0,2.f0]))
+
+        Y_vec = reshape(Y, length(Y))
 
         model = DecisionTree.RandomForestClassifier(n_trees=n_trees, max_depth=max_depth, rng=50)
 
-        # if balance_weight
-        #     counts = [sum(.! Vector{Bool}(Y[:])), sum(Vector{Bool}(Y[:]))]
-        #     dub = 2 * counts
-        #     weights = [sum(counts[1] ./ dub), sum(counts[2] ./ dub)]
-        #     class_weights = [target ? weights[1] : weights[2] for target in Vector{Bool}(Y[:])]
-
-        # else
-        #     class_weights = ones(length(Y[:]))
-        # end
-
-
-        if ! (length(Y) == length(class_weights))
+        if ! (length(Y_vec) == length(class_weights))
             printstyled("WARNING: class_weights of different length than targets.... Continiuing with no class weights...\n", color=:yellow)
-            class_weights = ones(length(Y))
+            class_weights = ones(length(Y_vec))
         end
 
         println("FITTING MODEL")
         startTime = time()
-        DecisionTree.fit!(model, X, reshape(Y, length(Y),), class_weights)
+        DecisionTree.fit!(model, X, Y_vec, class_weights)
 
         println("COMPLETED FITTING MODEL IN $((time() - startTime)) seconds")
         println()
 
-
         println("MODEL VERIFICATION:")
         predicted_Y = DecisionTree.predict(model, X)
-        accuracy = sum(predicted_Y .== Y) / length(Y)
+        accuracy = sum(predicted_Y .== Y_vec) / length(Y_vec)
         println("ACCURACY ON TRAINING SET: $(round(accuracy * 100, sigdigits=3))%")
         println()
-
 
         printstyled("SAVING MODEL TO: $(model_location) \n", color=:green)
         save_object(model_location, model)
@@ -1230,11 +1231,9 @@ module Ronin
             println("WRITING VERIFICATION DATA TO $(verify_out)" )
             fid = h5open(verify_out, "w")
             HDF5.write_dataset(fid, "Y_PREDICTED", predicted_Y)
-            HDF5.write_dataset(fid, "Y_ACTUAL", Y)
+            HDF5.write_dataset(fid, "Y_ACTUAL", Y_vec)
             close(fid)
         end
-
-        close(radar_data)
     end
 
 
@@ -2214,7 +2213,8 @@ module Ronin
 
             printstyled("\n...TRAINING FOR PASS: $(i) ON $(size(X)[1]) GATES...\n", color=:green)
 
-            train_model(out, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
+            printstyled("X TYPE: $(typeof(X))\n", color=:blue)
+            train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
 
             # If training on a feature subset, re-save model with selected_features metadata
             # so inference knows which columns to use
@@ -2230,7 +2230,9 @@ module Ronin
             if config.task_mode == "convolution" && config.compute_feature_importance
                 printstyled("\nCOMPUTING FEATURE IMPORTANCE FOR PASS $(i)...\n", color=:green)
                 curr_model = load_model(model_path, config.task_mode)
-                importances = compute_rf_feature_importance(curr_model, X, reshape(Y, length(Y)))
+                importances = compute_rf_feature_importance(curr_model, X, reshape(Y, length(Y));
+                    n_repeats=config.n_importance_repeats,
+                    subsample_fraction=config.importance_subsample_fraction)
 
                 kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
                 feat_names_full = String[]
@@ -2386,6 +2388,118 @@ module Ronin
     end
 
     """
+        generate_pass_masks(config::ModelConfig, pass::Int; data_path::String="")
+
+    Run inference with the trained model for `pass` and write `met_prob_pass_<pass>`
+    and `mask_pass_<pass+1>` to all CfRadial files. This bridges an existing trained
+    pass to the next pass without retraining.
+
+    Use this when you have a trained Pass 1 model and want to prepare data for Pass 2
+    training, or any pass N → pass N+1 transition.
+
+    If `data_path` is provided, it overrides `config.input_path` (useful for generating
+    masks on both training and testing sets).
+
+    The mask threshold is taken from `config.met_probs[pass]`.
+    """
+    function generate_pass_masks(config::ModelConfig, pass::Int; data_path::String="")
+        model_path = config.model_output_paths[pass]
+        if !isfile(model_path)
+            error("Model file not found: $(model_path). Train pass $(pass) first.")
+        end
+
+        curr_model = load_model(model_path, config.task_mode)
+        curr_metprobs = config.met_probs[pass]
+        target_path = isempty(data_path) ? config.input_path : data_path
+
+        paths = isdir(target_path) ? parse_directory(target_path) : [target_path]
+
+        QC_mask = pass > 1
+        mask_name = QC_mask ? config.mask_names[pass] : ""
+        out = config.feature_output_paths[pass]
+
+        # Load model metadata once (not per-file)
+        md = config.task_mode == "convolution" ? load_model_with_metadata(model_path, config.task_mode) : nothing
+
+        printstyled("\nGENERATING MASKS FOR PASS $(pass) → $(pass+1)\n", color=:green)
+        printstyled("  Model: $(model_path)\n", color=:green)
+        printstyled("  met_prob threshold: $(curr_metprobs)\n", color=:green)
+        printstyled("  Data: $(target_path) ($(length(paths)) files)\n", color=:green)
+        printstyled("  Threads: $(Threads.nthreads())\n", color=:green)
+
+        n_paths = length(paths)
+        files_done = Threads.Atomic{Int}(0)
+        start_time = time()
+
+        Threads.@threads for fi in 1:n_paths
+            path = paths[fi]
+
+            dims = Dataset(path) do f
+                (f.dim["range"], f.dim["time"])
+            end
+
+            if config.task_mode == "convolution"
+                config_single = deepcopy(config)
+                config_single.input_path = path
+                config_single.write_out = false
+                config_single.selected_features = md.selected_features
+                config_single.verbose = false
+                X_mask, Y_mask, idxer = calculate_features_conv(config_single, out;
+                                                                 QC_mask=QC_mask, mask_name=mask_name,
+                                                                 write_out=false, return_idxer=true)
+            else
+                currt = config.task_paths[pass]
+                cw = config.task_weights[pass]
+                X_mask, Y_mask, idxer = calculate_features(path, currt, out, true;
+                                    verbose = false,
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY,
+                                    SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD,
+                                    SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
+                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,
+                                    PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var,
+                                    remove_variable = config.remove_var,
+                                    replace_missing = config.replace_missing, return_idxer=true,
+                                    write_out = false, QC_mask = QC_mask, mask_name = mask_name,
+                                    weight_matrixes=cw)
+            end
+
+            met_probs_pred = DecisionTree.predict_proba(curr_model, X_mask)
+            if size(met_probs_pred, 2) < 2
+                throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET for $(path)"))
+            end
+            met_probs_pred = met_probs_pred[:, 2]
+            valid_idxs = (met_probs_pred .>= minimum(curr_metprobs)) .& (met_probs_pred .<= maximum(curr_metprobs))
+
+            ## Save met_prob predictions
+            met_prob_field = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+            met_prob_idxer = copy(idxer[1][:])
+            met_prob_field[met_prob_idxer] .= Float32.(met_probs_pred)
+            met_prob_field = reshape(met_prob_field, dims)
+            write_field(path, "met_prob_pass_$(pass)", met_prob_field,
+                attribs=Dict("Units" => "probability",
+                             "Description" => "RF meteorological probability from pass $(pass)"))
+
+            ## Create mask for next pass
+            new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+            idxer_flat = idxer[1][:]
+            idxer_flat[idxer_flat] .= Vector{Bool}(valid_idxs)
+            new_mask[idxer_flat] .= 1.
+            new_mask = reshape(new_mask, dims)
+            write_field(path, config.mask_names[pass + 1], new_mask,
+                attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
+
+            done = Threads.atomic_add!(files_done, 1)
+            if done % 50 == 0 || done == n_paths
+                elapsed = round(time() - start_time, digits=1)
+                printstyled("  Processed $(done)/$(n_paths) files ($(elapsed)s elapsed)\n", color=:light_black)
+            end
+        end
+
+        total_time = round(time() - start_time, digits=1)
+        printstyled("  Done — wrote met_prob_pass_$(pass) and $(config.mask_names[pass+1]) to $(n_paths) files in $(total_time)s\n", color=:green)
+    end
+
+    """
         train_single_pass(config::ModelConfig, pass::Int)
 
     Train a single pass of the multi-pass cascade. This is the building block for
@@ -2459,7 +2573,7 @@ module Ronin
         end
 
         printstyled("\n...TRAINING FOR PASS: $(pass) ON $(size(X)[1]) GATES...\n", color=:green)
-        train_model(out, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
+        train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
 
         # If training on a feature subset, re-save model with selected_features metadata
         if config.task_mode == "convolution" && !isempty(config.selected_features)
@@ -2474,7 +2588,9 @@ module Ronin
         if config.task_mode == "convolution" && config.compute_feature_importance
             printstyled("\nCOMPUTING FEATURE IMPORTANCE FOR PASS $(pass)...\n", color=:green)
             curr_model = load_model(model_path, config.task_mode)
-            importances = compute_rf_feature_importance(curr_model, X, reshape(Y, length(Y)))
+            importances = compute_rf_feature_importance(curr_model, X, reshape(Y, length(Y));
+                n_repeats=config.n_importance_repeats,
+                subsample_fraction=config.importance_subsample_fraction)
 
             kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
             feat_names_full = String[]
@@ -2569,6 +2685,73 @@ module Ronin
 
         printstyled("\n COMPLETED TRAINING PASS $(pass) in $(round(time() - starttime, digits = 3)) seconds...\n", color=:green)
         return X, Y
+    end
+
+    """
+        compute_importance(config::ModelConfig)
+
+    Compute permutation-based feature importance for each pass using existing
+    trained models and cached feature files. Does NOT retrain — loads the model
+    from the JLD2 file and features from the HDF5 file.
+
+    This is the recommended way to compute importance after initial training
+    (Step 2). It avoids redundant retraining and supports configurable
+    `n_importance_repeats` and `importance_subsample_fraction` from the config.
+    """
+    function compute_importance(config::ModelConfig)
+        for (i, model_path) in enumerate(config.model_output_paths)
+            out = config.feature_output_paths[i]
+
+            if !isfile(model_path)
+                @warn "Model file not found: $(model_path). Run training first."
+                continue
+            end
+            if !isfile(out)
+                @warn "Feature file not found: $(out). Run training first."
+                continue
+            end
+
+            printstyled("\nLOADING FEATURES FROM $(out)...\n", color=:green)
+            X, Y = h5open(out) do f
+                (f["X"][:,:], f["Y"][:,:])
+            end
+            Y_vec = reshape(Y, length(Y))
+
+            printstyled("COMPUTING FEATURE IMPORTANCE FOR PASS $(i) ($(size(X,1)) gates, $(size(X,2)) features)...\n", color=:green)
+            curr_model = load_model(model_path, config.task_mode)
+            importances = compute_rf_feature_importance(curr_model, X, Y_vec;
+                n_repeats=config.n_importance_repeats,
+                subsample_fraction=config.importance_subsample_fraction)
+
+            kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+            feat_names_full = String[]
+            for varname in config.conv_variables
+                for kern in kernel_bank
+                    push!(feat_names_full, "$(varname)_$(kern.name)")
+                    push!(feat_names_full, "$(varname)_$(kern.name)_vfrac")
+                end
+            end
+            append!(feat_names_full, ["AHT", "ELV", "RNG", "NRG"])
+
+            sorted_idx = sortperm(importances, rev=true)
+            printstyled("\n  FEATURE IMPORTANCE RANKING (Pass $(i)):\n", color=:cyan)
+            for (rank, idx) in enumerate(sorted_idx)
+                name = idx <= length(feat_names_full) ? feat_names_full[idx] : "feature_$(idx)"
+                printstyled("    $(rank). $(name): $(round(importances[idx], digits=6))\n", color=:cyan)
+            end
+
+            recommended = select_features(importances, config.feature_importance_threshold)
+            printstyled("\n  RECOMMENDED $(length(recommended))/$(length(importances)) FEATURES above $(config.feature_importance_threshold * 100)% threshold\n", color=:green)
+            printstyled("  To use this subset, retrain with selected_features set to these indices.\n", color=:yellow)
+
+            JLD2.jldsave(model_path;
+                model=curr_model,
+                selected_features=Int[],
+                recommended_features=recommended,
+                feature_names=feat_names_full,
+                importances=importances)
+            printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
+        end
     end
 
     """

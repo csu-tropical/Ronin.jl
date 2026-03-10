@@ -15,6 +15,8 @@
 ##   Step 3:  Compute feature importance
 ##   Step 4:  Retrain with pruned features (requires SELECTED_FEATURES)
 ##   Step 4a: Evaluate retrained model (same as 2a, different output name)
+##   Step 4b: Generate met_prob/masks from a trained pass (bridge to next pass)
+##   Step 4c: Train next pass independently using existing prior-pass masks
 ##   Step 5:  Sweep Pass 2 met_prob thresholds
 ##   Step 6:  Apply QC to write corrected fields
 ##
@@ -26,6 +28,13 @@
 ##   2. Review output, set SELECTED_FEATURES in 00_config.jl
 ##   3. Set RUN_RETRAIN = true, RUN_RETRAIN_EVALUATION = true
 ##
+## MULTI-PASS (building passes incrementally):
+##   1. Train + optimize Pass 1 (Steps 2-4a above)
+##   2. Set RUN_GENERATE_MASKS = true, MASK_PASS = 1 → writes met_prob/masks
+##   3. Set RUN_TRAIN_NEXT_PASS = true, TRAIN_PASS = 2 → trains Pass 2
+##   4. Repeat importance/retrain cycle for Pass 2 if desired
+##   5. For Pass 3: MASK_PASS = 2, TRAIN_PASS = 3, etc.
+##
 ## THRESHOLD OPTIMIZATION:
 ##   Set RUN_PASS2_SWEEP = true (after training exists)
 ##=============================================================================
@@ -36,15 +45,23 @@
 
 RUN_SPLIT_DATA          = false   # Step 1:  one-time data split
 RUN_TRAINING            = false   # Step 2:  train on all features
-RUN_EVALUATION          = false   # Step 2a: evaluate on testing set
-RUN_IMPORTANCE          = false    # Step 3:  compute feature importance
+RUN_EVALUATION          = true   # Step 2a: evaluate on testing set
+RUN_IMPORTANCE          = false   # Step 3:  compute feature importance
 RUN_RETRAIN             = false   # Step 4:  retrain with pruned features
 RUN_RETRAIN_EVALUATION  = false   # Step 4a: evaluate retrained model
+RUN_GENERATE_MASKS      = false   # Step 4b: generate met_prob/masks from trained pass
+RUN_TRAIN_NEXT_PASS     = false   # Step 4c: train next pass using existing prior pass
 RUN_PASS2_SWEEP         = false   # Step 5:  sweep Pass 2 thresholds
 RUN_QC                  = false   # Step 6:  apply QC to data
 
 ## Also evaluate on validation set? (applies to both 2a and 4a)
 RUN_VALIDATION          = false
+
+## For Steps 4b/4c: which pass to generate masks from / which pass to train
+## Example: MASK_PASS=1 writes met_prob_pass_1 + mask_pass_2, then
+##          TRAIN_PASS=2 trains pass 2 using those masks
+MASK_PASS               = 1
+TRAIN_PASS              = 2
 
 ##=============================================================================
 ## LOAD SHARED CONFIG
@@ -119,58 +136,68 @@ if RUN_EVALUATION
 end
 
 ## --- Step 3: Feature importance ---
+##     Uses TRAIN_PASS to determine which pass to compute importance for.
+##     Applies the per-pass conv_variables so feature names are correct.
 if RUN_IMPORTANCE
-    if !isempty(SELECTED_FEATURES)
-        @warn "SELECTED_FEATURES is non-empty. Feature importance should be " *
-              "computed on the full feature set for best results."
+    configure_pass!(config, TRAIN_PASS)
+
+    if !isempty(config.selected_features)
+        @warn "selected_features is non-empty for Pass $(TRAIN_PASS). Feature importance " *
+              "should be computed on the full feature set for best results."
     end
 
     println("\n", "="^70)
-    println("STEP 3: COMPUTING FEATURE IMPORTANCE — $(EXPERIMENT_NAME)")
+    println("STEP 3: COMPUTING FEATURE IMPORTANCE — $(EXPERIMENT_NAME) PASS $(TRAIN_PASS)")
+    println("  n_repeats = $(config.n_importance_repeats)")
+    println("  subsample_fraction = $(config.importance_subsample_fraction)")
+    println("  threads = $(Threads.nthreads())")
     println("="^70)
 
-    config.compute_feature_importance = true
-    config.file_preprocessed = fill(true, num_models)
-
-    train_multi_model(config)
+    compute_importance(config)
 
     for (i, path) in enumerate(config.model_output_paths)
-        println("\n--- Pass $(i) ---")
-        inspect_model_configuration(path)
+        if isfile(path)
+            println("\n--- Pass $(i) ---")
+            inspect_model_configuration(path)
 
-        md = load_model_with_metadata(path, config.task_mode)
-        if !isempty(md.recommended_features)
-            println("\nRecommended features for Pass $(i):")
-            println("  SELECTED_FEATURES = $(md.recommended_features)")
+            md = load_model_with_metadata(path, config.task_mode)
+            if !isempty(md.recommended_features)
+                println("\nRecommended features for Pass $(i):")
+                println("  Add to PASS_CONFIG[$(i)] selected_features in 00_config.jl:")
+                println("  selected_features = $(md.recommended_features)")
+            end
         end
     end
 
     println("\n", "="^70)
     println("NEXT STEPS:")
-    println("  1. Copy recommended indices to SELECTED_FEATURES in 00_config.jl")
-    println("  2. Set RUN_RETRAIN = true and RUN_RETRAIN_EVALUATION = true")
+    println("  1. Copy recommended indices to PASS_CONFIG[$(TRAIN_PASS)].selected_features")
+    println("  2. Set RUN_RETRAIN = true (or RUN_TRAIN_NEXT_PASS for per-pass retrain)")
     println("  3. Re-run this script")
     println("="^70)
-
-    ## Reset so subsequent steps in this run don't re-compute importance
-    config.compute_feature_importance = false
 end
 
 ## --- Step 4: Retrain with pruned features ---
+##     Uses TRAIN_PASS to determine which pass to retrain.
+##     Applies per-pass config (conv_variables + selected_features).
 if RUN_RETRAIN
-    if isempty(SELECTED_FEATURES)
-        error("SELECTED_FEATURES is empty in 00_config.jl.\n" *
-              "Run Step 3 (feature importance) first, then set SELECTED_FEATURES " *
-              "to the recommended indices.")
+    configure_pass!(config, TRAIN_PASS)
+
+    if isempty(config.selected_features)
+        error("selected_features is empty for Pass $(TRAIN_PASS) in PASS_CONFIG.\n" *
+              "Run Step 3 (feature importance) first, then set selected_features " *
+              "in PASS_CONFIG[$(TRAIN_PASS)].")
     end
 
     println("\n", "="^70)
-    println("STEP 4: RETRAINING WITH PRUNED FEATURES — $(EXPERIMENT_NAME)")
-    println("  Using $(length(SELECTED_FEATURES)) selected features")
-    println("  Indices: $(SELECTED_FEATURES)")
+    println("STEP 4: RETRAINING PASS $(TRAIN_PASS) WITH PRUNED FEATURES — $(EXPERIMENT_NAME)")
+    println("  Using $(length(config.selected_features)) selected features")
+    if task_mode == "convolution"
+        println("  conv_variables = $(config.conv_variables)")
+    end
     println("="^70)
 
-    train_multi_model(config)
+    train_single_pass(config, TRAIN_PASS)
     println("Retrain complete.")
 end
 
@@ -202,6 +229,79 @@ if RUN_RETRAIN_EVALUATION
     end
 
     println("\nCompare to initial training results to verify no skill loss.")
+end
+
+## --- Step 4b: Generate masks from a trained pass ---
+if RUN_GENERATE_MASKS
+    if num_models < MASK_PASS + 1
+        @warn "num_models=$(num_models) but MASK_PASS=$(MASK_PASS) — setting num_models=$(MASK_PASS + 1) " *
+              "so mask/model paths are properly allocated."
+        config_kwargs[:compute_feature_importance] = false
+        config = make_config(;
+            num_models = MASK_PASS + 1,
+            input_path = TRAINING_PATH,
+            experiment_name = EXPERIMENT_NAME,
+            config_kwargs...
+        )
+    end
+
+    println("\n", "="^70)
+    println("STEP 4b: GENERATING MASKS FROM PASS $(MASK_PASS) — $(EXPERIMENT_NAME)")
+    println("  Model: $(config.model_output_paths[MASK_PASS])")
+    println("  met_prob threshold: $(met_probs_train[MASK_PASS])")
+    println("="^70)
+
+    ## Apply per-pass config so the model uses the correct features
+    configure_pass!(config, MASK_PASS)
+
+    generate_pass_masks(config, MASK_PASS; data_path=TRAINING_PATH)
+
+    if isdir(TESTING_PATH)
+        println("\nAlso generating masks on TESTING set...")
+        generate_pass_masks(config, MASK_PASS; data_path=TESTING_PATH)
+    end
+
+    if RUN_VALIDATION && isdir(VALIDATION_PATH)
+        println("\nAlso generating masks on VALIDATION set...")
+        generate_pass_masks(config, MASK_PASS; data_path=VALIDATION_PATH)
+    end
+end
+
+## --- Step 4c: Train next pass using existing prior-pass masks ---
+if RUN_TRAIN_NEXT_PASS
+    if num_models < TRAIN_PASS
+        @warn "num_models=$(num_models) but TRAIN_PASS=$(TRAIN_PASS) — setting num_models=$(TRAIN_PASS) " *
+              "so model paths are properly allocated."
+        config_kwargs[:compute_feature_importance] = false
+        config = make_config(;
+            num_models = TRAIN_PASS,
+            input_path = TRAINING_PATH,
+            experiment_name = EXPERIMENT_NAME,
+            config_kwargs...
+        )
+    end
+
+    ## Apply per-pass config so Pass 2 gets the right conv_variables and selected_features
+    configure_pass!(config, TRAIN_PASS)
+
+    println("\n", "="^70)
+    println("STEP 4c: TRAINING PASS $(TRAIN_PASS) — $(EXPERIMENT_NAME)")
+    println("  Requires mask_pass_$(TRAIN_PASS) in CfRadials (from Step 4b)")
+    println("  n_trees = $(n_trees), max_depth = $(max_depth)")
+    if task_mode == "convolution"
+        println("  conv_variables = $(config.conv_variables)")
+        println("  selected_features = $(isempty(config.selected_features) ? "all" : config.selected_features)")
+    end
+    println("="^70)
+
+    train_single_pass(config, TRAIN_PASS)
+    println("Pass $(TRAIN_PASS) training complete.")
+
+    model_path = config.model_output_paths[TRAIN_PASS]
+    if isfile(model_path)
+        println("\n--- Pass $(TRAIN_PASS) model ---")
+        inspect_model_configuration(model_path)
+    end
 end
 
 ## --- Step 5: Pass 2 sweep ---

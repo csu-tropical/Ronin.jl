@@ -308,41 +308,72 @@ function select_features(importance_scores::Vector{Float64}, threshold_fraction:
 end
 
 """
-    compute_rf_feature_importance(ensemble, X::Matrix{Float32}, Y::Vector, n_repeats::Int=5)
+    compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector;
+                                   n_repeats::Int=3, subsample_fraction::Float64=1.0)
 
 Compute permutation-based feature importance for a random forest ensemble.
 For each feature, randomly shuffle that column and measure the drop in accuracy.
 Higher drop = more important feature.
 
+Performance optimizations:
+- Features are evaluated in parallel using `Threads.@threads`
+- `subsample_fraction` < 1.0 evaluates on a random subset (e.g., 0.5 = 50% of samples)
+  This is statistically stable for large datasets and provides significant speedup.
+- Each thread works on its own copy of the subsampled data to avoid race conditions.
+
 Returns a Vector{Float64} of importance scores (accuracy drop), one per feature.
 """
-function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector; n_repeats::Int=5)
+function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector;
+                                        n_repeats::Int=3, subsample_fraction::Float64=1.0)
     n_samples, n_features = size(X)
 
-    # Baseline accuracy
-    baseline_preds = DecisionTree.predict(model, X)
-    baseline_acc = sum(baseline_preds .== Y) / n_samples
+    # Subsample if requested
+    if subsample_fraction < 1.0
+        n_sub = max(1, round(Int, n_samples * subsample_fraction))
+        sub_idx = randperm(n_samples)[1:n_sub]
+        X_eval = X[sub_idx, :]
+        Y_eval = Y[sub_idx]
+        printstyled("  Subsampling $(n_sub)/$(n_samples) gates ($(round(subsample_fraction * 100, digits=1))%) for importance evaluation\n", color=:cyan)
+    else
+        X_eval = copy(X)
+        Y_eval = Y
+        n_sub = n_samples
+    end
+
+    # Baseline accuracy on the evaluation subset
+    baseline_preds = DecisionTree.predict(model, X_eval)
+    baseline_acc = sum(baseline_preds .== Y_eval) / n_sub
 
     importances = Vector{Float64}(undef, n_features)
+    start_time = time()
 
-    for f in 1:n_features
+    n_threads = Threads.nthreads()
+    printstyled("  Using $(n_threads) thread(s), $(n_repeats) repeats per feature, $(n_features) features\n", color=:cyan)
+
+    # Each thread gets its own copy of X_eval to avoid race conditions
+    Threads.@threads for f in 1:n_features
+        X_local = copy(X_eval)
+        original_col = X_local[:, f]
         acc_drops = 0.0
-        original_col = X[:, f]
 
         for _ in 1:n_repeats
-            # Shuffle the column in-place
-            shuffled = original_col[randperm(n_samples)]
-            X[:, f] = shuffled
+            shuffled = original_col[randperm(n_sub)]
+            X_local[:, f] = shuffled
 
-            perm_preds = DecisionTree.predict(model, X)
-            perm_acc = sum(perm_preds .== Y) / n_samples
+            perm_preds = DecisionTree.predict(model, X_local)
+            perm_acc = sum(perm_preds .== Y_eval) / n_sub
             acc_drops += (baseline_acc - perm_acc)
         end
 
-        # Restore original column
-        X[:, f] = original_col
         importances[f] = acc_drops / n_repeats
+
+        elapsed = time() - start_time
+        done = f  # approximate — threads may complete out of order
+        printstyled("  Feature $(f)/$(n_features) done (elapsed: $(round(elapsed, digits=1))s)\n", color=:light_black)
     end
+
+    total_time = time() - start_time
+    printstyled("  Feature importance completed in $(round(total_time, digits=1))s\n", color=:green)
 
     return importances
 end

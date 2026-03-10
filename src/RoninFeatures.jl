@@ -317,8 +317,7 @@ function get_task_params(params_file, variablelist; delimiter=",")
         if (typeof(expr_ret) != Nothing)
             if (expr_ret[1] ∉ valid_funcs || 
                 (expr_ret[2] ∉ variablelist && expr_ret[2] ∉ valid_derived_params))
-                println("ERROR: CANNOT CALCULATE $(expr_ret[1]) of $(expr_ret[2])\n", 
-                "Potentially invalid function or missing variable\n")
+                @warn "Cannot calculate $(expr_ret[1]) of $(expr_ret[2]): invalid function or missing variable"
             else
                 ###Add λ to the front of the token to indicate it is a function call
                 ###This helps later when trying to determine what to do with each "task" 
@@ -371,12 +370,11 @@ function get_task_params(params_file; delimiter = ',')
 
         if (typeof(expr_ret) != Nothing)
             if (expr_ret[1] ∉ valid_funcs)
-                println("ERROR: CANNOT CALCULATE $(expr_ret[1]) of $(expr_ret[2])\n", 
-                "Potentially invalid function or missing variable\n")
+                @warn "Cannot calculate $(expr_ret[1]) of $(expr_ret[2]): invalid function"
             else
                 push!(task_param_list, token)
-            end 
-        else 
+            end
+        else
             push!(task_param_list, token)                 
         end 
     end 
