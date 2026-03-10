@@ -44,8 +44,8 @@
 ##=============================================================================
 
 RUN_SPLIT_DATA          = false   # Step 1:  one-time data split
-RUN_TRAINING            = false   # Step 2:  train on all features
-RUN_EVALUATION          = true   # Step 2a: evaluate on testing set
+RUN_TRAINING            = false   # Step 2:  train ALL passes from scratch (ignores TRAIN_PASS)
+RUN_EVALUATION          = false   # Step 2a: evaluate on testing set
 RUN_IMPORTANCE          = false   # Step 3:  compute feature importance
 RUN_RETRAIN             = false   # Step 4:  retrain with pruned features
 RUN_RETRAIN_EVALUATION  = false   # Step 4a: evaluate retrained model
@@ -88,6 +88,12 @@ if RUN_TRAINING
         @warn "SELECTED_FEATURES is non-empty ($(length(SELECTED_FEATURES)) features). " *
               "Initial training uses all features. " *
               "To retrain with a pruned set, set RUN_RETRAIN = true instead."
+    end
+
+    if TRAIN_PASS > 1
+        @warn "RUN_TRAINING trains ALL passes from scratch (starting at pass 1), " *
+              "ignoring TRAIN_PASS=$(TRAIN_PASS). To train only pass $(TRAIN_PASS), " *
+              "use RUN_TRAIN_NEXT_PASS = true instead."
     end
 
     println("\n", "="^70)
