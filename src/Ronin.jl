@@ -22,7 +22,7 @@ module Ronin
     export get_NCP, airborne_ht, prob_groundgate
     export calc_avg, calc_std, calc_iso, process_single_file
     export parse_directory, get_num_tasks, get_task_params, remove_validation
-    export calculate_features
+    export calculate_features, calculate_features_conv
     export split_training_testing!, split_training_testing_validation!
     export QC_scan, get_QC_mask
     export evaluate_model, get_feature_importance, error_characteristics
@@ -32,7 +32,7 @@ module Ronin
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
     export run_evaluation, sweep_pass2_met_probs
     export load_model_with_metadata, inspect_model_configuration
-    export compute_importance, generate_pass_masks
+    export compute_importance, generate_pass_masks, met_prob_histogram
 
 
 
@@ -465,6 +465,7 @@ module Ronin
         compute_feature_importance::Bool = true
         n_importance_repeats::Int = 3
         importance_subsample_fraction::Float64 = 1.0
+        max_training_threads::Int = 1
 
     end
 
@@ -1212,7 +1213,8 @@ module Ronin
 
     function train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
                         verify::Bool=false, verify_out::String="model_verification.h5",
-                        n_trees::Int = 21, max_depth::Int=14, class_weights::Vector{Float32} = Vector{Float32}([1.f0,2.f0]))
+                        n_trees::Int = 21, max_depth::Int=14, class_weights::Vector{Float32} = Vector{Float32}([1.f0,2.f0]),
+                        max_threads::Int = Threads.nthreads())
 
         Y_vec = reshape(Y, length(Y))
 
@@ -1223,9 +1225,9 @@ module Ronin
             class_weights = ones(length(Y_vec))
         end
 
-        println("FITTING MODEL")
+        println("FITTING MODEL ($(min(max_threads, Threads.nthreads())) training threads)")
         startTime = time()
-        DecisionTree.fit!(model, X, Y_vec, class_weights)
+        DecisionTree.fit!(model, X, Y_vec, class_weights; max_threads=max_threads)
 
         println("COMPLETED FITTING MODEL IN $((time() - startTime)) seconds")
         println()
@@ -2134,7 +2136,7 @@ module Ronin
     #Returns
         -None
     """
-    function train_multi_model(config::ModelConfig)
+    function train_multi_model(config::ModelConfig; pass_config::Dict=Dict())
         ##Quick input sanitation check
         if config.task_mode != "convolution"
             @assert (length(config.model_output_paths) == length(config.feature_output_paths)
@@ -2147,10 +2149,30 @@ module Ronin
         if !(config.HAS_INTERACTIVE_QC)
             throw("ERROR: Input cfradials must have interactive QC present to train a model. Set config HAS_INTERACTIVE_QC flag to true")
         end
+
+        # Save original config values so each pass can override independently
+        orig_conv_variables = copy(config.conv_variables)
+        orig_selected_features = copy(config.selected_features)
+
         full_start_time = time()
         ###Iteratively train models and apply QC_scan with the specified probabilites to train a multi-pass model
         ###pipeline
         for (i, model_path) in enumerate(config.model_output_paths)
+
+            # Apply per-pass config overrides (conv_variables, selected_features)
+            if haskey(pass_config, i)
+                pc = pass_config[i]
+                config.conv_variables = hasproperty(pc, :conv_variables) ? pc.conv_variables : orig_conv_variables
+                config.selected_features = hasproperty(pc, :selected_features) ? pc.selected_features : orig_selected_features
+            else
+                config.conv_variables = orig_conv_variables
+                config.selected_features = orig_selected_features
+            end
+            if config.task_mode == "convolution"
+                printstyled("  Pass $(i) config: $(length(config.conv_variables)) conv_variables, " *
+                            "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features\n",
+                            color=:cyan)
+            end
 
             out = config.feature_output_paths[i]
 
@@ -2227,7 +2249,7 @@ module Ronin
             printstyled("\n...TRAINING FOR PASS: $(i) ON $(size(X)[1]) GATES...\n", color=:green)
 
             printstyled("X TYPE: $(typeof(X))\n", color=:blue)
-            train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
+            train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights, max_threads = config.max_training_threads)
 
             # Re-save model with metadata (conv_variables, selected_features)
             if config.task_mode == "convolution"
@@ -2270,7 +2292,8 @@ module Ronin
                 # Identify recommended features (informational only — model is still trained on all)
                 recommended = select_features(importances, config.feature_importance_threshold)
                 printstyled("\n  RECOMMENDED $(length(recommended))/$(length(importances)) FEATURES above $(config.feature_importance_threshold * 100)% threshold\n", color=:green)
-                printstyled("  To use this subset, retrain with selected_features set to these indices.\n", color=:yellow)
+                printstyled("  selected_features = $(recommended)\n", color=:yellow)
+            printstyled("  Copy the line above into your PASS_CONFIG to retrain with this subset.\n", color=:yellow)
 
                 # Save importance metadata alongside model
                 # NOTE: selected_features=Int[] because this model was trained on ALL features.
@@ -2308,12 +2331,15 @@ module Ronin
                     end
 
                     if config.task_mode == "convolution"
-                        # Load selected_features from model JLD2 to match what the model expects
+                        # Load metadata from model JLD2 to match what the model expects
                         md = load_model_with_metadata(model_path, config.task_mode)
                         config_single = deepcopy(config)
                         config_single.input_path = path
                         config_single.write_out = false
                         config_single.selected_features = md.selected_features
+                        if !isempty(md.conv_variables)
+                            config_single.conv_variables = md.conv_variables
+                        end
                         X, Y, idxer_list = calculate_features_conv(config_single, out;
                                                                      QC_mask=QC_mask, mask_name=mask_name,
                                                                      write_out=false, return_idxer=true)
@@ -2362,6 +2388,10 @@ module Ronin
                 end
             end
         end
+        # Restore original config values
+        config.conv_variables = orig_conv_variables
+        config.selected_features = orig_selected_features
+
         printstyled("\n COMPLETED TRAINING MODEL IN $(round(time() - full_start_time, digits = 3)) seconds...\n", color=:green)
     end
 
@@ -2401,6 +2431,167 @@ module Ronin
                              "Description" => "Gates between met prob thresholds"))
         end
         printstyled("Regenerated masks for pass $(pass+1) with threshold $(met_probs_threshold)\n", color=:green)
+    end
+
+    """
+        met_prob_histogram(config::ModelConfig, pass::Int; data_path::String="",
+                           met_probs_threshold::Union{Nothing, Tuple{Float32,Float32}}=nothing)
+
+    Read saved `met_prob_pass_<pass>` from CfRadial files and print a histogram
+    of the probability distribution. Uses fine bins near 0 and 1 (where threshold
+    choices are most sensitive) and coarser bins in the middle.
+
+    If `met_probs_threshold` is provided, marks the threshold positions and prints
+    a summary of how many gates fall into each category. Otherwise shows the raw
+    distribution to help choose thresholds.
+
+    Prints cumulative percentages from each tail to help identify where thresholds
+    capture the most confident classifications.
+    """
+    function met_prob_histogram(config::ModelConfig, pass::Int; data_path::String="",
+                                 met_probs_threshold::Union{Nothing, Tuple{Float32,Float32}}=nothing)
+
+        target_path = isempty(data_path) ? config.input_path : data_path
+        paths = isdir(target_path) ? parse_directory(target_path) : [target_path]
+        met_prob_name = "met_prob_pass_$(pass)"
+
+        probs = Float32[]
+        n_files = 0
+        n_missing = 0
+        for path in paths
+            NCDataset(path, "r") do f
+                if !haskey(f, met_prob_name)
+                    n_missing += 1
+                    return
+                end
+                raw = f[met_prob_name][:]
+                for v in raw
+                    if !ismissing(v) && !isnan(v) && v >= 0.0f0 && v <= 1.0f0
+                        push!(probs, Float32(v))
+                    end
+                end
+                n_files += 1
+            end
+        end
+
+        if n_missing > 0
+            printstyled("  WARNING: $(n_missing)/$(length(paths)) files missing $(met_prob_name)\n", color=:yellow)
+        end
+        if isempty(probs)
+            printstyled("  No valid probabilities found for $(met_prob_name)\n", color=:red)
+            return
+        end
+
+        n = length(probs)
+
+        ## Adaptive bin edges: 0.001 in extreme tails (0–0.01, 0.99–1.0),
+        ## 0.01 in near tails (0.01–0.1, 0.9–0.99), coarse in the middle
+        bin_edges = Float32[0.000, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.010,
+                            0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10,
+                            0.20, 0.30, 0.50, 0.70, 0.80, 0.90,
+                            0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99,
+                            0.991, 0.992, 0.993, 0.994, 0.995, 0.996, 0.997, 0.998, 0.999, 1.001]
+        n_bins = length(bin_edges) - 1
+        counts = zeros(Int, n_bins)
+        for p in probs
+            for b in n_bins:-1:1
+                if p >= bin_edges[b]
+                    counts[b] += 1
+                    break
+                end
+            end
+        end
+        max_count = maximum(counts)
+        bar_width = 50
+
+        header = "Pass $(pass) met_prob distribution ($(n) gates from $(n_files) files)"
+        if met_probs_threshold !== nothing
+            header *= ", thresholds=$(met_probs_threshold)"
+        end
+
+        printstyled("\n  $(header):\n", color=:cyan)
+        printstyled("  ", "─"^72, "\n", color=:light_black)
+
+        ## Cumulative from low tail
+        cum_low = 0
+        ## Cumulative from high tail
+        cum_high = 0
+        cum_high_counts = zeros(Int, n_bins)
+        for b in n_bins:-1:1
+            cum_high += counts[b]
+            cum_high_counts[b] = cum_high
+        end
+
+        cum_low = 0
+        for b in 1:n_bins
+            lo_edge = bin_edges[b]
+            hi_edge = min(bin_edges[b+1], 1.0f0)
+            bar_len = max_count > 0 ? round(Int, counts[b] / max_count * bar_width) : 0
+            pct = round(counts[b] / n * 100, digits=1)
+            cum_low += counts[b]
+            cum_low_pct = round(cum_low / n * 100, digits=1)
+            cum_hi_pct = round(cum_high_counts[b] / n * 100, digits=1)
+
+            ## Color based on threshold position
+            bar_color = :white
+            marker = ""
+            if met_probs_threshold !== nothing
+                lo_t = minimum(met_probs_threshold)
+                hi_t = maximum(met_probs_threshold)
+                if hi_edge <= lo_t
+                    bar_color = :red
+                elseif lo_edge >= hi_t
+                    bar_color = :green
+                else
+                    bar_color = :yellow
+                end
+                if lo_edge < lo_t <= hi_edge
+                    marker = " ◀ NMD"
+                elseif lo_edge < hi_t <= hi_edge
+                    marker = " ◀ MD"
+                end
+            end
+
+            bar = "█"^bar_len
+            label = "$(lpad(string(round(lo_edge, digits=2)), 4))–$(rpad(string(round(hi_edge, digits=2)), 4))"
+            printstyled("    $(label) ", color=:light_black)
+            printstyled("│$(bar)", color=bar_color)
+            printstyled(" $(lpad(string(counts[b]), 7)) ($(lpad(string(pct), 5))%)", color=:light_black)
+            ## Show cumulative from the nearer tail
+            if b <= n_bins ÷ 2
+                printstyled("  cum≤$(round(hi_edge, digits=2)): $(cum_low_pct)%", color=:light_black)
+            else
+                printstyled("  cum≥$(round(lo_edge, digits=2)): $(cum_hi_pct)%", color=:light_black)
+            end
+            printstyled("$(marker)\n", color=:cyan)
+        end
+
+        printstyled("  ", "─"^72, "\n", color=:light_black)
+
+        ## Summary statistics
+        q = sort(probs)
+        p5  = q[max(1, round(Int, 0.05 * n))]
+        p25 = q[max(1, round(Int, 0.25 * n))]
+        p50 = q[max(1, round(Int, 0.50 * n))]
+        p75 = q[max(1, round(Int, 0.75 * n))]
+        p95 = q[max(1, round(Int, 0.95 * n))]
+
+        printstyled("    Percentiles: 5th=$(round(p5, digits=3))  25th=$(round(p25, digits=3))" *
+                    "  50th=$(round(p50, digits=3))  75th=$(round(p75, digits=3))" *
+                    "  95th=$(round(p95, digits=3))\n", color=:cyan)
+
+        if met_probs_threshold !== nothing
+            lo_t = minimum(met_probs_threshold)
+            hi_t = maximum(met_probs_threshold)
+            n_nmd = sum(p -> p < lo_t, probs)
+            n_md  = sum(p -> p >= hi_t, probs)
+            n_unc = n - n_md - n_nmd
+            printstyled("    With threshold ($(lo_t), $(hi_t)): " *
+                        "$(n_nmd) NMD ($(round(n_nmd/n*100, digits=1))%), " *
+                        "$(n_unc) uncertain → pass $(pass+1) ($(round(n_unc/n*100, digits=1))%), " *
+                        "$(n_md) MD ($(round(n_md/n*100, digits=1))%)\n", color=:cyan)
+        end
+        println()
     end
 
     """
@@ -2589,7 +2780,7 @@ module Ronin
         end
 
         printstyled("\n...TRAINING FOR PASS: $(pass) ON $(size(X)[1]) GATES...\n", color=:green)
-        train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights)
+        train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights, max_threads = config.max_training_threads)
 
         # Re-save model with metadata (conv_variables, selected_features)
         if config.task_mode == "convolution"
@@ -2630,14 +2821,16 @@ module Ronin
 
             recommended = select_features(importances, config.feature_importance_threshold)
             printstyled("\n  RECOMMENDED $(length(recommended))/$(length(importances)) FEATURES above $(config.feature_importance_threshold * 100)% threshold\n", color=:green)
-            printstyled("  To use this subset, retrain with selected_features set to these indices.\n", color=:yellow)
+            printstyled("  selected_features = $(recommended)\n", color=:yellow)
+            printstyled("  Copy the line above into your PASS_CONFIG to retrain with this subset.\n", color=:yellow)
 
             JLD2.jldsave(model_path;
                 model=curr_model,
                 selected_features=Int[],
                 recommended_features=recommended,
                 feature_names=feat_names_full,
-                importances=importances)
+                importances=importances,
+                conv_variables=config.conv_variables)
             printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
         end
 
@@ -2717,8 +2910,10 @@ module Ronin
     (Step 2). It avoids redundant retraining and supports configurable
     `n_importance_repeats` and `importance_subsample_fraction` from the config.
     """
-    function compute_importance(config::ModelConfig)
-        for (i, model_path) in enumerate(config.model_output_paths)
+    function compute_importance(config::ModelConfig; pass::Int=0)
+        passes = pass > 0 ? [pass] : 1:length(config.model_output_paths)
+        for i in passes
+            model_path = config.model_output_paths[i]
             out = config.feature_output_paths[i]
 
             if !isfile(model_path)
@@ -2730,6 +2925,11 @@ module Ronin
                 continue
             end
 
+            # Load this pass's conv_variables from its own model file so we don't
+            # accidentally overwrite pass 1 metadata with pass 2 config
+            md = load_model_with_metadata(model_path, config.task_mode)
+            pass_conv_variables = !isempty(md.conv_variables) ? md.conv_variables : config.conv_variables
+
             printstyled("\nLOADING FEATURES FROM $(out)...\n", color=:green)
             X, Y = h5open(out) do f
                 (f["X"][:,:], f["Y"][:,:])
@@ -2737,14 +2937,14 @@ module Ronin
             Y_vec = reshape(Y, length(Y))
 
             printstyled("COMPUTING FEATURE IMPORTANCE FOR PASS $(i) ($(size(X,1)) gates, $(size(X,2)) features)...\n", color=:green)
-            curr_model = load_model(model_path, config.task_mode)
+            curr_model = md.model
             importances = compute_rf_feature_importance(curr_model, X, Y_vec;
                 n_repeats=config.n_importance_repeats,
                 subsample_fraction=config.importance_subsample_fraction)
 
             kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
             feat_names_full = String[]
-            for varname in config.conv_variables
+            for varname in pass_conv_variables
                 for kern in kernel_bank
                     push!(feat_names_full, "$(varname)_$(kern.name)")
                     push!(feat_names_full, "$(varname)_$(kern.name)_vfrac")
@@ -2761,15 +2961,16 @@ module Ronin
 
             recommended = select_features(importances, config.feature_importance_threshold)
             printstyled("\n  RECOMMENDED $(length(recommended))/$(length(importances)) FEATURES above $(config.feature_importance_threshold * 100)% threshold\n", color=:green)
-            printstyled("  To use this subset, retrain with selected_features set to these indices.\n", color=:yellow)
+            printstyled("  selected_features = $(recommended)\n", color=:yellow)
+            printstyled("  Copy the line above into your PASS_CONFIG to retrain with this subset.\n", color=:yellow)
 
             JLD2.jldsave(model_path;
                 model=curr_model,
-                selected_features=Int[],
+                selected_features=md.selected_features,
                 recommended_features=recommended,
                 feature_names=feat_names_full,
                 importances=importances,
-                conv_variables=config.conv_variables)
+                conv_variables=pass_conv_variables)
             printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
         end
     end
@@ -2786,7 +2987,8 @@ module Ronin
     """
     function run_evaluation(config::ModelConfig, dataset_name::String, dataset_path::String,
                             met_probs::Vector{Tuple{Float32, Float32}};
-                            prediction_outfile::String = "", verbose::Bool = true)
+                            prediction_outfile::String = "", verbose::Bool = true,
+                            skip_existing_met_probs::Bool = false)
 
         orig_path = config.input_path
         orig_probs = copy(config.met_probs)
@@ -2798,10 +3000,11 @@ module Ronin
         outfile = write_preds ? prediction_outfile : "model_predictions.h5"
 
         try
-            predictions, verification, indexers = composite_prediction(
+            predictions, verification, indexers, _pass_probs = composite_prediction(
                 config;
                 write_predictions_out = write_preds,
                 prediction_outfile    = outfile,
+                skip_existing_met_probs = skip_existing_met_probs,
             )
 
             targets = Vector{Bool}(verification[:])
@@ -3255,7 +3458,7 @@ module Ronin
          All values returned will be only those that passed quality control checks in the first pass of the model
         minimum NCP / PGG thresholds. In order to reconstruct a scan, user would need to use the values in the returned indexers.
     """
-    function composite_prediction(config::ModelConfig; write_predictions_out::Bool = false, prediction_outfile::String="model_predictions.h5", return_probs::Bool=false, QC_mode::Bool=false)
+    function composite_prediction(config::ModelConfig; write_predictions_out::Bool = false, prediction_outfile::String="model_predictions.h5", return_probs::Bool=false, QC_mode::Bool=false, skip_existing_met_probs::Bool=false)
 
         if config.task_mode != "convolution"
             @assert (length(config.model_output_paths) == length(config.feature_output_paths)
@@ -3291,6 +3494,9 @@ module Ronin
             push!(model_conv_variables, md.conv_variables)
         end
 
+        ## Collect per-pass probabilities for summary histogram
+        pass_probs = [Float32[] for _ in 1:config.num_models]
+
         ###Need to do this file by file so that the spatial context of gates is maintained
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version
         for file in files
@@ -3320,6 +3526,95 @@ module Ronin
             ###For multi-pass models, iteratively construct predictions vector by applying models one at a time
             for (i, model_path) in enumerate(config.model_output_paths)
 
+                met_prob_name = "met_prob_pass_$(i)"
+                curr_proba = config.met_probs[i]
+                met_threshold = maximum(curr_proba)
+                nmd_threshold = minimum(curr_proba)
+
+                ## --- Fast path: read saved probabilities instead of recomputing ---
+                ## When skip_existing_met_probs=true and met_prob_pass_<i> already exists,
+                ## we only need the cheap QC indexer + verification labels, not the
+                ## expensive convolution features or RF prediction.
+                can_skip_computation = false
+                if skip_existing_met_probs
+                    can_skip_computation = NCDataset(file) do ds
+                        haskey(ds, met_prob_name)
+                    end
+                end
+
+                if can_skip_computation
+                    ## Read saved probabilities and build indexer cheaply
+                    f = redirect_stdout(devnull) do
+                        NCDataset(file, "r")
+                    end
+
+                    ## Reconstruct the QC indexer (cheap — no convolutions)
+                    VT = f[config.remove_var][:]
+                    indexer = [!ismissing(x) for x in VT]
+
+                    if i > 1
+                        mask_name = config.mask_names[i]
+                        feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
+                        indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                    elseif config.QC_mask
+                        mask_name = config.mask_names[i]
+                        feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
+                        indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                    end
+
+                    if config.REMOVE_HIGH_PGG
+                        PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(f)[:]]
+                        indexer[indexer] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[indexer]]
+                    end
+                    if config.REMOVE_LOW_SIG_QUALITY
+                        SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(f, config.SIG_QUALITY_VAR)[:]]
+                        indexer[indexer] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[indexer]]
+                    end
+
+                    ## Read saved met_probs for this pass
+                    saved_probs = f[met_prob_name][:]
+                    met_probs = Float32[ismissing(x) ? Float32(-1.0) : Float32(x) for x in saved_probs[:]][indexer]
+
+                    ## Build Y if interactive QC
+                    if ((!QC_mode) && config.HAS_INTERACTIVE_QC)
+                        VG = f[config.QC_var][:][indexer]
+                        VV = f[config.remove_var][:][indexer]
+                        Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
+                    else
+                        Y = false
+                    end
+
+                    close(f)
+
+                    final_idxer = indexer
+                    curr_probs[indexer] .= met_probs[:]
+
+                    append!(pass_probs[i], met_probs)
+
+                    if i == 1
+                        init_idxer = copy(indexer)
+                        curr_Y = copy(Y)
+                        final_predictions = fill(false, sum(indexer))
+                        final_predictions[met_probs .< nmd_threshold] .= false
+                        final_predictions[met_probs .> met_threshold] .= true
+                    elseif i == config.num_models
+                        valid_idxs = indexer[init_idxer]
+                        curr_preds = final_predictions[valid_idxs]
+                        curr_preds[met_probs .>= met_threshold] .= true
+                        curr_preds[met_probs .<  nmd_threshold] .= false
+                        final_predictions[valid_idxs] .= curr_preds
+                    else
+                        valid_idxs = indexer[init_idxer]
+                        curr_preds = final_predictions[valid_idxs]
+                        curr_preds[met_probs .< nmd_threshold] .= false
+                        curr_preds[met_probs .> met_threshold] .= true
+                        final_predictions[valid_idxs] .= curr_preds
+                    end
+
+                    continue
+                end
+
+                ## --- Normal path: compute features and run RF prediction ---
 
                 ###REFACTOR NOTES: I THINK PROCESS_SINGLE_FILE CLOSES THE FILE SO WILL NEED TO CHANGE THAT
                 ###TO MOVE OUTSIDE LOOP
@@ -3372,21 +3667,16 @@ module Ronin
                         mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
                 end
                 final_idxer = indexer
-                #println("SUM OF INDEXER: $(sum(indexer))")
-		        #println("SHAPE OF X: $(size(X))")
                 ###If there are no gates that meet the basic QC thresholds now, we're once again done.
                 if sum(indexer) != 0
 
                     curr_model = models[i]
-                    curr_proba = config.met_probs[i]
                     ###Here's where we need to modify. The ONLY gates that will go on to the next pass
                     ### will be the ones between the thresholds, (inclusive on both ends)
 
                     met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
                     curr_probs[indexer] .= met_probs[:]
-
-                    met_threshold = maximum(curr_proba)
-                    nmd_threshold = minimum(curr_proba)
+                    append!(pass_probs[i], Float32.(met_probs))
 
                     if i == 1
                         init_idxer = copy(indexer)
@@ -3424,11 +3714,13 @@ module Ronin
                     close(f)
                     ###If this wasn't the last pass, write met_prob and mask for the next pass
                     if i < config.num_models
+                        mask_name_next = config.mask_names[i+1]
+
                         ## Write met_prob_pass_<i> so the next pass can use it as a feature
                         met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
                         met_prob_field[indexer] .= met_probs
                         met_prob_field = reshape(met_prob_field, scan_dims)
-                        write_field(file, "met_prob_pass_$(i)", met_prob_field,
+                        write_field(file, met_prob_name, met_prob_field,
                             attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
                             fillval=config.FILL_VAL)
 
@@ -3441,7 +3733,17 @@ module Ronin
                             new_mask[indexer] .= 1.
                         end
                         new_mask = reshape(new_mask, scan_dims)
-                        write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
+                        write_field(file, mask_name_next, new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
+                    end
+
+                    ## Save met_prob for final pass too, so threshold sweeps can skip recomputation
+                    if i == config.num_models
+                        met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                        met_prob_field[indexer] .= met_probs
+                        met_prob_field = reshape(met_prob_field, scan_dims)
+                        write_field(file, met_prob_name, met_prob_field,
+                            attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                            fillval=config.FILL_VAL)
                     end
                 else
                     ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
@@ -3494,24 +3796,72 @@ module Ronin
             throw("ERROR: NO GATES IN INPUT DATASET MET BASIC QC THRESHOLDS")
         end
 
+        ## Print per-pass probability histogram
+        if !QC_mode
+            for i in 1:config.num_models
+                probs = pass_probs[i]
+                if isempty(probs)
+                    printstyled("\n  Pass $(i): no gates processed\n", color=:yellow)
+                    continue
+                end
+                n = length(probs)
+                curr_proba = config.met_probs[i]
+                lo = minimum(curr_proba)
+                hi = maximum(curr_proba)
+
+                ## 20 bins from 0.0 to 1.0
+                n_bins = 20
+                bin_edges = range(0.0f0, 1.0f0, length=n_bins+1)
+                counts = zeros(Int, n_bins)
+                for p in probs
+                    bin = clamp(floor(Int, p * n_bins) + 1, 1, n_bins)
+                    counts[bin] += 1
+                end
+                max_count = maximum(counts)
+                bar_width = 40
+
+                printstyled("\n  Pass $(i) met_prob distribution ($(n) gates, thresholds=$(lo), $(hi)):\n", color=:cyan)
+                for b in 1:n_bins
+                    lo_edge = bin_edges[b]
+                    hi_edge = bin_edges[b+1]
+                    bar_len = max_count > 0 ? round(Int, counts[b] / max_count * bar_width) : 0
+                    pct = round(counts[b] / n * 100, digits=1)
+
+                    ## Mark threshold boundaries
+                    marker = ""
+                    if lo_edge < lo <= hi_edge
+                        marker = " ← NMD threshold"
+                    elseif lo_edge < hi <= hi_edge
+                        marker = " ← MD threshold"
+                    end
+
+                    bar = "█"^bar_len
+                    printstyled("    $(lpad(string(round(lo_edge, digits=2)), 4))–$(rpad(string(round(hi_edge, digits=2)), 4)) ", color=:light_black)
+                    printstyled("│$(bar)", color= lo_edge >= hi ? :green : hi_edge <= lo ? :red : :yellow)
+                    printstyled(" $(counts[b]) ($(pct)%)$(marker)\n", color=:light_black)
+                end
+                n_md  = sum(p -> p >= hi, probs)
+                n_nmd = sum(p -> p < lo, probs)
+                n_unc = n - n_md - n_nmd
+                printstyled("    Summary: $(n_nmd) NMD ($(round(n_nmd/n*100, digits=1))%), " *
+                            "$(n_unc) uncertain ($(round(n_unc/n*100, digits=1))%), " *
+                            "$(n_md) MD ($(round(n_md/n*100, digits=1))%)\n", color=:cyan)
+            end
+        end
 
         if write_predictions_out
             h5open(prediction_outfile, "w") do f
                 write_dataset(f, "Predictions", predictions)
                 write_dataset(f, "Verification", values)
-                #write_dataset(f, "Met_probabilities", met_probs)
-                ##Below line is giving me Type Array does not have a definite size errors
-                #write_dataset(f, "Scan_indexers", init_idxers)
             end
         end
 
         if return_probs
-            return(predictions, values, init_idxers, total_met_probs)
+            return(predictions, values, init_idxers, total_met_probs, pass_probs)
         elseif QC_mode
-
             return
         else
-            return(predictions, values, init_idxers)
+            return(predictions, values, init_idxers, pass_probs)
         end
 
     end
@@ -3555,7 +3905,7 @@ module Ronin
 
     function get_idxer(model_config::ModelConfig, low_threshold::Float32, high_threshold::Float32)
 
-        low_predictions, low_verification, low_idxrs, low_probs = composite_prediction(model_config, return_probs=true)
+        low_predictions, low_verification, low_idxrs, low_probs, _ = composite_prediction(model_config, return_probs=true)
         pred_idxer = Vector{Bool}((low_probs .> low_threshold) .& (low_probs .< high_threshold))
         return(low_predictions, low_verification, low_idxrs, pred_idxer)
 

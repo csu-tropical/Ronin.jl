@@ -215,7 +215,7 @@ get_classes(rf::RandomForestClassifier) = rf.classes
                           :min_samples_leaf, :min_samples_split, :min_purity_increase,
                           :rng])
 
-function fit!(rf::RandomForestClassifier, X::Matrix, y::Vector, weights=nothing)
+function fit!(rf::RandomForestClassifier, X::Matrix, y::Vector, weights=nothing; max_threads::Int=Threads.nthreads())
     n_samples, n_features = size(X)
     rf.ensemble = build_forest(
         y, X,
@@ -227,7 +227,8 @@ function fit!(rf::RandomForestClassifier, X::Matrix, y::Vector, weights=nothing)
         rf.min_samples_split,
         rf.min_purity_increase;
         weights = weights,
-        rng = rf.rng)
+        rng = rf.rng,
+        max_threads = max_threads)
     rf.classes = sort(unique(y))
     rf
 end

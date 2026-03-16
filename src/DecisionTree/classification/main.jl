@@ -207,7 +207,8 @@ function build_forest(
         min_samples_split   = 2,
         min_purity_increase = 0.0;
         weights             = nothing,
-        rng                 = Random.GLOBAL_RNG) where {S, T}
+        rng                 = Random.GLOBAL_RNG,
+        max_threads         = Threads.nthreads()) where {S, T}
 
     if n_trees < 1
         throw("the number of trees must be >= 1")
@@ -237,7 +238,7 @@ function build_forest(
     # Build trees in batches to limit peak memory from concurrent bootstrap copies.
     # Each bootstrap sample is ~partial_sampling * n_features * sizeof(S) bytes;
     # without batching, all threads hold copies simultaneously.
-    n_threads = Threads.nthreads()
+    n_threads = min(max_threads, Threads.nthreads())
     for batch_start in 1:n_threads:n_trees
         batch_end = min(batch_start + n_threads - 1, n_trees)
         Threads.@threads for i in batch_start:batch_end

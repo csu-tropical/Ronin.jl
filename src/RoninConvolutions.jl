@@ -347,13 +347,19 @@ function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector;
     importances = Vector{Float64}(undef, n_features)
     start_time = time()
 
-    n_threads = Threads.nthreads()
-    printstyled("  Using $(n_threads) thread(s), $(n_repeats) repeats per feature, $(n_features) features\n", color=:cyan)
+    max_tid = Threads.maxthreadid()
+    mem_per_copy = sizeof(X_eval) / 1024^2
+    printstyled("  Using $(Threads.nthreads()) thread(s) (max tid=$(max_tid)), $(n_repeats) repeats per feature, $(n_features) features\n", color=:cyan)
+    printstyled("  Memory: $(round(mem_per_copy, digits=1)) MB per thread × $(max_tid) slots = $(round(mem_per_copy * max_tid, digits=1)) MB\n", color=:cyan)
 
-    # Each thread gets its own copy of X_eval to avoid race conditions
+    # Pre-allocate one matrix copy per thread (not per feature) to bound memory
+    # Use maxthreadid() since threadid() can exceed nthreads() with interactive threads
+    thread_X = [copy(X_eval) for _ in 1:max_tid]
+
     Threads.@threads for f in 1:n_features
-        X_local = copy(X_eval)
-        original_col = X_local[:, f]
+        tid = Threads.threadid()
+        X_local = thread_X[tid]
+        original_col = copy(X_local[:, f])
         acc_drops = 0.0
 
         for _ in 1:n_repeats
@@ -365,10 +371,11 @@ function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector;
             acc_drops += (baseline_acc - perm_acc)
         end
 
+        # Restore original column so the thread's copy is clean for the next feature
+        X_local[:, f] = original_col
         importances[f] = acc_drops / n_repeats
 
         elapsed = time() - start_time
-        done = f  # approximate — threads may complete out of order
         printstyled("  Feature $(f)/$(n_features) done (elapsed: $(round(elapsed, digits=1))s)\n", color=:light_black)
     end
 
