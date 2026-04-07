@@ -37,7 +37,7 @@
 RUN_SPLIT_DATA           = false   # One-time data split (run before anything else)
 RUN_FULL_TRAINING        = false   # Phase 1: train → evaluate → importance (all passes)
 RUN_FULL_RETRAIN         = false   # Phase 2: retrain with selected_features → evaluate
-USE_PRECOMPUTED_FEATURES = true  # Skip feature calculation (use saved h5, any mode)
+USE_PRECOMPUTED_FEATURES = false  # Skip feature calculation (use saved h5, any mode)
 
 ## Also evaluate on validation set?
 RUN_VALIDATION          = false
@@ -48,7 +48,7 @@ RUN_VALIDATION          = false
 
 RUN_CALCULATE_FEATURES  = false   # Calculate and save features (no training)
 RUN_TRAINING            = false   # Train all passes from scratch
-RUN_EVALUATION          = false   # Evaluate on testing set
+RUN_EVALUATION          = true   # Evaluate on testing set
 SKIP_EXISTING_MET_PROBS = false   # Skip re-writing met_prob_pass_N if already in CfRadial files
 RUN_IMPORTANCE          = false   # Compute feature importance for TRAIN_PASS
 RUN_RETRAIN             = false   # Retrain TRAIN_PASS with pruned features
@@ -60,25 +60,48 @@ RUN_PASS2_SWEEP         = false   # Sweep Pass 2 met_prob thresholds
 RUN_QC                  = false   # Apply QC to write corrected fields
 
 ## For incremental steps: which pass to operate on
-MASK_PASS               = 1
-TRAIN_PASS              = 2
+MASK_PASS               = 0
+TRAIN_PASS              = 1
 
 ##=============================================================================
 ## LOAD SHARED CONFIG
 ##=============================================================================
 
 # Default is 00_config.jl but you can change that here
-include("kitchen_sink_config.jl")
+include("3pass_config.jl")
 
 ## --- Apply precomputed features flag (applies to all modes) ---
 if USE_PRECOMPUTED_FEATURES
     for i in 1:config.num_models
         out = config.feature_output_paths[i]
-        if isfile(out)
-            config.file_preprocessed[i] = true
-            printstyled("  Pass $(i): using precomputed features from $(out)\n", color=:cyan)
-        else
+        if !isfile(out)
             @warn "USE_PRECOMPUTED_FEATURES is true but $(out) not found — pass $(i) will recalculate"
+            continue
+        end
+
+        # Determine what selected_features this pass wants
+        pc = get(PASS_CONFIG, i, nothing)
+        pass_sf = pc !== nothing && hasproperty(pc, :selected_features) ? pc.selected_features : SELECTED_FEATURES
+
+        # Check what the trained model expects (if model file exists)
+        model_path = config.model_output_paths[i]
+        model_sf = Int[]
+        if task_mode == "convolution" && isfile(model_path)
+            try
+                md = load_model_with_metadata(model_path, task_mode)
+                model_sf = md.selected_features
+            catch; end
+        end
+
+        # Compare: can we reuse the precomputed features?
+        h5_ncols = Ronin.HDF5.h5open(out) do f; size(f["X"], 2); end
+        if collect(Int, pass_sf) == collect(Int, model_sf)
+            config.file_preprocessed[i] = true
+            printstyled("  Pass $(i): using precomputed features from $(out) ($(h5_ncols) columns)\n", color=:cyan)
+        else
+            config.file_preprocessed[i] = false
+            printstyled("  Pass $(i): recalculating features — config has $(isempty(pass_sf) ? "all" : "$(length(pass_sf))") selected features" *
+                        ", model has $(isempty(model_sf) ? "all" : "$(length(model_sf))") (h5 has $(h5_ncols) columns)\n", color=:yellow)
         end
     end
 end
@@ -587,6 +610,7 @@ if RUN_PASS2_SWEEP
         infer_high_grid        = INFER_HIGH_GRID,
         nmd_target             = NMD_TARGET,
         secondary_metric       = SECONDARY_METRIC,
+        skip_existing_sweep    = SKIP_EXISTING_SWEEP,
     )
 end
 

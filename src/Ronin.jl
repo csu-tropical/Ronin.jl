@@ -2246,7 +2246,8 @@ module Ronin
                 end
             end
 
-            printstyled("\n...TRAINING FOR PASS: $(i) ON $(size(X)[1]) GATES...\n", color=:green)
+            printstyled("\n...TRAINING FOR PASS: $(i) ON $(size(X)[1]) GATES, $(size(X)[2]) FEATURES...\n", color=:green)
+            printstyled("  selected_features: $(isempty(config.selected_features) ? "none (all)" : "$(length(config.selected_features)) indices, max=$(maximum(config.selected_features))")\n", color=:cyan)
 
             printstyled("X TYPE: $(typeof(X))\n", color=:blue)
             train_model(X, Y, model_path, n_trees = config.n_trees, max_depth = config.max_depth, class_weights = class_weights, max_threads = config.max_training_threads)
@@ -2296,11 +2297,10 @@ module Ronin
             printstyled("  Copy the line above into your PASS_CONFIG to retrain with this subset.\n", color=:yellow)
 
                 # Save importance metadata alongside model
-                # NOTE: selected_features=Int[] because this model was trained on ALL features.
-                # recommended_features stores the pruned subset for a future retrain step.
+                # Preserve selected_features so inference knows which columns the model expects
                 JLD2.jldsave(model_path;
                     model=curr_model,
-                    selected_features=Int[],
+                    selected_features=config.selected_features,
                     recommended_features=recommended,
                     feature_names=feat_names_full,
                     importances=importances,
@@ -2355,6 +2355,7 @@ module Ronin
                                             write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
                     end
 
+                    printstyled("  Prediction: X size=$(size(X)), model_selected_features=$(isempty(md.selected_features) ? "none" : "$(length(md.selected_features)) indices")\n", color=:cyan)
                     met_probs = DecisionTree.predict_proba(curr_model, X)
                     if size(met_probs)[2] < 2
                         throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET"))
@@ -2428,9 +2429,10 @@ module Ronin
 
             write_field(path, config.mask_names[pass + 1], new_mask,
                 attribs=Dict("Units" => "Bool",
-                             "Description" => "Gates between met prob thresholds"))
+                             "Description" => "Gates between met prob thresholds"),
+                verbose=false)
         end
-        printstyled("Regenerated masks for pass $(pass+1) with threshold $(met_probs_threshold)\n", color=:green)
+        printstyled("Regenerated masks for pass $(pass+1) with threshold $(met_probs_threshold) ($(length(paths)) files)\n", color=:green)
     end
 
     """
@@ -2826,7 +2828,7 @@ module Ronin
 
             JLD2.jldsave(model_path;
                 model=curr_model,
-                selected_features=Int[],
+                selected_features=config.selected_features,
                 recommended_features=recommended,
                 feature_names=feat_names_full,
                 importances=importances,
@@ -3082,7 +3084,8 @@ module Ronin
                                    infer_low_grid::Vector{Float32} = Float32[0.1, 0.2, 0.3],
                                    infer_high_grid::Vector{Float32} = Float32[0.98, 0.99, 0.999],
                                    nmd_target::Float32 = 0.99f0,
-                                   secondary_metric::Symbol = :hss)
+                                   secondary_metric::Symbol = :hss,
+                                   skip_existing_sweep::Bool = false)
 
         @assert config.num_models >= 2 "sweep_pass2_met_probs requires num_models >= 2"
         @assert isfile(config.model_output_paths[1]) "Pass 1 model not found at $(config.model_output_paths[1]). Train Pass 1 first."
@@ -3094,28 +3097,54 @@ module Ronin
         orig_met_probs = copy(config.met_probs)
         orig_input_path = config.input_path
 
-        results = NamedTuple[]
+        all_results = NamedTuple[]
+
+        # Summary file — append results as we go so progress is saved
+        summary_file = "$(experiment_name)_sweep_summary.txt"
+        completed_combos = Set{Tuple{Float32,Float32,Float32}}()
+        if skip_existing_sweep && isfile(summary_file)
+            for line in eachline(summary_file)
+                startswith(line, "#") && continue
+                fields = split(strip(line))
+                length(fields) >= 3 || continue
+                try
+                    k = (parse(Float32, fields[1]), parse(Float32, fields[2]), parse(Float32, fields[3]))
+                    push!(completed_combos, k)
+                catch; end
+            end
+            if !isempty(completed_combos)
+                printstyled("  Loaded $(length(completed_combos)) completed results from $(summary_file)\n", color=:cyan)
+            end
+        else
+            open(summary_file, "w") do io
+                println(io, "# RONIN Pass 2 Sweep Summary — $(experiment_name)")
+                println(io, "#")
+                println(io, "# mask_lo  mask_hi  infer_hi  NMD       MD        HSS       F1        gates     model_path")
+            end
+        end
 
         n_combos = length(met_prob_low_grid) * length(met_prob_high_grid)
+        n_infer = sweep_inference ? length(infer_high_grid) : 0
         println("\n", "="^70)
-        println("PASS 2 MET_PROB SWEEP: $(n_combos) threshold combinations")
+        println("PASS 2 MET_PROB SWEEP: $(n_combos) mask thresholds × $(max(1, n_infer)) inference thresholds")
         println("  Pass 1 model: $(config.model_output_paths[1]) (frozen)")
         println("  NMD target: $(nmd_target)")
         println("  Secondary metric: $(secondary_metric)")
         println("  met_prob as Pass 2 feature: $(use_met_prob_as_feature)")
+        println("  Summary file: $(summary_file)")
+        if sweep_inference
+            println("  Inference high grid: $(infer_high_grid)")
+        end
+        if skip_existing_sweep
+            println("  Skip existing: ON (reuses trained models and features if present)")
+        end
         println("="^70)
 
         combo_idx = 0
         for mp_lo in met_prob_low_grid, mp_hi in met_prob_high_grid
             combo_idx += 1
             sweep_threshold = (mp_lo, mp_hi)
-            println("\n  [$(combo_idx)/$(n_combos)] met_prob threshold=$(sweep_threshold)")
-
-            # Regenerate masks on training and testing data
-            config.input_path = training_path
-            regenerate_masks(config, 1, sweep_threshold)
-            config.input_path = testing_path
-            regenerate_masks(config, 1, sweep_threshold)
+            println("\n  [$(combo_idx)/$(n_combos)] mask threshold=$(sweep_threshold)")
 
             # Configure Pass 2 with unique paths
             sweep_tag = "mp_$(mp_lo)_$(mp_hi)"
@@ -3134,44 +3163,86 @@ module Ronin
                 end
             end
 
-            # Train Pass 2
-            println("    Training Pass 2...")
-            train_single_pass(config, 2)
+            # Skip training if model and features already exist
+            if skip_existing_sweep && isfile(pass2_model_path) && isfile(pass2_feature_path)
+                printstyled("    Skipping training — model and features exist: $(pass2_model_path)\n", color=:cyan)
+                config.file_preprocessed[2] = true
+            else
+                # Regenerate masks on training and testing data
+                config.input_path = training_path
+                regenerate_masks(config, 1, sweep_threshold)
+                config.input_path = testing_path
+                regenerate_masks(config, 1, sweep_threshold)
+                config.input_path = training_path
 
-            # Evaluate
-            println("    Evaluating...")
-            r = run_evaluation(config, "PASS2_SWEEP", testing_path,
-                               [sweep_threshold, config.met_probs[2]])
+                # Use precomputed features if they exist, otherwise recalculate
+                if skip_existing_sweep && isfile(pass2_feature_path)
+                    printstyled("    Using precomputed features: $(pass2_feature_path)\n", color=:cyan)
+                    config.file_preprocessed[2] = true
+                else
+                    config.file_preprocessed[2] = false
+                end
 
-            push!(results, (
-                met_prob_low  = mp_lo,
-                met_prob_high = mp_hi,
-                pass2_gates   = r.n,
-                nmd_hit_rate  = r.nmd_hit_rate,
-                md_hit_rate   = r.md_hit_rate,
-                precision     = r.precision,
-                recall        = r.recall,
-                f1            = r.f1,
-                hss           = r.hss,
-                accuracy      = Float32((r.tp + r.tn) / r.n),
-                tp = r.tp, fp = r.fp, tn = r.tn, fn = r.fn,
-                model_path    = pass2_model_path,
-            ))
-            println("    NMD=$(round(r.nmd_hit_rate, digits=4))  MD=$(round(r.md_hit_rate, digits=4))  HSS=$(round(r.hss, digits=4))  gates=$(r.n)")
+                println("    Training Pass 2...")
+                train_single_pass(config, 2)
+            end
+
+            # Run evaluation once to store met_prob_pass_2 in testing CfRadials
+            # (pass 1 is frozen so skip_existing_met_probs reads saved pass 1 probs)
+            baseline_infer_hi = Float32(maximum(config.met_probs[2]))
+            if (mp_lo, mp_hi, baseline_infer_hi) in completed_combos
+                printstyled("    Skipping baseline evaluation — already in summary\n", color=:cyan)
+            else
+                println("    Computing pass 2 predictions on testing set...")
+                r = run_evaluation(config, "PASS2_SWEEP", testing_path,
+                                   [sweep_threshold, config.met_probs[2]];
+                                   skip_existing_met_probs=true, verbose=false)
+                println("    NMD=$(round(r.nmd_hit_rate, digits=4))  MD=$(round(r.md_hit_rate, digits=4))  " *
+                        "HSS=$(round(r.hss, digits=4))  gates=$(r.n)")
+                _append_sweep_result!(all_results, summary_file,
+                    mp_lo, mp_hi, baseline_infer_hi, r, pass2_model_path)
+            end
+
+            # Sweep inference thresholds (fast — reads stored met_prob_pass_2)
+            if sweep_inference
+                # Check which inference thresholds still need to run
+                remaining = [hi for hi in infer_high_grid if (mp_lo, mp_hi, hi) ∉ completed_combos]
+                if isempty(remaining)
+                    printstyled("    Skipping inference sweep — all thresholds already in summary\n", color=:cyan)
+                else
+                    if length(remaining) < length(infer_high_grid)
+                        printstyled("    Inference sweep ($(length(remaining))/$(length(infer_high_grid)) remaining): ", color=:cyan)
+                    else
+                        print("    Inference sweep: ")
+                    end
+                    for infer_hi in remaining
+                        infer_probs = [sweep_threshold, (mp_lo, infer_hi)]
+                        r = run_evaluation(config, "INFER_SWEEP", testing_path, infer_probs;
+                                           skip_existing_met_probs=true, verbose=false)
+                        _append_sweep_result!(all_results, summary_file,
+                            mp_lo, mp_hi, infer_hi, r, pass2_model_path)
+                        print("hi=$(infer_hi)→HSS=$(round(r.hss, digits=4)) ")
+                    end
+                    println()
+                end
+            end
+
+            # Free memory between sweep iterations to reduce GC pressure
+            GC.gc()
         end
 
         # Print sorted results
         println("\n", "="^70)
-        println("PASS 2 SWEEP RESULTS (sorted by $(secondary_metric))")
+        println("SWEEP RESULTS (sorted by $(secondary_metric))")
         println("="^70)
-        sorted = sort(results, by = r -> getfield(r, secondary_metric), rev=true)
+        sorted = sort(all_results, by = r -> getfield(r, secondary_metric), rev=true)
         for r in sorted
-            println("  threshold=($(r.met_prob_low), $(r.met_prob_high))  " *
+            println("  mask=($(r.met_prob_low), $(r.met_prob_high))  infer_hi=$(r.infer_high)  " *
                     "NMD=$(round(r.nmd_hit_rate, digits=4))  MD=$(round(r.md_hit_rate, digits=4))  " *
                     "HSS=$(round(r.hss, digits=4))  F1=$(round(r.f1, digits=4))  gates=$(r.pass2_gates)")
         end
 
-        # Find best
+        # Find best meeting NMD target
         passing = filter(r -> r.nmd_hit_rate >= nmd_target, sorted)
         best = isempty(passing) ? sorted[1] : passing[1]
 
@@ -3179,51 +3250,13 @@ module Ronin
             println("\nWARNING: No config met NMD >= $(nmd_target). Showing best $(secondary_metric).")
         end
 
-        println("\n>> BEST: threshold=($(best.met_prob_low), $(best.met_prob_high))")
+        println("\n>> BEST: mask=($(best.met_prob_low), $(best.met_prob_high))  infer_hi=$(best.infer_high)")
         println("   NMD=$(round(best.nmd_hit_rate, digits=4))  MD=$(round(best.md_hit_rate, digits=4))  " *
                 "HSS=$(round(best.hss, digits=4))  F1=$(round(best.f1, digits=4))")
         println("   Model: $(best.model_path)")
-
-        # Phase 2: inference threshold sweep for best training config
-        infer_results = NamedTuple[]
-        if sweep_inference
-            config.model_output_paths[2] = best.model_path
-            best_threshold = (best.met_prob_low, best.met_prob_high)
-
-            println("\n", "="^70)
-            println("INFERENCE SWEEP for best training threshold: $(best_threshold)")
-            println("="^70)
-
-            n_infer = length(infer_low_grid) * length(infer_high_grid)
-            infer_idx = 0
-            for ip_lo in infer_low_grid, ip_hi in infer_high_grid
-                infer_idx += 1
-                infer_probs = [best_threshold, (ip_lo, ip_hi)]
-                print("  [$(infer_idx)/$(n_infer)] infer_probs=$(infer_probs) ... ")
-
-                r = run_evaluation(config, "INFER_SWEEP", testing_path, infer_probs; verbose=false)
-                push!(infer_results, (
-                    infer_p2_low  = ip_lo,
-                    infer_p2_high = ip_hi,
-                    nmd_hit_rate  = r.nmd_hit_rate,
-                    md_hit_rate   = r.md_hit_rate,
-                    precision = r.precision, recall = r.recall,
-                    f1 = r.f1, hss = r.hss,
-                    accuracy = Float32((r.tp + r.tn) / r.n),
-                    tp = r.tp, fp = r.fp, tn = r.tn, fn = r.fn,
-                ))
-                println("NMD=$(round(r.nmd_hit_rate, digits=4))  MD=$(round(r.md_hit_rate, digits=4))  HSS=$(round(r.hss, digits=4))")
-            end
-
-            infer_sorted = sort(infer_results, by = r -> getfield(r, secondary_metric), rev=true)
-            infer_passing = filter(r -> r.nmd_hit_rate >= nmd_target, infer_sorted)
-            if !isempty(infer_passing)
-                best_infer = infer_passing[1]
-                println("\n>> BEST INFERENCE: met_probs_test[2]=($(best_infer.infer_p2_low), $(best_infer.infer_p2_high))")
-                println("   NMD=$(round(best_infer.nmd_hit_rate, digits=4))  MD=$(round(best_infer.md_hit_rate, digits=4))  " *
-                        "HSS=$(round(best_infer.hss, digits=4))  F1=$(round(best_infer.f1, digits=4))")
-            end
-        end
+        println("   met_probs_train = [($(best.met_prob_low)f0, $(best.met_prob_high)f0), ...]")
+        println("   met_probs_test  = [($(best.met_prob_low)f0, $(best.met_prob_high)f0), ($(best.met_prob_low)f0, $(best.infer_high)f0)]")
+        println("\n   Summary written to: $(summary_file)")
 
         # Restore original config
         config.conv_variables = orig_conv_variables
@@ -3232,7 +3265,35 @@ module Ronin
         config.met_probs = orig_met_probs
         config.input_path = orig_input_path
 
-        return (training=results, inference=infer_results, best=best)
+        return (results=all_results, best=best)
+    end
+
+    """Helper to record a sweep result to both the results vector and the summary file."""
+    function _append_sweep_result!(all_results, summary_file,
+                                   mp_lo, mp_hi, infer_hi, r, model_path)
+        push!(all_results, (
+            met_prob_low  = mp_lo,
+            met_prob_high = mp_hi,
+            infer_high    = infer_hi,
+            pass2_gates   = r.n,
+            nmd_hit_rate  = r.nmd_hit_rate,
+            md_hit_rate   = r.md_hit_rate,
+            precision     = r.precision,
+            recall        = r.recall,
+            f1            = r.f1,
+            hss           = r.hss,
+            accuracy      = Float32((r.tp + r.tn) / r.n),
+            tp = r.tp, fp = r.fp, tn = r.tn, fn = r.fn,
+            model_path    = model_path,
+        ))
+        open(summary_file, "a") do io
+            println(io, "  $(rpad(mp_lo, 8)) $(rpad(mp_hi, 8)) $(rpad(infer_hi, 9)) " *
+                        "$(rpad(round(r.nmd_hit_rate, digits=6), 9)) " *
+                        "$(rpad(round(r.md_hit_rate, digits=6), 9)) " *
+                        "$(rpad(round(r.hss, digits=6), 9)) " *
+                        "$(rpad(round(r.f1, digits=6), 9)) " *
+                        "$(rpad(r.n, 9)) $(model_path)")
+        end
     end
 
     """
@@ -3722,7 +3783,7 @@ module Ronin
                         met_prob_field = reshape(met_prob_field, scan_dims)
                         write_field(file, met_prob_name, met_prob_field,
                             attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
-                            fillval=config.FILL_VAL)
+                            fillval=config.FILL_VAL, verbose=false)
 
                         ## Write mask for gates between thresholds
                         gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
@@ -3733,7 +3794,7 @@ module Ronin
                             new_mask[indexer] .= 1.
                         end
                         new_mask = reshape(new_mask, scan_dims)
-                        write_field(file, mask_name_next, new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
+                        write_field(file, mask_name_next, new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL, verbose=false)
                     end
 
                     ## Save met_prob for final pass too, so threshold sweeps can skip recomputation
@@ -3743,7 +3804,7 @@ module Ronin
                         met_prob_field = reshape(met_prob_field, scan_dims)
                         write_field(file, met_prob_name, met_prob_field,
                             attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
-                            fillval=config.FILL_VAL)
+                            fillval=config.FILL_VAL, verbose=false)
                     end
                 else
                     ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.

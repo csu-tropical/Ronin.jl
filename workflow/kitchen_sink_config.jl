@@ -55,8 +55,8 @@ num_models = 2
 ##     met_probs_train: thresholds used during training (controls pass-to-pass masks)
 ##     met_probs_test:  thresholds used during inference/evaluation
 ##-----------------------------------------------------------------------------
-met_probs_train = [(0.1f0, 0.8f0), (0.1f0, 0.999f0)]
-met_probs_test  = [(0.1f0, 0.8f0), (0.1f0, 0.99f0)]
+met_probs_train = [(0.15f0, 0.8f0), (0.1f0, 0.99f0)]
+met_probs_test  = [(0.15f0, 0.8f0), (0.1f0, 0.999f0)]
 
 ##-----------------------------------------------------------------------------
 ## 3c. Signal quality filtering
@@ -77,6 +77,7 @@ PGG_THRESHOLD   = 1.0f0
 n_trees       = 51
 max_depth     = 14
 class_weights = "balanced"
+max_training_threads = Threads.nthreads()   # use all available Julia threads for RF training
 
 ##-----------------------------------------------------------------------------
 ## 3f. Feature mode
@@ -138,7 +139,10 @@ importance_subsample_fraction = 0.3
 PASS_CONFIG = Dict(
     1 => (
         conv_variables = conv_variables,
-        selected_features = []
+        #selected_features = []
+        selected_features = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 23, 29, 31, 33,
+            37, 39, 45, 47, 59, 65, 67, 69, 71, 79, 81, 83, 85, 91, 93, 95, 97,
+            99, 101, 103, 105, 109, 111, 113, 115, 117, 119, 125, 127, 129, 130, 131, 132]
         #selected_features = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 27, 29, 31, 33,
         #    35, 37, 39, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 77,
         #    79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 99, 101, 103, 105, 107, 109, 111,
@@ -146,6 +150,13 @@ PASS_CONFIG = Dict(
     ),
     2 => (
         conv_variables = vcat(conv_variables, ["met_prob_pass_1"]),
+        #selected_features = [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20,
+        #    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 36, 37, 38, 39, 40,
+        #    41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+        #    61, 62, 63, 64, 65, 67, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+        #    81, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 99, 100,
+        #    101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 115, 116, 117, 118, 119, 120,
+        #    121, 122, 123, 124, 125, 126, 127, 128, 133, 134, 135, 136, 137, 138, 139, 140, 141, 144, 145, 146, 147, 148]
         selected_features = []
         #selected_features = [1, 3, 5, 7, 9, 10, 11, 12, 13, 14, 15, 17, 19, 21, 22, 23,
         #    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 37, 38, 39, 41, 42, 43, 44, 45,
@@ -173,16 +184,17 @@ QC_SUFFIX  = "_QC"
 ##=============================================================================
 ## SECTION 4: SWEEP PARAMETERS (used by 05_sweep_pass2.jl)
 ##=============================================================================
-SWEEP_MET_PROB_LOW_GRID  = Float32[0.1, 0.2, 0.3, 0.4]
-SWEEP_MET_PROB_HIGH_GRID = Float32[0.6, 0.7, 0.8, 0.9]
+SWEEP_MET_PROB_LOW_GRID  = Float32[0.01, 0.02, 0.05, 0.075, 0.1]
+SWEEP_MET_PROB_HIGH_GRID = Float32[0.75, 0.8, 0.85, 0.9, 0.95]
 USE_MET_PROB_AS_FEATURE  = true
 
 SWEEP_INFERENCE          = true
-INFER_LOW_GRID           = Float32[0.1, 0.2, 0.3]
-INFER_HIGH_GRID          = Float32[0.98, 0.99, 0.999]
+INFER_LOW_GRID           = Float32[0.1]
+INFER_HIGH_GRID          = Float32[0.9, 0.95, 0.98, 0.99, 0.999]
 
 NMD_TARGET       = 0.99f0
 SECONDARY_METRIC = :hss
+SKIP_EXISTING_SWEEP = true   # Reuse trained models/features from prior sweep runs
 
 ##=============================================================================
 ## SECTION 5: QC OUTPUT PATH (used by 06_qc.jl)
@@ -215,6 +227,7 @@ config_kwargs = Dict{Symbol,Any}(
     :max_depth              => max_depth,
     :overwrite_output       => true,
     :class_weights          => class_weights,
+    :max_training_threads   => max_training_threads,
     :compute_feature_importance => false,
 )
 
