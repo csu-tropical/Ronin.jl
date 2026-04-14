@@ -48,7 +48,7 @@ RUN_VALIDATION          = false
 
 RUN_CALCULATE_FEATURES  = false   # Calculate and save features (no training)
 RUN_TRAINING            = false   # Train all passes from scratch
-RUN_EVALUATION          = true   # Evaluate on testing set
+RUN_EVALUATION          = false   # Evaluate on testing set
 SKIP_EXISTING_MET_PROBS = false   # Skip re-writing met_prob_pass_N if already in CfRadial files
 RUN_IMPORTANCE          = false   # Compute feature importance for TRAIN_PASS
 RUN_RETRAIN             = false   # Retrain TRAIN_PASS with pruned features
@@ -57,18 +57,19 @@ RUN_HISTOGRAM           = false   # Show met_prob distribution for MASK_PASS
 RUN_GENERATE_MASKS      = false  # Generate met_prob/masks from MASK_PASS
 RUN_TRAIN_NEXT_PASS     = false  # Train TRAIN_PASS using existing prior-pass masks
 RUN_PASS2_SWEEP         = false   # Sweep Pass 2 met_prob thresholds
+RUN_HYPERTUNING         = true   # Sweep n_trees/max_depth, evaluate AUC on testing
 RUN_QC                  = false   # Apply QC to write corrected fields
 
 ## For incremental steps: which pass to operate on
-MASK_PASS               = 0
-TRAIN_PASS              = 1
+MASK_PASS               = 1
+TRAIN_PASS              = 2
 
 ##=============================================================================
 ## LOAD SHARED CONFIG
 ##=============================================================================
 
 # Default is 00_config.jl but you can change that here
-include("3pass_config.jl")
+include("00_config.jl")
 
 ## --- Apply precomputed features flag (applies to all modes) ---
 if USE_PRECOMPUTED_FEATURES
@@ -122,7 +123,7 @@ end
 ## --- Phase 1: Train all passes → Evaluate → Importance ---
 if RUN_FULL_TRAINING
     ## Verify PASS_CONFIG selected_features are empty (Phase 1 trains on all features)
-    for (p, pc) in sort(collect(PASS_CONFIG))
+    for (p, pc) in sort(collect(PASS_CONFIG); by=first)
         sf = hasproperty(pc, :selected_features) ? pc.selected_features : Int[]
         if !isempty(sf)
             @warn "PASS_CONFIG[$(p)] has $(length(sf)) selected_features. " *
@@ -131,14 +132,21 @@ if RUN_FULL_TRAINING
         end
     end
 
-    ## Build a training-only pass_config (strip selected_features so all features are used)
+    ## Build a training-only pass_config (strip selected_features so all features are used,
+    ## but preserve masked conv config)
     train_pass_config = Dict{Int,Any}()
     for (p, pc) in PASS_CONFIG
+        fields = Dict{Symbol,Any}(:selected_features => Int[])
         if hasproperty(pc, :conv_variables)
-            train_pass_config[p] = (conv_variables = pc.conv_variables, selected_features = Int[])
-        else
-            train_pass_config[p] = (selected_features = Int[],)
+            fields[:conv_variables] = pc.conv_variables
         end
+        for fname in (:masked_conv_variables, :masked_conv_kernel_types,
+                       :masked_conv_kernel_sizes, :masked_conv_threshold)
+            if hasproperty(pc, fname)
+                fields[fname] = getproperty(pc, fname)
+            end
+        end
+        train_pass_config[p] = NamedTuple(fields)
     end
 
     println("\n", "="^70)
@@ -151,7 +159,7 @@ if RUN_FULL_TRAINING
     println("  met_probs_train = $(met_probs_train)")
     if task_mode == "convolution"
         println("  conv_kernel_sizes = $(config.conv_kernel_sizes)")
-        for (p, pc) in sort(collect(PASS_CONFIG))
+        for (p, pc) in sort(collect(PASS_CONFIG); by=first)
             cv = hasproperty(pc, :conv_variables) ? pc.conv_variables : conv_variables
             println("  Pass $(p): $(length(cv)) conv_variables, all features")
         end
@@ -214,7 +222,7 @@ end
 if RUN_FULL_RETRAIN
     ## Verify at least one pass has selected_features set
     local any_selected = false
-    for (p, pc) in sort(collect(PASS_CONFIG))
+    for (p, pc) in sort(collect(PASS_CONFIG); by=first)
         sf = hasproperty(pc, :selected_features) ? pc.selected_features : Int[]
         if !isempty(sf)
             any_selected = true
@@ -230,7 +238,7 @@ if RUN_FULL_RETRAIN
     println("PHASE 2: FULL RETRAIN WITH PRUNED FEATURES — $(EXPERIMENT_NAME)")
     println("="^70)
     if task_mode == "convolution"
-        for (p, pc) in sort(collect(PASS_CONFIG))
+        for (p, pc) in sort(collect(PASS_CONFIG); by=first)
             cv = hasproperty(pc, :conv_variables) ? pc.conv_variables : conv_variables
             sf = hasproperty(pc, :selected_features) ? pc.selected_features : Int[]
             println("  Pass $(p): $(length(cv)) conv_variables, $(isempty(sf) ? "all" : "$(length(sf))") features")
@@ -358,7 +366,7 @@ if RUN_TRAINING
     println("  met_probs_train = $(met_probs_train)")
     if task_mode == "convolution"
         println("  conv_kernel_sizes = $(config.conv_kernel_sizes)")
-        for (p, pc) in sort(collect(PASS_CONFIG))
+        for (p, pc) in sort(collect(PASS_CONFIG); by=first)
             cv = hasproperty(pc, :conv_variables) ? pc.conv_variables : conv_variables
             sf = hasproperty(pc, :selected_features) ? pc.selected_features : Int[]
             println("  Pass $(p): $(length(cv)) conv_variables, $(isempty(sf) ? "all" : "$(length(sf))") features")
@@ -612,6 +620,44 @@ if RUN_PASS2_SWEEP
         secondary_metric       = SECONDARY_METRIC,
         skip_existing_sweep    = SKIP_EXISTING_SWEEP,
     )
+end
+
+## --- Hyperparameter tuning ---
+if RUN_HYPERTUNING
+    configure_pass!(config, HYPERTUNE_PASS)
+
+    n_combos = length(HYPERTUNE_N_TREES_GRID) * length(HYPERTUNE_MAX_DEPTH_GRID)
+    println("\n", "="^70)
+    println("HYPERPARAMETER TUNING — $(EXPERIMENT_NAME) PASS $(HYPERTUNE_PASS)")
+    println("  n_trees grid:   $(HYPERTUNE_N_TREES_GRID)")
+    println("  max_depth grid: $(HYPERTUNE_MAX_DEPTH_GRID)")
+    println("  met_threshold:  $(HYPERTUNE_MET_THRESHOLD)")
+    println("  $(n_combos) combinations")
+    if task_mode == "convolution"
+        println("  conv_variables: $(length(config.conv_variables))")
+        println("  selected_features: $(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))")")
+    end
+    println("="^70)
+
+    hypertune_results = run_hypertuning(
+        config, HYPERTUNE_PASS, TRAINING_PATH, TESTING_PATH;
+        experiment_name         = EXPERIMENT_NAME,
+        n_trees_grid            = HYPERTUNE_N_TREES_GRID,
+        max_depth_grid          = HYPERTUNE_MAX_DEPTH_GRID,
+        met_threshold           = HYPERTUNE_MET_THRESHOLD,
+        skip_existing           = HYPERTUNE_SKIP_EXISTING,
+        compute_test_importance = HYPERTUNE_TEST_IMPORTANCE,
+        n_importance_repeats    = n_importance_repeats,
+        importance_subsample_fraction = importance_subsample_fraction,
+    )
+
+    println("\n", "="^70)
+    println("NEXT STEPS:")
+    println("  1. Update n_trees and max_depth in 00_config.jl Section 3e")
+    println("  2. Review test-set feature importance above for feature selection")
+    println("  3. Update selected_features in PASS_CONFIG if pruning")
+    println("  4. Re-run hypertuning with pruned features, or train final model")
+    println("="^70)
 end
 
 ## --- Apply QC ---

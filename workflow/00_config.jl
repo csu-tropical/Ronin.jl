@@ -22,20 +22,20 @@ using Dates
 ## SECTION 1: EXPERIMENT
 ##=============================================================================
 
-EXPERIMENT_NAME = "kitchen_sink"
-EXPERIMENT_NOTES = "Lots of parameters and trees"
+EXPERIMENT_NAME = "aft_training"
+EXPERIMENT_NOTES = "Aft only"
 
 ##=============================================================================
 ## SECTION 2: DATA PATHS
 ##=============================================================================
 
 CASE_PATHS = [
-    "/Users/mmbell/Science/ronin_testing/tm_swps",
+    "/Users/mmbell/Science/ronin_testing/aft_training",
 ]
 
-TRAINING_PATH   = "/Users/mmbell/Science/ronin_testing/tm_swps/TRAINING/"
-TESTING_PATH    = "/Users/mmbell/Science/ronin_testing/tm_swps/TESTING/"
-VALIDATION_PATH = "/Users/mmbell/Science/ronin_testing/tm_swps/VALIDATION/"
+TRAINING_PATH   = "/Users/mmbell/Science/ronin_testing/aft_training/training/"
+TESTING_PATH    = "/Users/mmbell/Science/ronin_testing/aft_training/testing/"
+VALIDATION_PATH = "/Users/mmbell/Science/ronin_testing/aft_training/validation/"
 
 ##=============================================================================
 ## SECTION 3: MODEL PARAMETERS
@@ -55,8 +55,8 @@ num_models = 2
 ##     met_probs_train: thresholds used during training (controls pass-to-pass masks)
 ##     met_probs_test:  thresholds used during inference/evaluation
 ##-----------------------------------------------------------------------------
-met_probs_train = [(0.05f0, 0.95f0), (0.1f0, 0.99f0)]
-met_probs_test  = [(0.05f0, 0.95f0), (0.1f0, 0.95f0)]
+met_probs_train = [(0.0f0, 1.0f0), (0.0f0, 0.99f0)]
+met_probs_test  = [(0.0f0, 1.0f0), (0.0f0, 0.99f0)]
 
 ##-----------------------------------------------------------------------------
 ## 3c. Signal quality filtering
@@ -77,6 +77,7 @@ PGG_THRESHOLD   = 1.0f0
 n_trees       = 51
 max_depth     = 14
 class_weights = "balanced"
+max_training_threads = Threads.nthreads()   # use all available Julia threads for RF training
 
 ##-----------------------------------------------------------------------------
 ## 3f. Feature mode
@@ -138,14 +139,15 @@ importance_subsample_fraction = 0.3
 PASS_CONFIG = Dict(
     1 => (
         conv_variables = conv_variables,
-        selected_features = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 27, 29, 31, 33,
-            35, 37, 39, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 77,
-            79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 99, 101, 103, 105, 107, 109, 111,
-            113, 115, 117, 119, 123, 125, 127, 129, 130, 131, 132],
+        selected_features = []
     ),
     2 => (
         conv_variables = vcat(conv_variables, ["met_prob_pass_1"]),
-        selected_features = Int[],   # train on all features initially
+        selected_features = [],
+        masked_conv_variables = ["DBZ", "VEL", "SIG"],
+        masked_conv_kernel_types = ["mean", "gaussian", "laplacian"],
+        masked_conv_kernel_sizes = [3, 5, 7],
+        masked_conv_threshold = 0.1f0,
     ),
 )
 
@@ -175,11 +177,22 @@ INFER_HIGH_GRID          = Float32[0.98, 0.99, 0.999]
 
 NMD_TARGET       = 0.99f0
 SECONDARY_METRIC = :hss
+SKIP_EXISTING_SWEEP = false   # Reuse trained models/features from prior sweep runs
 
 ##=============================================================================
 ## SECTION 5: QC OUTPUT PATH (used by 06_qc.jl)
 ##=============================================================================
 QC_PATH = TESTING_PATH
+
+##=============================================================================
+## SECTION 6: HYPERTUNING PARAMETERS (used by run_workflow.jl)
+##=============================================================================
+HYPERTUNE_PASS            = 1
+HYPERTUNE_N_TREES_GRID    = [11, 21, 51, 101, 151]
+HYPERTUNE_MAX_DEPTH_GRID  = [8, 10, 12, 14, 16, 18, 20]
+HYPERTUNE_MET_THRESHOLD   = 0.5f0         # threshold for confusion matrix metrics (AUC is threshold-independent)
+HYPERTUNE_SKIP_EXISTING   = false
+HYPERTUNE_TEST_IMPORTANCE = true
 
 ##=============================================================================
 ## BUILD CONFIG (do not modify below this line)
@@ -207,7 +220,9 @@ config_kwargs = Dict{Symbol,Any}(
     :max_depth              => max_depth,
     :overwrite_output       => true,
     :class_weights          => class_weights,
+    :max_training_threads   => max_training_threads,
     :compute_feature_importance => false,
+    :max_training_threads   => max_training_threads,
 )
 
 if task_mode == "convolution"
@@ -232,12 +247,12 @@ config = make_config(;
 """
     configure_pass!(config, pass; pass_config=PASS_CONFIG)
 
-Apply per-pass settings (conv_variables, selected_features) to config before
-running a pass-specific operation. Reads from the PASS_CONFIG dict defined
+Apply per-pass settings (conv_variables, selected_features, masked conv) to config
+before running a pass-specific operation. Reads from the PASS_CONFIG dict defined
 in 00_config.jl.
 
 If the pass has no entry in PASS_CONFIG, defaults to the base conv_variables
-with empty selected_features (train on all features).
+with empty selected_features and no masked convolutions.
 """
 function configure_pass!(config, pass; pass_config=PASS_CONFIG)
     if haskey(pass_config, pass)
@@ -248,11 +263,30 @@ function configure_pass!(config, pass; pass_config=PASS_CONFIG)
         if hasproperty(pc, :selected_features)
             config.selected_features = pc.selected_features
         end
+        if hasproperty(pc, :masked_conv_variables)
+            config.masked_conv_variables = pc.masked_conv_variables
+            config.masked_conv_kernel_types = pc.masked_conv_kernel_types
+            config.masked_conv_kernel_sizes = pc.masked_conv_kernel_sizes
+            config.masked_conv_threshold = pc.masked_conv_threshold
+            config.masked_conv_met_prob_field = "met_prob_pass_$(pass - 1)"
+        else
+            config.masked_conv_variables = String[]
+            config.masked_conv_kernel_types = String[]
+            config.masked_conv_kernel_sizes = Int[]
+            config.masked_conv_threshold = 0.1f0
+            config.masked_conv_met_prob_field = ""
+        end
     else
         config.conv_variables = conv_variables
         config.selected_features = Int[]
+        config.masked_conv_variables = String[]
+        config.masked_conv_kernel_types = String[]
+        config.masked_conv_kernel_sizes = Int[]
+        config.masked_conv_threshold = 0.1f0
+        config.masked_conv_met_prob_field = ""
     end
+    masked_info = isempty(config.masked_conv_variables) ? "" : ", $(length(config.masked_conv_variables)) masked_conv_vars (thresh=$(config.masked_conv_threshold))"
     printstyled("  Pass $(pass) config: $(length(config.conv_variables)) conv_variables, " *
-                "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features\n",
+                "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features$(masked_info)\n",
                 color=:cyan)
 end

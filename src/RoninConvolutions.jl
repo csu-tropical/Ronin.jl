@@ -56,6 +56,53 @@ function build_kernel_bank(kernel_sizes::Vector{Int})
 end
 
 """
+    build_filtered_kernel_bank(kernel_types::Vector{String}, kernel_sizes::Vector{Int})
+
+Build a kernel bank from the Cartesian product of `kernel_types` and `kernel_sizes`.
+Invalid combinations (e.g., laplacian at 5x5, gaussian at 3x3) are skipped with a warning.
+
+Supported kernel types: "mean", "gaussian", "laplacian", "sobel_range", "sobel_azi".
+"""
+function build_filtered_kernel_bank(kernel_types::Vector{String}, kernel_sizes::Vector{Int})
+    bank = ConvolutionKernel[]
+    for ktype in kernel_types
+        for k in kernel_sizes
+            if ktype == "mean"
+                w = ones(Float32, k, k) ./ Float32(k * k)
+                push!(bank, ConvolutionKernel("mean_$(k)x$(k)", w))
+            elseif ktype == "laplacian"
+                if k == 3
+                    push!(bank, ConvolutionKernel("laplacian_3x3", Float32[0 1 0; 1 -4 1; 0 1 0]))
+                else
+                    @warn "Laplacian only supported at 3x3, skipping $(k)x$(k)"
+                end
+            elseif ktype == "sobel_range"
+                if k == 3
+                    push!(bank, ConvolutionKernel("sobel_range_3x3", Float32[-1 -2 -1; 0 0 0; 1 2 1]))
+                else
+                    @warn "Sobel range only supported at 3x3, skipping $(k)x$(k)"
+                end
+            elseif ktype == "sobel_azi"
+                if k == 3
+                    push!(bank, ConvolutionKernel("sobel_azi_3x3", Float32[-1 0 1; -2 0 2; -1 0 1]))
+                else
+                    @warn "Sobel azi only supported at 3x3, skipping $(k)x$(k)"
+                end
+            elseif ktype == "gaussian"
+                if k >= 5
+                    push!(bank, ConvolutionKernel("gaussian_$(k)x$(k)", _gaussian_kernel(k)))
+                else
+                    @warn "Gaussian only supported at sizes >= 5, skipping $(k)x$(k)"
+                end
+            else
+                error("Unknown kernel type: $(ktype). Supported: mean, gaussian, laplacian, sobel_range, sobel_azi")
+            end
+        end
+    end
+    return bank
+end
+
+"""
     _gaussian_kernel(k::Int; sigma=nothing)
 
 Generate a k x k Gaussian kernel. If sigma is not given, defaults to (k-1)/4.
@@ -76,9 +123,15 @@ function _gaussian_kernel(k::Int; sigma=nothing)
 end
 
 """
-    masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool})
+    masked_convolve(data, kernel, valid; neighbor_mask=valid)
 
-Compute a masked convolution over `data` using `kernel`, only considering gates where `valid` is true.
+Compute a masked convolution over `data` using `kernel`.
+
+- `valid` controls which center gates receive a computed value (others get FILL_VAL).
+- `neighbor_mask` controls which neighbors contribute to the convolution (default: same as `valid`).
+
+Using a separate `neighbor_mask` enables met_prob-masked convolutions: compute features
+for all valid gates, but only let high-confidence neighbors contribute to the spatial statistics.
 
 Returns `(result, valid_fraction)` where:
 - `result[i,j]` = weighted sum of valid neighbors / sum of weights at valid neighbors
@@ -86,7 +139,8 @@ Returns `(result, valid_fraction)` where:
 
 Missing/invalid gates contribute nothing. Edges are zero-padded (treated as invalid).
 """
-function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool})
+function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool};
+                         neighbor_mask::AbstractMatrix{Bool}=valid)
     nrows, ncols = size(data)
     kr, kc = size(kernel)
     hr = kr ÷ 2
@@ -118,7 +172,7 @@ function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::
 
             total_abs_weight += akw
 
-            if ni >= 1 && ni <= nrows && nj >= 1 && nj <= ncols && valid[ni, nj]
+            if ni >= 1 && ni <= nrows && nj >= 1 && nj <= ncols && neighbor_mask[ni, nj]
                 weighted_sum += kw * data[ni, nj]
                 weight_sum += akw
             end
@@ -226,15 +280,20 @@ Returns `(X::Matrix{Float32}, feature_names::Vector{String})` where X is
 function compute_convolution_features(cfrad, conv_variables::Vector{String},
                                        kernel_bank::Vector{ConvolutionKernel},
                                        valid_mask::AbstractMatrix{Bool},
-                                       SIG_QUALITY_VAR::String)
+                                       SIG_QUALITY_VAR::String;
+                                       masked_conv_variables::Vector{String} = String[],
+                                       masked_conv_kernel_bank::Vector{ConvolutionKernel} = ConvolutionKernel[],
+                                       masked_conv_threshold::Float32 = 0.1f0,
+                                       met_prob_mask::Union{Nothing, AbstractMatrix{Bool}} = nothing)
 
     nrows, ncols = size(valid_mask)
     ngates = nrows * ncols
 
-    # Count features: (n_vars * n_kernels * 2) + 4 scalar features
+    # Count features: normal conv + masked conv + scalar
     n_conv_features = length(conv_variables) * length(kernel_bank) * 2
+    n_masked_conv_features = (met_prob_mask !== nothing) ? length(masked_conv_variables) * length(masked_conv_kernel_bank) * 2 : 0
     n_scalar_features = 4  # AHT, ELV, RNG, NRG
-    n_total = n_conv_features + n_scalar_features
+    n_total = n_conv_features + n_masked_conv_features + n_scalar_features
 
     X = Matrix{Float32}(undef, ngates, n_total)
     feature_names = Vector{String}(undef, n_total)
@@ -262,6 +321,35 @@ function compute_convolution_features(cfrad, conv_variables::Vector{String},
             X[:, col] = vfrac[:]
             feature_names[col] = "$(varname)_$(kern.name)_vfrac"
             col += 1
+        end
+    end
+
+    # Masked convolution features: convolve with neighbor_mask derived from met_prob
+    if met_prob_mask !== nothing && !isempty(masked_conv_variables)
+        masked_valid = valid_mask .&& met_prob_mask
+        thresh_str = string(masked_conv_threshold)
+
+        for varname in masked_conv_variables
+            raw_data = load_conv_variable(cfrad, varname, valid_mask, SIG_QUALITY_VAR)
+
+            data_f32 = Matrix{Float32}(undef, nrows, ncols)
+            for j in 1:ncols, i in 1:nrows
+                v = raw_data[i, j]
+                data_f32[i, j] = (ismissing(v) || (v isa AbstractFloat && isnan(v))) ? 0.0f0 : Float32(v)
+            end
+
+            for kern in masked_conv_kernel_bank
+                conv_result, vfrac = masked_convolve(data_f32, kern.weights, valid_mask;
+                                                      neighbor_mask=masked_valid)
+
+                X[:, col] = conv_result[:]
+                feature_names[col] = "$(varname)_masked_$(thresh_str)_$(kern.name)"
+                col += 1
+
+                X[:, col] = vfrac[:]
+                feature_names[col] = "$(varname)_masked_$(thresh_str)_$(kern.name)_vfrac"
+                col += 1
+            end
         end
     end
 
@@ -386,11 +474,45 @@ function compute_rf_feature_importance(model, X::Matrix{Float32}, Y::Vector;
 end
 
 """
-    get_convolution_feature_count(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel})
+    build_feature_names(conv_variables, kernel_bank; masked_conv_variables, masked_conv_kernel_bank, masked_conv_threshold)
+
+Build the complete ordered list of feature names matching the column layout of
+`compute_convolution_features`: [normal_conv] [masked_conv] [AHT, ELV, RNG, NRG].
+"""
+function build_feature_names(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel};
+                              masked_conv_variables::Vector{String} = String[],
+                              masked_conv_kernel_bank::Vector{ConvolutionKernel} = ConvolutionKernel[],
+                              masked_conv_threshold::Float32 = 0.1f0)
+    names = String[]
+    for varname in conv_variables
+        for kern in kernel_bank
+            push!(names, "$(varname)_$(kern.name)")
+            push!(names, "$(varname)_$(kern.name)_vfrac")
+        end
+    end
+    if !isempty(masked_conv_variables) && !isempty(masked_conv_kernel_bank)
+        thresh_str = string(masked_conv_threshold)
+        for varname in masked_conv_variables
+            for kern in masked_conv_kernel_bank
+                push!(names, "$(varname)_masked_$(thresh_str)_$(kern.name)")
+                push!(names, "$(varname)_masked_$(thresh_str)_$(kern.name)_vfrac")
+            end
+        end
+    end
+    append!(names, ["AHT", "ELV", "RNG", "NRG"])
+    return names
+end
+
+"""
+    get_convolution_feature_count(conv_variables, kernel_bank; masked_conv_variables, masked_conv_kernel_bank)
 
 Return the total number of features that will be produced:
-(n_variables * n_kernels * 2) + 4 scalar features.
+(n_variables * n_kernels * 2) + (n_masked_variables * n_masked_kernels * 2) + 4 scalar features.
 """
-function get_convolution_feature_count(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel})
-    return length(conv_variables) * length(kernel_bank) * 2 + 4
+function get_convolution_feature_count(conv_variables::Vector{String}, kernel_bank::Vector{ConvolutionKernel};
+                                        masked_conv_variables::Vector{String} = String[],
+                                        masked_conv_kernel_bank::Vector{ConvolutionKernel} = ConvolutionKernel[])
+    n_normal = length(conv_variables) * length(kernel_bank) * 2
+    n_masked = length(masked_conv_variables) * length(masked_conv_kernel_bank) * 2
+    return n_normal + n_masked + 4
 end

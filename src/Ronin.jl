@@ -30,7 +30,7 @@ module Ronin
     export multipass_uncertain, write_field, characterize_misclassified_gates, composite_QC
     export ConvolutionKernel, build_kernel_bank, masked_convolve, compute_convolution_features
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
-    export run_evaluation, sweep_pass2_met_probs
+    export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc
     export load_model_with_metadata, inspect_model_configuration
     export compute_importance, generate_pass_masks, met_prob_histogram
 
@@ -89,22 +89,42 @@ module Ronin
                 feat_names = get(data, "feature_names", String[])
                 imps = get(data, "importances", Float64[])
                 conv_vars = get(data, "conv_variables", String[])
+                masked_conv_vars = get(data, "masked_conv_variables", String[])
+                masked_conv_ktypes = get(data, "masked_conv_kernel_types", String[])
+                masked_conv_ksizes = get(data, "masked_conv_kernel_sizes", Int[])
+                masked_conv_thresh = get(data, "masked_conv_threshold", 0.1f0)
+                masked_conv_mpf = get(data, "masked_conv_met_prob_field", "")
                 return (model=model, selected_features=selected,
                         recommended_features=recommended,
                         feature_names=feat_names, importances=imps,
-                        conv_variables=conv_vars)
+                        conv_variables=conv_vars,
+                        masked_conv_variables=masked_conv_vars,
+                        masked_conv_kernel_types=masked_conv_ktypes,
+                        masked_conv_kernel_sizes=masked_conv_ksizes,
+                        masked_conv_threshold=masked_conv_thresh,
+                        masked_conv_met_prob_field=masked_conv_mpf)
             else
                 return (model=data, selected_features=Int[],
                         recommended_features=Int[],
                         feature_names=String[], importances=Float64[],
-                        conv_variables=String[])
+                        conv_variables=String[],
+                        masked_conv_variables=String[],
+                        masked_conv_kernel_types=String[],
+                        masked_conv_kernel_sizes=Int[],
+                        masked_conv_threshold=0.1f0,
+                        masked_conv_met_prob_field="")
             end
         else
             model = load_object(path)
             return (model=model, selected_features=Int[],
                     recommended_features=Int[],
                     feature_names=String[], importances=Float64[],
-                    conv_variables=String[])
+                    conv_variables=String[],
+                    masked_conv_variables=String[],
+                    masked_conv_kernel_types=String[],
+                    masked_conv_kernel_sizes=Int[],
+                    masked_conv_threshold=0.1f0,
+                    masked_conv_met_prob_field="")
         end
     end
 
@@ -164,6 +184,19 @@ module Ronin
             if !isempty(cv)
                 printstyled(io, "\n  CONV VARIABLES ($(length(cv))):\n", color=:cyan)
                 println(io, "    $(cv)")
+            end
+        end
+
+        # Masked convolution config
+        if haskey(data, "masked_conv_variables")
+            mcv = data["masked_conv_variables"]
+            if !isempty(mcv)
+                printstyled(io, "\n  MASKED CONV CONFIG:\n", color=:cyan)
+                println(io, "    Variables: $(mcv)")
+                println(io, "    Kernel types: $(get(data, "masked_conv_kernel_types", String[]))")
+                println(io, "    Kernel sizes: $(get(data, "masked_conv_kernel_sizes", Int[]))")
+                println(io, "    Threshold: $(get(data, "masked_conv_threshold", 0.1f0))")
+                println(io, "    Met prob field: $(get(data, "masked_conv_met_prob_field", ""))")
             end
         end
 
@@ -466,6 +499,12 @@ module Ronin
         n_importance_repeats::Int = 3
         importance_subsample_fraction::Float64 = 1.0
         max_training_threads::Int = 1
+
+        masked_conv_variables::Vector{String} = String[]
+        masked_conv_kernel_types::Vector{String} = String[]
+        masked_conv_kernel_sizes::Vector{Int} = Int[]
+        masked_conv_threshold::Float32 = 0.1f0
+        masked_conv_met_prob_field::String = ""
 
     end
 
@@ -1020,8 +1059,32 @@ module Ronin
         # Determine which variables to convolve (include PGG if not in conv_variables)
         conv_vars = copy(config.conv_variables)
 
+        # Build met_prob mask for masked convolutions (if configured)
+        met_prob_mask = nothing
+        masked_conv_kb = ConvolutionKernel[]
+        if !isempty(config.masked_conv_variables) && config.masked_conv_met_prob_field != ""
+            masked_conv_kb = build_filtered_kernel_bank(config.masked_conv_kernel_types,
+                                                         config.masked_conv_kernel_sizes)
+            if config.masked_conv_met_prob_field in keys(cfrad)
+                mp_raw = load_conv_variable(cfrad, config.masked_conv_met_prob_field,
+                                             valid_mask, config.SIG_QUALITY_VAR)
+                mp_f32 = Matrix{Float32}(undef, cfrad_dims...)
+                for j in 1:cfrad_dims[2], i in 1:cfrad_dims[1]
+                    v = mp_raw[i, j]
+                    mp_f32[i, j] = (ismissing(v) || (v isa AbstractFloat && isnan(v))) ? 0.0f0 : Float32(v)
+                end
+                met_prob_mask = mp_f32 .>= config.masked_conv_threshold
+            else
+                @warn "Masked conv field $(config.masked_conv_met_prob_field) not found in CfRadial — skipping masked conv features"
+            end
+        end
+
         # Compute convolution features
-        X_full, feature_names = compute_convolution_features(cfrad, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR)
+        X_full, feature_names = compute_convolution_features(cfrad, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR;
+            masked_conv_variables = config.masked_conv_variables,
+            masked_conv_kernel_bank = masked_conv_kb,
+            masked_conv_threshold = config.masked_conv_threshold,
+            met_prob_mask = met_prob_mask)
 
         # If selected_features is set (inference), subset columns
         if !isempty(config.selected_features)
@@ -1058,7 +1121,14 @@ module Ronin
         paths = isdir(config.input_path) ? parse_directory(config.input_path) : [config.input_path]
 
         kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
-        n_features = get_convolution_feature_count(config.conv_variables, kernel_bank)
+        masked_conv_kb = if !isempty(config.masked_conv_variables)
+            build_filtered_kernel_bank(config.masked_conv_kernel_types, config.masked_conv_kernel_sizes)
+        else
+            ConvolutionKernel[]
+        end
+        n_features = get_convolution_feature_count(config.conv_variables, kernel_bank;
+            masked_conv_variables=config.masked_conv_variables,
+            masked_conv_kernel_bank=masked_conv_kb)
         if !isempty(config.selected_features)
             n_features = length(config.selected_features)
         end
@@ -2153,24 +2223,48 @@ module Ronin
         # Save original config values so each pass can override independently
         orig_conv_variables = copy(config.conv_variables)
         orig_selected_features = copy(config.selected_features)
+        orig_masked_conv_variables = copy(config.masked_conv_variables)
+        orig_masked_conv_kernel_types = copy(config.masked_conv_kernel_types)
+        orig_masked_conv_kernel_sizes = copy(config.masked_conv_kernel_sizes)
+        orig_masked_conv_threshold = config.masked_conv_threshold
+        orig_masked_conv_met_prob_field = config.masked_conv_met_prob_field
 
         full_start_time = time()
         ###Iteratively train models and apply QC_scan with the specified probabilites to train a multi-pass model
         ###pipeline
         for (i, model_path) in enumerate(config.model_output_paths)
 
-            # Apply per-pass config overrides (conv_variables, selected_features)
+            # Apply per-pass config overrides (conv_variables, selected_features, masked conv)
             if haskey(pass_config, i)
                 pc = pass_config[i]
                 config.conv_variables = hasproperty(pc, :conv_variables) ? pc.conv_variables : orig_conv_variables
                 config.selected_features = hasproperty(pc, :selected_features) ? pc.selected_features : orig_selected_features
+                if hasproperty(pc, :masked_conv_variables)
+                    config.masked_conv_variables = pc.masked_conv_variables
+                    config.masked_conv_kernel_types = pc.masked_conv_kernel_types
+                    config.masked_conv_kernel_sizes = pc.masked_conv_kernel_sizes
+                    config.masked_conv_threshold = pc.masked_conv_threshold
+                    config.masked_conv_met_prob_field = "met_prob_pass_$(i - 1)"
+                else
+                    config.masked_conv_variables = String[]
+                    config.masked_conv_kernel_types = String[]
+                    config.masked_conv_kernel_sizes = Int[]
+                    config.masked_conv_threshold = orig_masked_conv_threshold
+                    config.masked_conv_met_prob_field = ""
+                end
             else
                 config.conv_variables = orig_conv_variables
                 config.selected_features = orig_selected_features
+                config.masked_conv_variables = orig_masked_conv_variables
+                config.masked_conv_kernel_types = orig_masked_conv_kernel_types
+                config.masked_conv_kernel_sizes = orig_masked_conv_kernel_sizes
+                config.masked_conv_threshold = orig_masked_conv_threshold
+                config.masked_conv_met_prob_field = orig_masked_conv_met_prob_field
             end
             if config.task_mode == "convolution"
+                masked_info = isempty(config.masked_conv_variables) ? "" : ", $(length(config.masked_conv_variables)) masked_conv_vars (thresh=$(config.masked_conv_threshold))"
                 printstyled("  Pass $(i) config: $(length(config.conv_variables)) conv_variables, " *
-                            "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features\n",
+                            "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features$(masked_info)\n",
                             color=:cyan)
             end
 
@@ -2261,7 +2355,12 @@ module Ronin
                 JLD2.jldsave(model_path;
                     model=curr_model,
                     selected_features=config.selected_features,
-                    conv_variables=config.conv_variables)
+                    conv_variables=config.conv_variables,
+                    masked_conv_variables=config.masked_conv_variables,
+                    masked_conv_kernel_types=config.masked_conv_kernel_types,
+                    masked_conv_kernel_sizes=config.masked_conv_kernel_sizes,
+                    masked_conv_threshold=config.masked_conv_threshold,
+                    masked_conv_met_prob_field=config.masked_conv_met_prob_field)
             end
 
             # Feature importance and selection for convolution mode
@@ -2273,14 +2372,15 @@ module Ronin
                     subsample_fraction=config.importance_subsample_fraction)
 
                 kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
-                feat_names_full = String[]
-                for varname in config.conv_variables
-                    for kern in kernel_bank
-                        push!(feat_names_full, "$(varname)_$(kern.name)")
-                        push!(feat_names_full, "$(varname)_$(kern.name)_vfrac")
-                    end
+                masked_conv_kb = if !isempty(config.masked_conv_variables)
+                    build_filtered_kernel_bank(config.masked_conv_kernel_types, config.masked_conv_kernel_sizes)
+                else
+                    ConvolutionKernel[]
                 end
-                append!(feat_names_full, ["AHT", "ELV", "RNG", "NRG"])
+                feat_names_full = build_feature_names(config.conv_variables, kernel_bank;
+                    masked_conv_variables=config.masked_conv_variables,
+                    masked_conv_kernel_bank=masked_conv_kb,
+                    masked_conv_threshold=config.masked_conv_threshold)
 
                 # Print importance ranking
                 sorted_idx = sortperm(importances, rev=true)
@@ -2304,7 +2404,12 @@ module Ronin
                     recommended_features=recommended,
                     feature_names=feat_names_full,
                     importances=importances,
-                    conv_variables=config.conv_variables)
+                    conv_variables=config.conv_variables,
+                    masked_conv_variables=config.masked_conv_variables,
+                    masked_conv_kernel_types=config.masked_conv_kernel_types,
+                    masked_conv_kernel_sizes=config.masked_conv_kernel_sizes,
+                    masked_conv_threshold=config.masked_conv_threshold,
+                    masked_conv_met_prob_field=config.masked_conv_met_prob_field)
                 printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
             end
 
@@ -2340,6 +2445,11 @@ module Ronin
                         if !isempty(md.conv_variables)
                             config_single.conv_variables = md.conv_variables
                         end
+                        config_single.masked_conv_variables = md.masked_conv_variables
+                        config_single.masked_conv_kernel_types = md.masked_conv_kernel_types
+                        config_single.masked_conv_kernel_sizes = md.masked_conv_kernel_sizes
+                        config_single.masked_conv_threshold = md.masked_conv_threshold
+                        config_single.masked_conv_met_prob_field = md.masked_conv_met_prob_field
                         X, Y, idxer_list = calculate_features_conv(config_single, out;
                                                                      QC_mask=QC_mask, mask_name=mask_name,
                                                                      write_out=false, return_idxer=true)
@@ -2392,6 +2502,11 @@ module Ronin
         # Restore original config values
         config.conv_variables = orig_conv_variables
         config.selected_features = orig_selected_features
+        config.masked_conv_variables = orig_masked_conv_variables
+        config.masked_conv_kernel_types = orig_masked_conv_kernel_types
+        config.masked_conv_kernel_sizes = orig_masked_conv_kernel_sizes
+        config.masked_conv_threshold = orig_masked_conv_threshold
+        config.masked_conv_met_prob_field = orig_masked_conv_met_prob_field
 
         printstyled("\n COMPLETED TRAINING MODEL IN $(round(time() - full_start_time, digits = 3)) seconds...\n", color=:green)
     end
@@ -2793,7 +2908,12 @@ module Ronin
             JLD2.jldsave(model_path;
                 model=curr_model,
                 selected_features=config.selected_features,
-                conv_variables=config.conv_variables)
+                conv_variables=config.conv_variables,
+                masked_conv_variables=config.masked_conv_variables,
+                masked_conv_kernel_types=config.masked_conv_kernel_types,
+                masked_conv_kernel_sizes=config.masked_conv_kernel_sizes,
+                masked_conv_threshold=config.masked_conv_threshold,
+                masked_conv_met_prob_field=config.masked_conv_met_prob_field)
         end
 
         ## Feature importance and selection for convolution mode
@@ -2805,14 +2925,15 @@ module Ronin
                 subsample_fraction=config.importance_subsample_fraction)
 
             kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
-            feat_names_full = String[]
-            for varname in config.conv_variables
-                for kern in kernel_bank
-                    push!(feat_names_full, "$(varname)_$(kern.name)")
-                    push!(feat_names_full, "$(varname)_$(kern.name)_vfrac")
-                end
+            masked_conv_kb = if !isempty(config.masked_conv_variables)
+                build_filtered_kernel_bank(config.masked_conv_kernel_types, config.masked_conv_kernel_sizes)
+            else
+                ConvolutionKernel[]
             end
-            append!(feat_names_full, ["AHT", "ELV", "RNG", "NRG"])
+            feat_names_full = build_feature_names(config.conv_variables, kernel_bank;
+                masked_conv_variables=config.masked_conv_variables,
+                masked_conv_kernel_bank=masked_conv_kb,
+                masked_conv_threshold=config.masked_conv_threshold)
 
             sorted_idx = sortperm(importances, rev=true)
             printstyled("\n  FEATURE IMPORTANCE RANKING (Pass $(pass)):\n", color=:cyan)
@@ -2832,7 +2953,12 @@ module Ronin
                 recommended_features=recommended,
                 feature_names=feat_names_full,
                 importances=importances,
-                conv_variables=config.conv_variables)
+                conv_variables=config.conv_variables,
+                masked_conv_variables=config.masked_conv_variables,
+                masked_conv_kernel_types=config.masked_conv_kernel_types,
+                masked_conv_kernel_sizes=config.masked_conv_kernel_sizes,
+                masked_conv_threshold=config.masked_conv_threshold,
+                masked_conv_met_prob_field=config.masked_conv_met_prob_field)
             printstyled("  Saved model + importance metadata to $(model_path)\n", color=:green)
         end
 
@@ -2855,6 +2981,11 @@ module Ronin
                     config_single.input_path = path
                     config_single.write_out = false
                     config_single.selected_features = md.selected_features
+                    config_single.masked_conv_variables = md.masked_conv_variables
+                    config_single.masked_conv_kernel_types = md.masked_conv_kernel_types
+                    config_single.masked_conv_kernel_sizes = md.masked_conv_kernel_sizes
+                    config_single.masked_conv_threshold = md.masked_conv_threshold
+                    config_single.masked_conv_met_prob_field = md.masked_conv_met_prob_field
                     X_mask, Y_mask, idxer = calculate_features_conv(config_single, out;
                                                                      QC_mask=QC_mask, mask_name=mask_name,
                                                                      write_out=false, return_idxer=true)
@@ -3096,6 +3227,11 @@ module Ronin
         orig_feature_paths = copy(config.feature_output_paths)
         orig_met_probs = copy(config.met_probs)
         orig_input_path = config.input_path
+        orig_masked_conv_variables = copy(config.masked_conv_variables)
+        orig_masked_conv_kernel_types = copy(config.masked_conv_kernel_types)
+        orig_masked_conv_kernel_sizes = copy(config.masked_conv_kernel_sizes)
+        orig_masked_conv_threshold = config.masked_conv_threshold
+        orig_masked_conv_met_prob_field = config.masked_conv_met_prob_field
 
         all_results = NamedTuple[]
 
@@ -3264,6 +3400,11 @@ module Ronin
         config.feature_output_paths = orig_feature_paths
         config.met_probs = orig_met_probs
         config.input_path = orig_input_path
+        config.masked_conv_variables = orig_masked_conv_variables
+        config.masked_conv_kernel_types = orig_masked_conv_kernel_types
+        config.masked_conv_kernel_sizes = orig_masked_conv_kernel_sizes
+        config.masked_conv_threshold = orig_masked_conv_threshold
+        config.masked_conv_met_prob_field = orig_masked_conv_met_prob_field
 
         return (results=all_results, best=best)
     end
@@ -3293,6 +3434,303 @@ module Ronin
                         "$(rpad(round(r.hss, digits=6), 9)) " *
                         "$(rpad(round(r.f1, digits=6), 9)) " *
                         "$(rpad(r.n, 9)) $(model_path)")
+        end
+    end
+
+    """
+        run_hypertuning(config, pass, training_path, testing_path; ...)
+
+    Sweep RF hyperparameters (n_trees, max_depth) for a single pass, evaluating on the
+    testing set with AUC-ROC as the primary metric. Features are computed once, then
+    the sweep trains and evaluates in-memory for each combination.
+
+    The caller should set up `config.conv_variables`, `config.selected_features`, and
+    masked conv fields for the target pass before calling (e.g., via `configure_pass!`).
+
+    Returns `(results=Vector{NamedTuple}, best=NamedTuple, best_model_path=String)`.
+    """
+    function run_hypertuning(config::ModelConfig, pass::Int,
+                              training_path::String, testing_path::String;
+                              experiment_name::String = "hypertune",
+                              n_trees_grid::Vector{Int} = [11, 21, 51, 101],
+                              max_depth_grid::Vector{Int} = [8, 10, 12, 14, 16],
+                              met_threshold::Float32 = 0.5f0,
+                              skip_existing::Bool = false,
+                              compute_test_importance::Bool = true,
+                              n_importance_repeats::Int = config.n_importance_repeats,
+                              importance_subsample_fraction::Float64 = config.importance_subsample_fraction)
+
+        @assert config.task_mode == "convolution" "run_hypertuning currently requires convolution mode"
+        @assert pass >= 1
+
+        # Save original config state
+        orig_input_path = config.input_path
+        orig_n_trees = config.n_trees
+        orig_max_depth = config.max_depth
+        orig_write_out = config.write_out
+        orig_overwrite = config.overwrite_output
+
+        try
+            QC_mask = pass > 1 ? true : config.QC_mask
+            mask_name = QC_mask ? config.mask_names[pass] : ""
+
+            # --- Step 1: Compute training features (once) ---
+            train_feature_file = "output_features_$(experiment_name)_hypertune_train_pass$(pass).h5"
+
+            if skip_existing && isfile(train_feature_file)
+                printstyled("  Loading precomputed training features: $(train_feature_file)\n", color=:cyan)
+                X_train, Y_train = h5open(train_feature_file) do f
+                    (f["X"][:,:], f["Y"][:,:])
+                end
+            else
+                printstyled("\nCOMPUTING TRAINING FEATURES...\n", color=:green)
+                config.input_path = training_path
+                config.write_out = true
+                config.overwrite_output = true
+                isfile(train_feature_file) && rm(train_feature_file)
+                X_train, Y_train = calculate_features_conv(config, train_feature_file;
+                                                            QC_mask=QC_mask, mask_name=mask_name,
+                                                            write_out=true)
+                printstyled("  Training features: $(size(X_train, 1)) gates × $(size(X_train, 2)) features\n", color=:cyan)
+            end
+
+            # --- Step 2: Compute testing features (once) ---
+            test_feature_file = "output_features_$(experiment_name)_hypertune_test_pass$(pass).h5"
+
+            if skip_existing && isfile(test_feature_file)
+                printstyled("  Loading precomputed testing features: $(test_feature_file)\n", color=:cyan)
+                X_test, Y_test = h5open(test_feature_file) do f
+                    (f["X"][:,:], f["Y"][:,:])
+                end
+            else
+                printstyled("\nCOMPUTING TESTING FEATURES...\n", color=:green)
+                config.input_path = testing_path
+                config.write_out = true
+                config.overwrite_output = true
+                isfile(test_feature_file) && rm(test_feature_file)
+                X_test, Y_test = calculate_features_conv(config, test_feature_file;
+                                                          QC_mask=QC_mask, mask_name=mask_name,
+                                                          write_out=true)
+                printstyled("  Testing features: $(size(X_test, 1)) gates × $(size(X_test, 2)) features\n", color=:cyan)
+            end
+
+            Y_train_vec = reshape(Y_train, length(Y_train))
+            Y_test_vec = reshape(Y_test, length(Y_test))
+
+            # --- Step 3: Compute balanced class weights (once) ---
+            class_weights = Vector{Float32}(fill(0, length(Y_train_vec)))
+            weight_dict = compute_balanced_class_weights(Y_train_vec)
+            for class in keys(weight_dict)
+                class_weights[Y_train_vec .== class] .= weight_dict[class]
+            end
+
+            # --- Step 4: Summary file setup ---
+            summary_file = "$(experiment_name)_hypertuning_pass$(pass)_summary.txt"
+            completed_combos = Set{Tuple{Int,Int}}()
+            if skip_existing && isfile(summary_file)
+                for line in eachline(summary_file)
+                    startswith(line, "#") && continue
+                    fields = split(strip(line))
+                    length(fields) >= 2 || continue
+                    try
+                        k = (parse(Int, fields[1]), parse(Int, fields[2]))
+                        push!(completed_combos, k)
+                    catch; end
+                end
+                if !isempty(completed_combos)
+                    printstyled("  Loaded $(length(completed_combos)) completed results from $(summary_file)\n", color=:cyan)
+                end
+            else
+                open(summary_file, "w") do io
+                    println(io, "# RONIN Hypertuning Summary — $(experiment_name) Pass $(pass)")
+                    println(io, "# Train: $(size(X_train, 1)) gates, Test: $(size(X_test, 1)) gates, $(size(X_train, 2)) features")
+                    println(io, "#")
+                    println(io, "# n_trees  max_depth  AUC_ROC    HSS        F1         NMD_HR     MD_HR      Accuracy   Precision  Recall     gates")
+                end
+            end
+
+            # --- Step 5: Sweep ---
+            all_results = NamedTuple[]
+            n_combos = length(n_trees_grid) * length(max_depth_grid)
+            combo_idx = 0
+            best_auc = -Inf
+            best_model = nothing
+            best_params = (n_trees=0, max_depth=0)
+
+            printstyled("\nSWEEPING $(n_combos) HYPERPARAMETER COMBINATIONS...\n", color=:green)
+            sweep_start = time()
+
+            for nt in n_trees_grid, md in max_depth_grid
+                combo_idx += 1
+
+                if (nt, md) in completed_combos
+                    printstyled("  [$(combo_idx)/$(n_combos)] n_trees=$(nt), max_depth=$(md) — skipped (exists)\n", color=:light_black)
+                    continue
+                end
+
+                # Train in-memory
+                train_start = time()
+                model = DecisionTree.RandomForestClassifier(n_trees=nt, max_depth=md, rng=50)
+                DecisionTree.fit!(model, X_train, Y_train_vec, class_weights;
+                                  max_threads=config.max_training_threads)
+                train_time = time() - train_start
+
+                # Predict on test set
+                proba = DecisionTree.predict_proba(model, X_test)
+                met_probs_pred = Vector{Float32}(proba[:, 2])
+
+                # AUC-ROC
+                auc = compute_auc_roc(met_probs_pred, Y_test_vec)
+
+                # Confusion matrix at met_threshold
+                predictions = Vector{Bool}(met_probs_pred .>= met_threshold)
+                targets = Vector{Bool}(Y_test_vec .== 1)
+                prec, recall, f1, tp, fp, tn, fn, n = evaluate_model(predictions, targets)
+
+                md_hit_rate = Float32(tp / max(tp + fn, 1))
+                nmd_hit_rate = Float32(tn / max(tn + fp, 1))
+                expected = ((tp + fn) * (tp + fp) + (tn + fp) * (tn + fn)) / max(n, 1)
+                hss = Float32((tp + tn - expected) / max(n - expected, 1))
+                accuracy = Float32((tp + tn) / max(n, 1))
+
+                result = (n_trees=nt, max_depth=md, auc_roc=auc,
+                          precision=prec, recall=recall, f1=f1, hss=hss,
+                          md_hit_rate=md_hit_rate, nmd_hit_rate=nmd_hit_rate,
+                          accuracy=accuracy, gates=n,
+                          tp=tp, fp=fp, tn=tn, fn=fn)
+                push!(all_results, result)
+
+                # Append to summary file
+                open(summary_file, "a") do io
+                    println(io, "  $(rpad(nt, 8)) $(rpad(md, 10)) " *
+                                "$(rpad(round(auc, digits=6), 10)) " *
+                                "$(rpad(round(hss, digits=6), 10)) " *
+                                "$(rpad(round(f1, digits=6), 10)) " *
+                                "$(rpad(round(nmd_hit_rate, digits=6), 10)) " *
+                                "$(rpad(round(md_hit_rate, digits=6), 10)) " *
+                                "$(rpad(round(accuracy, digits=6), 10)) " *
+                                "$(rpad(round(prec, digits=6), 10)) " *
+                                "$(rpad(round(recall, digits=6), 10)) $(n)")
+                end
+
+                # Track best model
+                if auc > best_auc
+                    best_auc = auc
+                    best_model = model
+                    best_params = (n_trees=nt, max_depth=md)
+                end
+
+                printstyled("  [$(combo_idx)/$(n_combos)] n_trees=$(rpad(nt, 4)) max_depth=$(rpad(md, 3)) " *
+                            "AUC=$(round(auc, digits=6))  HSS=$(round(hss, digits=4))  " *
+                            "F1=$(round(f1, digits=4))  " *
+                            "NMD=$(round(nmd_hit_rate, digits=4))  MD=$(round(md_hit_rate, digits=4))  " *
+                            "($(round(train_time, digits=1))s)\n", color=:white)
+            end
+
+            sweep_time = time() - sweep_start
+            printstyled("\nSweep completed in $(round(sweep_time, digits=1))s\n", color=:green)
+
+            # --- Step 6: Print sorted results ---
+            if !isempty(all_results)
+                sorted = sort(all_results, by = r -> r.auc_roc, rev=true)
+
+                println("\n", "="^90)
+                printstyled("HYPERTUNING RESULTS — Pass $(pass) (sorted by AUC-ROC)\n", color=:cyan)
+                println("="^90)
+                for (rank, r) in enumerate(sorted)
+                    marker = rank == 1 ? " ★" : ""
+                    println("  $(rpad(rank, 3)) n_trees=$(rpad(r.n_trees, 4)) max_depth=$(rpad(r.max_depth, 3))  " *
+                            "AUC=$(rpad(round(r.auc_roc, digits=6), 9)) " *
+                            "HSS=$(rpad(round(r.hss, digits=4), 7)) " *
+                            "F1=$(rpad(round(r.f1, digits=4), 7)) " *
+                            "NMD=$(rpad(round(r.nmd_hit_rate, digits=4), 7)) " *
+                            "MD=$(round(r.md_hit_rate, digits=4))$(marker)")
+                end
+                println("="^90)
+
+                best_result = sorted[1]
+                printstyled("\n>> BEST: n_trees=$(best_result.n_trees), max_depth=$(best_result.max_depth), " *
+                            "AUC=$(round(best_result.auc_roc, digits=6)), HSS=$(round(best_result.hss, digits=4))\n", color=:green)
+            else
+                sorted = NamedTuple[]
+                best_result = nothing
+            end
+
+            # --- Step 7: Test-set feature importance with best model ---
+            feat_names = String[]
+            importances = Float64[]
+            recommended = Int[]
+            if compute_test_importance && best_model !== nothing
+                printstyled("\nCOMPUTING TEST-SET FEATURE IMPORTANCE " *
+                            "(best: n_trees=$(best_params.n_trees), max_depth=$(best_params.max_depth))...\n", color=:green)
+
+                importances = compute_rf_feature_importance(best_model, X_test, Y_test_vec;
+                    n_repeats=n_importance_repeats,
+                    subsample_fraction=importance_subsample_fraction)
+
+                kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+                masked_conv_kb = if !isempty(config.masked_conv_variables)
+                    build_filtered_kernel_bank(config.masked_conv_kernel_types, config.masked_conv_kernel_sizes)
+                else
+                    ConvolutionKernel[]
+                end
+                feat_names = build_feature_names(config.conv_variables, kernel_bank;
+                    masked_conv_variables=config.masked_conv_variables,
+                    masked_conv_kernel_bank=masked_conv_kb,
+                    masked_conv_threshold=config.masked_conv_threshold)
+
+                sorted_idx = sortperm(importances, rev=true)
+                printstyled("\n  TEST-SET FEATURE IMPORTANCE RANKING:\n", color=:cyan)
+                max_imp = maximum(importances)
+                for (rank, idx) in enumerate(sorted_idx)
+                    name = idx <= length(feat_names) ? feat_names[idx] : "feature_$(idx)"
+                    bar_len = max_imp > 0 ? round(Int, importances[idx] / max_imp * 30) : 0
+                    bar = repeat("█", max(bar_len, 0))
+                    printstyled("    $(lpad(rank, 4)). $(rpad(name, 35)) $(rpad(round(importances[idx], digits=6), 10)) $(bar)\n", color=:cyan)
+                end
+
+                recommended = select_features(importances, config.feature_importance_threshold)
+                printstyled("\n  RECOMMENDED $(length(recommended))/$(length(importances)) FEATURES " *
+                            "(test-set importance, $(config.feature_importance_threshold * 100)% threshold)\n", color=:green)
+                printstyled("  selected_features = $(recommended)\n", color=:yellow)
+                printstyled("  Copy the line above into your PASS_CONFIG to retrain with this subset.\n", color=:yellow)
+            end
+
+            # --- Step 8: Save best model ---
+            best_model_path = "trained_model_$(experiment_name)_best_pass$(pass).jld2"
+            if best_model !== nothing
+                save_kwargs = Dict{Symbol,Any}(
+                    :model => best_model,
+                    :selected_features => config.selected_features,
+                    :conv_variables => config.conv_variables,
+                    :masked_conv_variables => config.masked_conv_variables,
+                    :masked_conv_kernel_types => config.masked_conv_kernel_types,
+                    :masked_conv_kernel_sizes => config.masked_conv_kernel_sizes,
+                    :masked_conv_threshold => config.masked_conv_threshold,
+                    :masked_conv_met_prob_field => config.masked_conv_met_prob_field,
+                    :n_trees => best_params.n_trees,
+                    :max_depth => best_params.max_depth,
+                    :auc_roc => best_auc,
+                )
+                if !isempty(importances)
+                    save_kwargs[:importances] = importances
+                    save_kwargs[:feature_names] = feat_names
+                    save_kwargs[:recommended_features] = recommended
+                end
+                JLD2.jldsave(best_model_path; save_kwargs...)
+                printstyled("\n  Saved best model to $(best_model_path)\n", color=:green)
+            end
+
+            return (results=all_results,
+                    best=isempty(all_results) ? nothing : sorted[1],
+                    best_model_path=best_model_path)
+
+        finally
+            config.input_path = orig_input_path
+            config.n_trees = orig_n_trees
+            config.max_depth = orig_max_depth
+            config.write_out = orig_write_out
+            config.overwrite_output = orig_overwrite
         end
     end
 
@@ -3548,11 +3986,21 @@ module Ronin
         model_selected_features = Vector{Vector{Int}}()
 
         model_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_kernel_types = Vector{Vector{String}}()
+        model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
+        model_masked_conv_thresholds = Vector{Float32}()
+        model_masked_conv_met_prob_fields = Vector{String}()
         for path in config.model_output_paths
             md = load_model_with_metadata(path, config.task_mode)
             push!(models, md.model)
             push!(model_selected_features, md.selected_features)
             push!(model_conv_variables, md.conv_variables)
+            push!(model_masked_conv_variables, md.masked_conv_variables)
+            push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
+            push!(model_masked_conv_kernel_sizes, md.masked_conv_kernel_sizes)
+            push!(model_masked_conv_thresholds, md.masked_conv_threshold)
+            push!(model_masked_conv_met_prob_fields, md.masked_conv_met_prob_field)
         end
 
         ## Collect per-pass probabilities for summary histogram
@@ -3715,6 +4163,11 @@ module Ronin
                     if !isempty(model_conv_variables[i])
                         config_pred.conv_variables = model_conv_variables[i]
                     end
+                    config_pred.masked_conv_variables = model_masked_conv_variables[i]
+                    config_pred.masked_conv_kernel_types = model_masked_conv_kernel_types[i]
+                    config_pred.masked_conv_kernel_sizes = model_masked_conv_kernel_sizes[i]
+                    config_pred.masked_conv_threshold = model_masked_conv_thresholds[i]
+                    config_pred.masked_conv_met_prob_field = model_masked_conv_met_prob_fields[i]
                     result = process_single_file_conv(f, config_pred, kernel_bank;
                                                       feature_mask=feature_mask, mask_features=QC_mask)
                     X, Y, indexer = result[1], result[2], result[3]
@@ -4059,6 +4512,59 @@ module Ronin
         return(prec, recall, f1, sum(tp_idx), sum(fp_idx), sum(tn_idx), sum(fn_idx), length(predictions))
     end
 
+
+    """
+        compute_auc_roc(probabilities::Vector{Float32}, labels::Vector{<:Integer})
+
+    Compute Area Under the ROC Curve from predicted probabilities and binary labels.
+    Uses the trapezoidal rule on (FPR, TPR) points at each distinct threshold.
+
+    Labels should be 1 (positive/meteorological) or 0 (negative/non-meteorological).
+    Returns AUC as Float64 in [0, 1], or NaN for empty input, 0.5 for single-class input.
+    """
+    function compute_auc_roc(probabilities::Vector{Float32}, labels::Vector{<:Integer})::Float64
+        n = length(probabilities)
+        n == 0 && return NaN
+        n_pos = sum(labels .== 1)
+        n_neg = n - n_pos
+        (n_pos == 0 || n_neg == 0) && return 0.5
+
+        sorted_idx = sortperm(probabilities, rev=true)
+
+        auc = 0.0
+        tp = 0
+        fp = 0
+        prev_fpr = 0.0
+        prev_tpr = 0.0
+        prev_prob = Inf32
+
+        for i in 1:n
+            idx = sorted_idx[i]
+            prob = probabilities[idx]
+
+            if prob != prev_prob && i > 1
+                fpr = fp / n_neg
+                tpr = tp / n_pos
+                auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
+                prev_fpr = fpr
+                prev_tpr = tpr
+            end
+            prev_prob = prob
+
+            if labels[idx] == 1
+                tp += 1
+            else
+                fp += 1
+            end
+        end
+
+        # Final point
+        fpr = fp / n_neg
+        tpr = tp / n_pos
+        auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
+
+        return auc
+    end
 
     """
         `evaluate_model(config::ModelConfig)`
