@@ -33,8 +33,51 @@ module Ronin
     export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc
     export load_model_with_metadata, inspect_model_configuration
     export compute_importance, generate_pass_masks, met_prob_histogram
+    export migrate_model_config 
 
 
+
+    """
+        migrate_model_config(infile::String, outfile::String; key=nothing)
+
+        Function to migrate an old model configuration file to the new ModelConfig struct format. 
+        Reads the old configuration object in, maps any overlapping fields to the new ModelConfig struct, 
+        and saves the new struct to a new JLD2 file.
+    """
+    function migrate_model_config(infile::String, outfile::String; key=nothing)
+
+        actual_key = jldopen(infile, "r") do f
+            ks = collect(keys(f))
+            println("Keys found: ", ks)
+
+            if key !== nothing
+                String(key)
+            elseif length(ks) == 1
+                String(ks[1])
+            else
+                error("Multiple keys found. Pass key=\"...\" explicitly.")
+            end
+        end
+
+        old = JLD2.load(infile, actual_key)
+
+        kwargs = Dict{Symbol,Any}()
+
+        for fld in fieldnames(ModelConfig)
+            if hasproperty(old, fld)
+                kwargs[fld] = getproperty(old, fld)
+            end
+        end
+
+        new = ModelConfig(; kwargs...)
+
+        jldsave(outfile; model_config = new)
+
+        println("Migrated ModelConfig saved to: $outfile")
+        return new
+    end
+        
+            
 
     """
         load_model(path::String, task_mode::String)
