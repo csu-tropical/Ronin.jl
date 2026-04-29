@@ -1456,6 +1456,150 @@ end
 end
 
 ###############################################################################
+# save_config / load_config — dict-keyed persistence (issue #34)
+###############################################################################
+@testset "save_config / load_config" begin
+    @testset "round-trip preserves field values" begin
+        cfg = make_config(num_models=2, input_path="/tmp/in",
+                          experiment_name="rt_test",
+                          task_mode="convolution",
+                          n_trees=37, max_depth=11,
+                          conv_variables=["DBZ", "VEL"],
+                          masked_conv_variables=["DBZ"],
+                          masked_conv_threshold=0.7f0)
+        path = joinpath(test_scratchspace, "config_roundtrip.jld2")
+        save_config(path, cfg)
+        @test isfile(path)
+        loaded = load_config(path)
+        @test loaded isa Ronin.ModelConfig
+        for fld in fieldnames(Ronin.ModelConfig)
+            @test getproperty(loaded, fld) == getproperty(cfg, fld)
+        end
+        ## Loaded config must be mutable — assigning fields is the core bug from #34.
+        loaded.task_paths = ["a", "b"]
+        @test loaded.task_paths == ["a", "b"]
+        rm(path; force=true)
+    end
+
+    @testset "missing keys fall back to defaults (forward-compat)" begin
+        ## Simulate an "older" save_config file by hand-writing only a subset of keys.
+        ## Future field additions to ModelConfig should load fine from such a file.
+        path = joinpath(test_scratchspace, "config_partial.jld2")
+        ## Symbol keys so `;partial...` becomes a kwarg splat for jldsave.
+        ## JLD2 serializes them as string keys on disk, which load_config reads back.
+        partial = Dict{Symbol,Any}(
+            :__ronin_config_format__ => "dict_v1",
+            :num_models              => 2,
+            :model_output_paths      => ["m1.jld2", "m2.jld2"],
+            :met_probs               => [(0.0f0, 1.0f0), (0.0f0, 0.99f0)],
+            :feature_output_paths    => ["f1.h5", "f2.h5"],
+            :input_path              => "/data",
+            :task_mode               => "convolution",
+            :file_preprocessed       => [false, false],
+            :n_trees                 => 99,
+        )
+        jldsave(path; partial...)
+        loaded = load_config(path)
+        @test loaded.n_trees == 99
+        @test loaded.num_models == 2
+        @test loaded.task_mode == "convolution"
+        ## A field not written should equal the struct's default.
+        default_cfg = make_config(num_models=2, input_path="/data", task_mode="convolution")
+        @test loaded.compute_feature_importance == default_cfg.compute_feature_importance
+        @test loaded.conv_kernel_sizes == default_cfg.conv_kernel_sizes
+        rm(path; force=true)
+    end
+
+    @testset "legacy save_object format is loadable inline" begin
+        ## Build a current ModelConfig, persist via save_object, reload via load_config.
+        ## (Same shape; this exercises the single_stored_object branch but does not
+        ## reproduce the cross-version field-mismatch on its own — see next testset.)
+        cfg = make_config(num_models=1, input_path="/legacy",
+                          experiment_name="legacy_test",
+                          task_mode="",
+                          n_trees=13, max_depth=7)
+        path = joinpath(test_scratchspace, "config_legacy.jld2")
+        JLD2.save_object(path, cfg)
+        loaded = load_config(path)
+        @test loaded isa Ronin.ModelConfig
+        @test loaded.n_trees == 13
+        @test loaded.max_depth == 7
+        @test loaded.num_models == 1
+        loaded.task_paths = ["from_legacy"]
+        @test loaded.task_paths == ["from_legacy"]
+        rm(path; force=true)
+    end
+
+    @testset "legacy file with extra/missing fields (cross-version simulation)" begin
+        ## Approximate Paul's situation: a saved struct that has fewer fields than the
+        ## current ModelConfig. We can't easily round-trip a foreign struct shape in
+        ## one process, so we exercise the recovery path by supplying a NamedTuple
+        ## standing in for the ReconstructedMutable.
+        old = (
+            num_models           = 2,
+            model_output_paths   = ["a.jld2", "b.jld2"],
+            met_probs            = [(0.0f0, 1.0f0), (0.0f0, 0.99f0)],
+            feature_output_paths = ["a.h5", "b.h5"],
+            input_path           = "/old",
+            task_mode            = "",
+            file_preprocessed    = [false, false],
+            task_paths           = Vector{Union{String,Vector{String}}}(["t1.txt", "t2.txt"]),
+            n_trees              = 7,
+            ## Note: no conv_variables, masked_conv_*, etc. — those should default.
+        )
+        rebuilt = Ronin._load_legacy_config(old, "synthetic.jld2")
+        @test rebuilt isa Ronin.ModelConfig
+        @test rebuilt.n_trees == 7
+        @test rebuilt.task_paths == Vector{Union{String,Vector{String}}}(["t1.txt", "t2.txt"])
+        ## New field gets the struct default, not garbage.
+        @test rebuilt.conv_variables == ["DBZ", "VEL"]
+        @test rebuilt.masked_conv_variables == String[]
+        ## Mutability check — the bug from #34 was setproperty! failing on the wrapper.
+        rebuilt.task_paths = ["new_path"]
+        @test rebuilt.task_paths == ["new_path"]
+    end
+
+    @testset "migrate_model_config writes loadable dict-keyed file" begin
+        cfg = make_config(num_models=1, input_path="/migrate",
+                          experiment_name="migrate_test",
+                          task_mode="",
+                          n_trees=21)
+        legacy = joinpath(test_scratchspace, "config_to_migrate.jld2")
+        new    = joinpath(test_scratchspace, "config_migrated.jld2")
+        JLD2.save_object(legacy, cfg)
+
+        migrated = migrate_model_config(legacy, new)
+        @test isfile(new)
+        @test migrated isa Ronin.ModelConfig
+
+        reloaded = load_config(new)
+        @test reloaded.n_trees == 21
+        @test reloaded.input_path == "/migrate"
+        ## Migrated file is the new format (no single_stored_object key).
+        keys_in_file = jldopen(new, "r") do f
+            collect(keys(f))
+        end
+        @test "num_models" in keys_in_file
+        @test !("single_stored_object" in keys_in_file)
+
+        rm(legacy; force=true)
+        rm(new; force=true)
+    end
+
+    @testset "load_config rejects non-config files" begin
+        ## A file containing only one or two unrelated keys should not load as a config.
+        path = joinpath(test_scratchspace, "not_a_config.jld2")
+        jldsave(path; some_other_key=42, another=[1, 2, 3])
+        @test_throws ErrorException load_config(path)
+        rm(path; force=true)
+    end
+
+    @testset "load_config errors clearly when file missing" begin
+        @test_throws ErrorException load_config("/nonexistent/path/config.jld2")
+    end
+end
+
+###############################################################################
 # Cleanup
 ###############################################################################
 @testset "Cleanup test scratch space" begin
