@@ -33,8 +33,7 @@ module Ronin
     export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc
     export load_model_with_metadata, inspect_model_configuration
     export compute_importance, generate_pass_masks, met_prob_histogram
-
-
+    export save_config, load_config, migrate_model_config
 
     """
         load_model(path::String, task_mode::String)
@@ -548,6 +547,157 @@ module Ronin
         end
 
         ModelConfig(; num_models=num_models, input_path=input_path, merged...)
+    end
+
+    ## Required ModelConfig fields (no @kwdef defaults). Used by load_config to
+    ## validate that legacy single_stored_object files actually yielded enough
+    ## values to construct a ModelConfig.
+    const _MODELCONFIG_REQUIRED_FIELDS = (:num_models, :model_output_paths, :met_probs,
+                                          :feature_output_paths, :input_path, :task_mode,
+                                          :file_preprocessed)
+
+    """
+        save_config(path::String, config::ModelConfig)
+
+    Save a `ModelConfig` to a JLD2 file in dict-keyed format: one key per field.
+
+    This format is robust to struct evolution. Adding a field to `ModelConfig` later
+    just means a new key for fresh files; old files still load via `load_config`,
+    which fills any missing key with the struct's default. No migration required
+    on every shape change.
+
+    Replaces the legacy pattern `JLD2.save_object(path, config)`, which pickled the
+    struct shape and broke on every field addition (see issue #34). The legacy
+    format is still readable by `load_config`.
+    """
+    function save_config(path::String, config::ModelConfig)
+        ## Symbol-keyed Dict so the `;pairs...` splat lands as JLD2 keyword args.
+        ## JLD2 serializes keyword names as string keys on disk, which `load_config`
+        ## then reads back via `data["field_name"]`.
+        pairs = Dict{Symbol,Any}()
+        for fld in fieldnames(ModelConfig)
+            pairs[fld] = getproperty(config, fld)
+        end
+        ## Format marker so future loaders can detect / version this layout.
+        pairs[:__ronin_config_format__] = "dict_v1"
+        jldsave(path; pairs...)
+        return path
+    end
+
+    """
+        load_config(path::String) -> ModelConfig
+
+    Load a `ModelConfig` from a JLD2 file, transparently handling both storage formats:
+
+    - **Dict-keyed format** (written by `save_config`): each ModelConfig field is
+      stored under its own key. Missing keys fall back to the struct's `@kwdef`
+      defaults, so future field additions do not break old files.
+
+    - **Legacy `save_object` format** (single `single_stored_object` key holding a
+      pickled struct): JLD2 may load these as a `ReconstructedMutable` shadow type
+      when the saved struct shape no longer matches the current `ModelConfig`.
+      Each accessible field is copied via `getproperty` into a fresh, real
+      `ModelConfig` instance; defaults fill in any new fields the saved file lacks.
+
+    A real, mutable `ModelConfig` is returned regardless of source format —
+    callers can then assign to fields (`config.task_paths = [...]`) without
+    hitting `setproperty!` errors on `ReconstructedMutable`.
+    """
+    function load_config(path::String)
+        isfile(path) || error("Config file not found: $(path)")
+        data = JLD2.load(path)
+        data isa Dict || error("Unexpected JLD2 contents in $(path): $(typeof(data))")
+
+        ## Legacy save_object: one key, "single_stored_object", holding a pickled struct.
+        if haskey(data, "single_stored_object")
+            return _load_legacy_config(data["single_stored_object"], path)
+        end
+
+        ## Dict-keyed format. Match keys against current ModelConfig fields and fill
+        ## defaults for anything missing.
+        field_names = fieldnames(ModelConfig)
+        matched = count(f -> haskey(data, String(f)), field_names)
+        if matched < length(_MODELCONFIG_REQUIRED_FIELDS)
+            error("$(path) does not look like a saved ModelConfig (only $(matched) " *
+                  "matching field keys; expected at least $(length(_MODELCONFIG_REQUIRED_FIELDS)) " *
+                  "required). Confirm this is a config file written by `save_config`, " *
+                  "not a trained-model file.")
+        end
+
+        kwargs = Dict{Symbol,Any}()
+        for fld in field_names
+            key = String(fld)
+            haskey(data, key) || continue
+            kwargs[fld] = data[key]
+        end
+        return ModelConfig(; kwargs...)
+    end
+
+    ## Internal: rebuild a ModelConfig from a (possibly Reconstructed) legacy object.
+    function _load_legacy_config(old, path::String)
+        type_name = string(typeof(old).name.name)
+        if !occursin("ModelConfig", type_name)
+            @warn "load_config: $(path) is in legacy save_object format but the stored " *
+                  "object type does not look like a ModelConfig (got $(type_name)). " *
+                  "Proceeding to copy whatever fields match by name."
+        end
+
+        kwargs = Dict{Symbol,Any}()
+        copied = 0
+        for fld in fieldnames(ModelConfig)
+            ## getproperty works on ReconstructedMutable for fields that exist in the
+            ## saved struct; we use try/catch instead of hasproperty because some JLD2
+            ## reconstruction wrappers do not override propertynames.
+            val = try
+                getproperty(old, fld)
+            catch
+                continue
+            end
+            kwargs[fld] = val
+            copied += 1
+        end
+
+        missing_required = [r for r in _MODELCONFIG_REQUIRED_FIELDS if !haskey(kwargs, r)]
+        if !isempty(missing_required)
+            error("Cannot construct ModelConfig from $(path): legacy file is missing " *
+                  "required field(s) $(missing_required). The file may be from a much " *
+                  "older Ronin version or may not be a ModelConfig at all.")
+        end
+
+        @info "load_config: $(path) is in legacy save_object format. Copied $(copied)/" *
+              "$(length(fieldnames(ModelConfig))) fields; defaults fill the rest. " *
+              "Re-save with `save_config(path, config)` to migrate to the dict-keyed " *
+              "format that survives future struct changes."
+
+        return ModelConfig(; kwargs...)
+    end
+
+    """
+        migrate_model_config(infile::String, outfile::String; key=nothing)
+
+    One-shot utility: load a legacy `save_object`-format ModelConfig file and re-save
+    it in the new dict-keyed format written by `save_config`. Returns the rebuilt
+    `ModelConfig`.
+
+    Migration is **not required for loading** — `load_config` reads legacy files
+    inline. Use this helper only when you want to upgrade a long-lived file on disk
+    so future loads skip the legacy path (and the deprecation `@info`).
+
+    `key` may be passed to select a specific JLD2 key when the file contains
+    multiple stored objects; defaults to the standard `single_stored_object` key
+    used by `JLD2.save_object`.
+    """
+    function migrate_model_config(infile::String, outfile::String; key=nothing)
+        config = if key === nothing
+            load_config(infile)
+        else
+            ## Caller specified a non-standard key — load that object and recover.
+            old = JLD2.load(infile, String(key))
+            _load_legacy_config(old, infile)
+        end
+        save_config(outfile, config)
+        @info "Migrated ModelConfig: $(infile) → $(outfile) (dict-keyed format)"
+        return config
     end
 
     """
