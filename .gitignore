@@ -1,0 +1,55 @@
+# Julia ----------------------------------------------------------------------
+# Manifest.toml is intentionally not tracked for libraries — it pins exact
+# versions for development, but releases need the bounds in [compat] to be
+# the source of truth. Remove this rule if Ronin ever becomes an end-user
+# application that benefits from a reproducible Manifest.
+Manifest.toml
+deps/build.log
+deps/deps.jl
+docs/build/
+docs/site/
+*.cov
+*.mem
+.julia-cache/
+
+# OS / editors ---------------------------------------------------------------
+.DS_Store
+.ipynb_checkpoints/
+*.swp
+*~
+
+# Jupyter --------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# CondaPkg -------------------------------------------------------------------
+.CondaPkg/
+
+# Training / evaluation artifacts (kept out of git; reproduced on demand) ----
+output_features_*.h5
+trained_model_*.jld2
+predictions_*.h5
+predictions_*.csv
+
+# Hypertuning / sweep summaries ----------------------------------------------
+*_hypertuning_pass*_summary.txt
+*_validation_pass*_summary.txt
+*_sweep_summary.txt
+*_sweep_summary.numbers
+
+# Ad-hoc analysis scripts that pile up at repo root --------------------------
+RONIN_CODE_REVIEW.md
+inspect_model.jl
+inspect_model2.jl
+repair_model.jl
+repair_model2.jl
+resave_jld2.jl
+model_inspect.txt
+RONIN_PARAMETER_TUNING copy.jl
+RONIN_TUTORIAL_WALKTHROUGH.jl
+RONIN_kitchen_sink.jl
+
+# Working scratch directories ------------------------------------------------
+bkup/
+ks_fore/
+kitchen_sink/
+tmp/
