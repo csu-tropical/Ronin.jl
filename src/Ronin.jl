@@ -24,9 +24,9 @@ module Ronin
     export calculate_features, calculate_features_conv
     export split_training_testing!, split_training_testing_validation!
     export QC_scan, get_QC_mask
-    export evaluate_model, get_feature_importance, error_characteristics, train_model
+    export evaluate_model, get_feature_importance, train_model
     export train_multi_model, train_single_pass, regenerate_masks, ModelConfig, make_config, composite_prediction, get_contingency, compute_balanced_class_weights
-    export multipass_uncertain, write_field, characterize_misclassified_gates, composite_QC
+    export write_field, characterize_misclassified_gates, composite_QC
     export ConvolutionKernel, build_kernel_bank, masked_convolve, compute_convolution_features
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
     export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc

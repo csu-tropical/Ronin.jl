@@ -9,34 +9,28 @@ RadarQC is a package that utilizes a methodology developed by [Dr. Alex DesRosie
 ```@docs
 ModelConfig
 ```
-## Calculating Model Input Features  
+## Calculating Model Input Features
 
-```@docs 
+```@docs
 calculate_features(::String, ::String, ::String, ::Bool)
-calculate_features(::String, ::Vector{String}, ::Vector{Matrix{Union{Missing, Float64}}}, ::String, ::Bool)
 split_training_testing!
 train_model(::String, ::String)
 remove_validation
 get_feature_importance(::String, ::Vector{Float64})
-``` 
+```
 
-## Applying and evaluating a trained model to data 
+## Applying and evaluating a trained model to data
 
 ```@docs
 QC_scan
-predict_with_model(::String, ::String)
-evaluate_model(::String, ::String, ::String)
-error_characteristics(::String, ::String, ::String) 
 characterize_misclassified_gates
 ```
 
-## Predicting using a composite model 
+## Predicting using a composite model
 
-```@docs 
-
+```@docs
 train_multi_model
 composite_prediction
-multipass_uncertain
 ```
 
 ## Non-user facing
