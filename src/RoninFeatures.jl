@@ -406,23 +406,31 @@ get_task_params(tasks::Vector{String}, variablelist) = tasks
             values in `feature_mask` are false. 
 
 """
-function process_single_file(cfrad::NCDataset, argfile_path::String; HAS_INTERACTIVE_QC::Bool = false, 
-    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP", 
-    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
+function process_single_file(cfrad::NCDataset, argfile_path::String; HAS_INTERACTIVE_QC::Bool = false,
+    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP",
+    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0,
      QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
-    mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;], 
-        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
+    mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;],
+        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)],
+        REMOVE_LOW_NCP=nothing)
+
+    ## Backward-compat: REMOVE_LOW_NCP is the v1.1.0 name for REMOVE_LOW_SIG_QUALITY.
+    if REMOVE_LOW_NCP !== nothing
+        Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                     :process_single_file)
+        REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
+    end
 
     valid_vars = keys(cfrad)
     curr_tasks = get_task_params(argfile_path, valid_vars)
 
     process_single_file(cfrad, curr_tasks; HAS_INTERACTIVE_QC=HAS_INTERACTIVE_QC, REMOVE_LOW_SIG_QUALITY=REMOVE_LOW_SIG_QUALITY,
-                        SIG_QUALITY_THRESHOLD=SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=SIG_QUALITY_VAR, 
-                        REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable, 
-                        remove_variable = remove_variable, replace_missing = replace_missing, 
+                        SIG_QUALITY_THRESHOLD=SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=SIG_QUALITY_VAR,
+                        REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable,
+                        remove_variable = remove_variable, replace_missing = replace_missing,
                         mask_features = mask_features, feature_mask =feature_mask, weight_matrixes = weight_matrixes)
 
-end 
+end
 
 
 
@@ -514,13 +522,20 @@ For spatial parameters, whether or not to replace `missings` values with `FILL_V
                 where in the scan features valid data and where does not. Will also contain `false` where 
                 values in `feature_mask` are false. 
 """
-function process_single_file(cfrad::NCDataset, tasks::Vector{String}; 
-    HAS_INTERACTIVE_QC::Bool = false, 
-    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP", 
-    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0, 
+function process_single_file(cfrad::NCDataset, tasks::Vector{String};
+    HAS_INTERACTIVE_QC::Bool = false,
+    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP",
+    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0,
      QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
-    mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;], 
-        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
+    mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;],
+        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)],
+        REMOVE_LOW_NCP=nothing)
+
+    if REMOVE_LOW_NCP !== nothing
+        Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                     :process_single_file)
+        REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
+    end
 
     cfrad_dims = (cfrad.dim["range"], cfrad.dim["time"])
     #println("\r\nDIMENSIONS: $(cfrad_dims[1]) times x $(cfrad_dims[2]) ranges\n")
