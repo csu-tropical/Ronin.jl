@@ -11,7 +11,6 @@ module Ronin
     using Statistics
     using Images
     using Missings
-    using BenchmarkTools
     using HDF5
     using MLJ, MLJLinearModels, CategoricalArrays
     using DataFrames

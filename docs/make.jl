@@ -11,6 +11,6 @@ makedocs(sitename="Ronin.jl",
         checkdocs=:none)
 
 deploydocs(;
-    repo="github.com/irslushy/Ronin.jl.git",
+    repo="github.com/csu-tropical/Ronin.jl.git",
     devbranch="main"
 )
