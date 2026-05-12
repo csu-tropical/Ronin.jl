@@ -1,15 +1,14 @@
 name = "Ronin"
 uuid = "905eca60-9fa9-4fb3-8835-f5cd63a3719c"
-version = "0.1.1"
+authors = ["Alex DesRosiers", "Isaac Schluesche", "Michael Bell <mmbell@colostate.edu>", "Paul Reasor"]
+version = "1.2.0"
 
 [deps]
-BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
-Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 FFMPEG = "c87230d0-a227-11e9-1b43-d7ebe4e7570a"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 ImageFiltering = "6a3955dd-da59-5b1f-98d4-e7296123deb5"
@@ -28,4 +27,31 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [compat]
-Scratch = "1.2.1"
+julia = "1.10"
+CategoricalArrays = "0.10"
+CondaPkg = "0.2"
+DataFrames = "1"
+DataStructures = "0.18, 0.19"
+DelimitedFiles = "1"
+FFMPEG = "0.4"
+HDF5 = "0.17"
+ImageFiltering = "0.7"
+Images = "0.26"
+JLD2 = "0.5, 0.6"
+LinearAlgebra = "1"
+MLJ = "0.20, 0.21"
+MLJLinearModels = "0.9, 0.10"
+Missings = "1"
+NCDatasets = "0.14"
+PlotlyJS = "0.18"
+Random = "1"
+ScikitLearnBase = "0.5, 0.6"
+Scratch = "1.2"
+Statistics = "1"
+StatsBase = "0.34"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

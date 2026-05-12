@@ -75,21 +75,33 @@ function build_forest(
     t_samples = length(labels)
     n_samples = floor(Int, partial_sampling * t_samples)
 
-    rngs = mk_rng(rng)::Random.AbstractRNG
+    base_rng = mk_rng(rng)::Random.AbstractRNG
 
     forest = Vector{LeafOrNode{S, T}}(undef, n_trees)
-    Threads.@threads for i in 1:n_trees
-        inds = rand(rngs, 1:t_samples, n_samples)
-        forest[i] = build_tree(
-            labels[inds],
-            features[inds,:],
-            n_subfeatures,
-            max_depth,
-            min_samples_leaf,
-            min_samples_split,
-            min_purity_increase,
-            weights = (weights === nothing ? nothing : weights[inds]),
-            rng = rngs)
+
+    # Create per-tree RNGs seeded from the base RNG to avoid race conditions
+    # when build_forest runs multi-threaded
+    tree_rngs = [Random.MersenneTwister(rand(base_rng, UInt64)) for _ in 1:n_trees]
+
+    # Build trees in batches to limit peak memory from concurrent bootstrap copies
+    n_threads = Threads.nthreads()
+    for batch_start in 1:n_threads:n_trees
+        batch_end = min(batch_start + n_threads - 1, n_trees)
+        Threads.@threads for i in batch_start:batch_end
+            local_rng = tree_rngs[i]
+            inds = rand(local_rng, 1:t_samples, n_samples)
+            forest[i] = build_tree(
+                labels[inds],
+                features[inds,:],
+                n_subfeatures,
+                max_depth,
+                min_samples_leaf,
+                min_samples_split,
+                min_purity_increase,
+                weights = (weights === nothing ? nothing : weights[inds]),
+                rng = local_rng)
+        end
+        GC.gc(false)
     end
 
     return Ensemble{S, T}(forest)

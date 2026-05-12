@@ -25,10 +25,10 @@ end
 # and returns a Matrix containing the resulting vectors, stacked vertically
 function stack_function_results(row_fun::Function, X::Matrix)
     N = size(X, 1)
-    N_cols = length(row_fun(X[1, :])) # gets the number of columns
+    N_cols = length(row_fun(@view(X[1, :]))) # gets the number of columns
     out = Array{Float64}(undef, N, N_cols)
     for i in 1:N
-        out[i, :] = row_fun(X[i, :])
+        out[i, :] = row_fun(@view(X[i, :]))
     end
     return out
 end
@@ -141,8 +141,17 @@ end
 
 
 apply_tree(leaf::Leaf{T}, feature::Vector{S}) where {S, T} = leaf.majority
+apply_tree(leaf::Leaf{T}, feature::SubArray{S}) where {S, T} = leaf.majority
 
 function apply_tree(tree::Node{S, T}, features::Vector{S}) where {S, T}
+    if features[tree.featid] < tree.featval
+        return apply_tree(tree.left, features)
+    else
+        return apply_tree(tree.right, features)
+    end
+end
+
+function apply_tree(tree::Node{S, T}, features::SubArray{S}) where {S, T}
     if features[tree.featid] < tree.featval
         return apply_tree(tree.left, features)
     else
@@ -154,7 +163,7 @@ function apply_tree(tree::LeafOrNode{S, T}, features::Matrix{S}) where {S, T}
     N = size(features,1)
     predictions = Array{T}(undef, N)
     for i in 1:N
-        predictions[i] = apply_tree(tree, features[i, :])
+        predictions[i] = apply_tree(tree, @view(features[i, :]))
     end
     if T <: Float64
         return Float64.(predictions)
@@ -171,10 +180,10 @@ n_labels` matrix of probabilities, each row summing up to 1.
 `col_labels` is a vector containing the distinct labels
 (eg. ["versicolor", "virginica", "setosa"]). It specifies the column ordering
 of the output matrix. """
-apply_tree_proba(leaf::Leaf{T}, features::Vector{S}, labels) where {S, T} =
+apply_tree_proba(leaf::Leaf{T}, features::Union{Vector{S}, SubArray{S}}, labels) where {S, T} =
     compute_probabilities(labels, leaf.values)
 
-function apply_tree_proba(tree::Node{S, T}, features::Vector{S}, labels) where {S, T}
+function apply_tree_proba(tree::Node{S, T}, features::Union{Vector{S}, SubArray{S}}, labels) where {S, T}
     if tree.featval === nothing
         return apply_tree_proba(tree.left, features, labels)
     elseif features[tree.featid] < tree.featval
@@ -198,7 +207,8 @@ function build_forest(
         min_samples_split   = 2,
         min_purity_increase = 0.0;
         weights             = nothing,
-        rng                 = Random.GLOBAL_RNG) where {S, T}
+        rng                 = Random.GLOBAL_RNG,
+        max_threads         = Threads.nthreads()) where {S, T}
 
     if n_trees < 1
         throw("the number of trees must be >= 1")
@@ -215,31 +225,45 @@ function build_forest(
     t_samples = length(labels)
     n_samples = floor(Int, partial_sampling * t_samples)
 
-    rngs = mk_rng(rng)::Random.AbstractRNG
+    base_rng = mk_rng(rng)::Random.AbstractRNG
 
     forest = Vector{LeafOrNode{S, T}}(undef, n_trees)
-    
+
     loss = (ns, n) -> util.gini(ns, n)
 
-    Threads.@threads for i in 1:n_trees
-        inds = rand(rngs, 1:t_samples, n_samples)
-        forest[i] = build_tree(
-            labels[inds],
-            features[inds,:],
-            n_subfeatures,
-            max_depth,
-            min_samples_leaf,
-            min_samples_split,
-            min_purity_increase,
-            weights = (weights === nothing ? nothing : weights[inds]),
-            loss = loss,
-            rng = rngs)
+    # Create per-tree RNGs seeded from the base RNG to avoid race conditions
+    # when build_forest runs multi-threaded
+    tree_rngs = [Random.MersenneTwister(rand(base_rng, UInt64)) for _ in 1:n_trees]
+
+    # Build trees in batches to limit peak memory from concurrent bootstrap copies.
+    # Each bootstrap sample is ~partial_sampling * n_features * sizeof(S) bytes;
+    # without batching, all threads hold copies simultaneously.
+    n_threads = min(max_threads, Threads.nthreads())
+    for batch_start in 1:n_threads:n_trees
+        batch_end = min(batch_start + n_threads - 1, n_trees)
+        Threads.@threads for i in batch_start:batch_end
+            local_rng = tree_rngs[i]
+            inds = rand(local_rng, 1:t_samples, n_samples)
+            forest[i] = build_tree(
+                labels[inds],
+                features[inds,:],
+                n_subfeatures,
+                max_depth,
+                min_samples_leaf,
+                min_samples_split,
+                min_purity_increase,
+                weights = (weights === nothing ? nothing : weights[inds]),
+                loss = loss,
+                rng = local_rng)
+        end
+        # Allow GC to reclaim bootstrap samples between batches
+        GC.gc(false)
     end
 
     return Ensemble{S, T}(forest)
 end
 
-function apply_forest(forest::Ensemble{S, T}, features::Vector{S}) where {S, T}
+function apply_forest(forest::Ensemble{S, T}, features::Union{Vector{S}, SubArray{S}}) where {S, T}
     n_trees = length(forest)
     votes = Array{T}(undef, n_trees)
     for i in 1:n_trees
@@ -257,7 +281,7 @@ function apply_forest(forest::Ensemble{S, T}, features::Matrix{S}) where {S, T}
     N = size(features,1)
     predictions = Array{T}(undef, N)
     for i in 1:N
-        predictions[i] = apply_forest(forest, features[i, :])
+        predictions[i] = apply_forest(forest, @view(features[i, :]))
     end
     return predictions
 end
@@ -270,7 +294,7 @@ n_labels` matrix of probabilities, each row summing up to 1.
 `col_labels` is a vector containing the distinct labels
 (eg. ["versicolor", "virginica", "setosa"]). It specifies the column ordering
 of the output matrix. """
-function apply_forest_proba(forest::Ensemble{S, T}, features::Vector{S}, labels) where {S, T}
+function apply_forest_proba(forest::Ensemble{S, T}, features::Union{Vector{S}, SubArray{S}}, labels) where {S, T}
     votes = [apply_tree(tree, features) for tree in forest.trees]
     return compute_probabilities(labels, votes)
 end
