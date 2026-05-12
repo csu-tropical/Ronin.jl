@@ -1,14 +1,59 @@
 # Ronin.jl
 
-Ronin.jl (Random forest Optimized Nonmeteorological IdentificatioN) contains a julia implementation of the algorithm described in [DesRosiers and Bell 2023](https://journals.ametsoc.org/view/journals/aies/aop/AIES-D-23-0064.1/AIES-D-23-0064.1.xml) for removing non-meteoroloigcal gates (Non-Meteorological Data, henceforth NMD) from airborne radar scans while retaining Meteorological Data (henceforth MD). Care has been taken to ensure relative similarity to the form described in the manuscript, but some changes have been made in the interest of computational speed. 
-  <br> 
+Ronin.jl (Random forest Optimized Nonmeteorological IdentificatioN) contains a julia implementation of the algorithm described in [DesRosiers and Bell 2023](https://journals.ametsoc.org/view/journals/aies/aop/AIES-D-23-0064.1/AIES-D-23-0064.1.xml) for removing non-meteoroloigcal gates (Non-Meteorological Data, henceforth NMD) from airborne radar scans while retaining Meteorological Data (henceforth MD). Care has been taken to ensure relative similarity to the form described in the manuscript, but some changes have been made in the interest of computational speed.
+  <br>
 
-  ___
-  # Acknowledgments 
-  
-  Much of the data used to train the models in this repository is the product of arduous manual editing of radar scans. ELDORA data is provided by the authors of [Bell, Lee, Wolff, & Cai 2013](https://journals.ametsoc.org/view/journals/apme/52/11/jamc-d-12-0283.1.xml?tab_body=fulltext-display). NOAA P3 TDR Data is courtsey of Dr. Paul Reasor, Dr. John Gamache, and Kelly Neighbour. As mentioned above, the code is adapted from the original work of Dr. Alex DesRosiers. 
 ___
-# Getting Started:
+# Installation
+
+Ronin.jl is registered in the Julia General Registry. From the Julia REPL:
+
+```julia
+julia> import Pkg; Pkg.add("Ronin")
+```
+
+or in package mode (`]`):
+
+```
+pkg> add Ronin
+```
+
+Supported Julia versions: 1.10 (LTS), 1.11, 1.12 — exercised by CI. See `CHANGELOG.md` for release notes.
+
+___
+# Quick start
+
+The recommended starting point is the `workflow/` directory, which provides a
+step-by-step pipeline driven by a single shared configuration file:
+
+| Script | Purpose |
+|---|---|
+| `workflow/00_config.jl` | Shared config (edit experiment name, data paths, hyperparameters) |
+| `workflow/01_split_data.jl` | One-time train/test/validation split |
+| `workflow/02_train.jl` | Train multi-pass cascade on all features |
+| `workflow/02a_evaluate.jl` | Evaluate trained model on the testing set |
+| `workflow/03_importance.jl` | Permutation feature importance |
+| `workflow/04_retrain.jl` | Retrain with the pruned feature set |
+| `workflow/05_sweep_pass2.jl` | Sweep Pass 2 met-probability thresholds |
+| `workflow/06_qc.jl` | Apply the final model to write QC'd fields |
+| `workflow/run_workflow.jl` | Orchestrator with boolean flags to run any subset |
+
+The default workflow uses **convolution feature mode** (`task_mode = "convolution"`),
+which derives features from a kernel bank applied to your chosen radar
+variables. The detailed walkthrough further below uses the older hand-crafted
+predictor pattern; both still work but convolution mode is the recommended
+path for new users.
+
+After a workflow run, the in-memory `ModelConfig` is auto-saved to
+`model_config_<EXPERIMENT_NAME>.jld2` so inference / operational scripts can
+reload it via `Ronin.load_config(path)` without re-executing the workflow.
+
+___
+# Acknowledgments
+
+Much of the data used to train the models in this repository is the product of arduous manual editing of radar scans. ELDORA data is provided by the authors of [Bell, Lee, Wolff, & Cai 2013](https://journals.ametsoc.org/view/journals/apme/52/11/jamc-d-12-0283.1.xml?tab_body=fulltext-display). NOAA P3 TDR Data is courtsey of Dr. Paul Reasor, Dr. John Gamache, and Kelly Neighbour. As mentioned above, the code is adapted from the original work of Dr. Alex DesRosiers.
+___
+# Developing from source
 ## Setting up the environment (CSU)
 After cloning the repository, start Julia using Ronin as the project directory, either by calling 
 ```
@@ -17,7 +62,7 @@ julia --project=Ronin
 from the parent directory of `Ronin` or modifying the `JULIA_PROJECT` environment variable. <br>
 Then, enter package mode in the REPL by pressing `]`.<br>
 <br><br>
-Next, run `instantiate` to download the necessary dependencies. This should serve both to download/install dependencies and precompile the Ronin package. Now, exit package using the dlete key. To ensure that everything was installed properly, run `using Ronin` on the Julia REPL. No errors or information should print out if successful. Run `add iJulia` if you will be viewing the code in a Jupyter notebook and need access to the Jupyter kernel.
+Next, run `instantiate` to download the necessary dependencies. This should serve both to download/install dependencies and precompile the Ronin package. Now, exit package mode using the delete key. To ensure that everything was installed properly, run `using Ronin` on the Julia REPL. No errors or information should print out if successful. Run `add IJulia` if you will be viewing the code in a Jupyter notebook and need access to the Jupyter kernel.
 > Guide adaped from https://github.com/mmbell/Scythe.jl/tree/main
 >
 ## Setting up the environment (Derecho)
@@ -136,7 +181,7 @@ Now that we have set everything up, instantiate a configuration object as follow
 config = ModelConfig(num_models = num_models,model_output_paths =  model_output_paths,met_probs =  met_probs, feature_output_paths = feature_output_paths, input_path = input_path,task_mode="nan",file_preprocessed = file_preprocessed, task_paths = [config_path, config_path], QC_var = QC_var, remove_var = remove_var, QC_mask = false, mask_names = mask_names, VARS_TO_QC = ["VEL"], class_weights = class_weights, HAS_INTERACTIVE_QC=true, task_weights = task_weights)
 ```
 
-> More detail about the model configuration structures are contained [here](https://irslushy.github.io/Ronin.jl/dev/api.html#Ronin.ModelConfig). 
+> More detail about the model configuration structures are contained [here](https://csu-tropical.github.io/Ronin.jl/dev/api.html#Ronin.ModelConfig).
 
 ___
 ## Training, evaluating, and applying a model
