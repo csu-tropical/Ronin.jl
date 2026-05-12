@@ -57,7 +57,7 @@ RUN_HISTOGRAM           = false   # Show met_prob distribution for MASK_PASS
 RUN_GENERATE_MASKS      = false  # Generate met_prob/masks from MASK_PASS
 RUN_TRAIN_NEXT_PASS     = false  # Train TRAIN_PASS using existing prior-pass masks
 RUN_PASS2_SWEEP         = false   # Sweep Pass 2 met_prob thresholds
-RUN_HYPERTUNING         = true   # Sweep n_trees/max_depth, evaluate AUC on testing
+RUN_HYPERTUNING         = false   # Sweep n_trees/max_depth, evaluate AUC on testing
 RUN_QC                  = false   # Apply QC to write corrected fields
 
 ## For incremental steps: which pass to operate on
