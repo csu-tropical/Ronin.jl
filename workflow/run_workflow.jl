@@ -71,6 +71,17 @@ TRAIN_PASS              = 2
 # Default is 00_config.jl but you can change that here
 include("00_config.jl")
 
+## --- Persist the ModelConfig to disk -----------------------------------------
+## The *_config.jl scripts only build `config` in memory. Save it to JLD2 so
+## inference / operational scripts (e.g. an aircraft-side auto_ronin_QC.jl)
+## can reload it via `Ronin.load_config(MODEL_CONFIG_PATH)` without having to
+## re-execute the workflow Julia script. Saved at workflow start; re-saved at
+## the end so any in-flight modifications (e.g. selected_features set by a
+## retrain step) are reflected in the on-disk file.
+const MODEL_CONFIG_PATH = "model_config_$(EXPERIMENT_NAME).jld2"
+save_config(MODEL_CONFIG_PATH, config)
+printstyled("ModelConfig saved → $(MODEL_CONFIG_PATH)\n\n", color=:cyan)
+
 ## --- Apply precomputed features flag (applies to all modes) ---
 if USE_PRECOMPUTED_FEATURES
     for i in 1:config.num_models
@@ -673,5 +684,10 @@ if RUN_QC
     QC_scan(config)
     println("QC complete. Check output files in $(QC_PATH)")
 end
+
+## Re-save the ModelConfig so any in-flight modifications during the workflow
+## (e.g. selected_features set by a retrain step) are captured on disk.
+save_config(MODEL_CONFIG_PATH, config)
+printstyled("ModelConfig re-saved → $(MODEL_CONFIG_PATH)\n", color=:cyan)
 
 println("\nWorkflow complete.")

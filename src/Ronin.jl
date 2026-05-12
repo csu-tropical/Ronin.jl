@@ -11,7 +11,6 @@ module Ronin
     using Statistics
     using Images
     using Missings
-    using BenchmarkTools
     using HDF5
     using MLJ, MLJLinearModels, CategoricalArrays
     using DataFrames
@@ -25,9 +24,9 @@ module Ronin
     export calculate_features, calculate_features_conv
     export split_training_testing!, split_training_testing_validation!
     export QC_scan, get_QC_mask
-    export evaluate_model, get_feature_importance, error_characteristics
+    export evaluate_model, get_feature_importance, train_model
     export train_multi_model, train_single_pass, regenerate_masks, ModelConfig, make_config, composite_prediction, get_contingency, compute_balanced_class_weights
-    export multipass_uncertain, write_field, characterize_misclassified_gates, composite_QC
+    export write_field, characterize_misclassified_gates, composite_QC
     export ConvolutionKernel, build_kernel_bank, masked_convolve, compute_convolution_features
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
     export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc
@@ -507,6 +506,27 @@ module Ronin
 
     end
 
+    ## Backward-compat property shim: in v1.1.0 the field was named REMOVE_LOW_NCP.
+    ## Reading or writing the old name still works but emits a deprecation warning.
+    ## Tests for `propertynames` / Tab-completion still see only the real fields.
+    function Base.getproperty(c::ModelConfig, name::Symbol)
+        if name === :REMOVE_LOW_NCP
+            Base.depwarn("`ModelConfig.REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :getproperty)
+            return getfield(c, :REMOVE_LOW_SIG_QUALITY)
+        end
+        return getfield(c, name)
+    end
+
+    function Base.setproperty!(c::ModelConfig, name::Symbol, x)
+        if name === :REMOVE_LOW_NCP
+            Base.depwarn("`ModelConfig.REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :setproperty!)
+            return setfield!(c, :REMOVE_LOW_SIG_QUALITY, convert(Bool, x))
+        end
+        return setfield!(c, name, convert(fieldtype(ModelConfig, name), x))
+    end
+
     """
         make_config(; num_models, input_path, experiment_name="experiment", kwargs...)
 
@@ -525,6 +545,14 @@ module Ronin
     function make_config(; num_models::Int, input_path::String,
                            experiment_name::String="experiment", kwargs...)
 
+        ## Backward-compat: rewrite the v1.1.0 keyword name to its v1.2.0 replacement.
+        kwargs_dict = Dict{Symbol,Any}(kwargs)
+        if haskey(kwargs_dict, :REMOVE_LOW_NCP)
+            Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :make_config)
+            kwargs_dict[:REMOVE_LOW_SIG_QUALITY] = pop!(kwargs_dict, :REMOVE_LOW_NCP)
+        end
+
         defaults = Dict{Symbol,Any}(
             :model_output_paths   => ["trained_model_$(experiment_name)_$(i).jld2" for i in 1:num_models],
             :feature_output_paths => ["output_features_$(experiment_name)_$(i-1).h5" for i in 1:num_models],
@@ -534,7 +562,7 @@ module Ronin
         )
 
         # User kwargs override defaults
-        merged = merge(defaults, Dict{Symbol,Any}(kwargs))
+        merged = merge(defaults, kwargs_dict)
 
         # Truncate per-pass vectors to num_models length so that e.g.
         # met_probs with 2 entries still works when num_models = 1
@@ -824,7 +852,15 @@ module Ronin
         REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32=1.f0,
         QC_variable::String = "VG", remove_variable::String = "VV",
         replace_missing::Bool = false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String = "", return_idxer::Bool=false,
-        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
+        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)],
+        REMOVE_LOW_NCP=nothing)
+
+        ## Backward-compat: REMOVE_LOW_NCP is the v1.1.0 name for REMOVE_LOW_SIG_QUALITY.
+        if REMOVE_LOW_NCP !== nothing
+            Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :calculate_features)
+            REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
+        end
 
         ##If this is a directory, things get a little more complicated
         paths = Vector{String}()

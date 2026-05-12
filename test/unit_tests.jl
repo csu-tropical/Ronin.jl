@@ -1600,6 +1600,67 @@ end
 end
 
 ###############################################################################
+# v1.1.0 → 1.2.0 deprecation shims
+#
+# These tests pin the backward-compat layer for the v1.1.0 API. When we drop
+# the shims (planned for 2.0), delete this whole testset.
+###############################################################################
+@testset "v1.1.0 deprecation shims" begin
+    @testset "train_model is exported" begin
+        ## v1.1.0 exposed train_model as a public name. The function still exists,
+        ## just need to confirm the export is restored.
+        @test isdefined(Ronin, :train_model)
+        @test :train_model in names(Ronin)
+    end
+
+    @testset "ModelConfig.REMOVE_LOW_NCP property forwards to REMOVE_LOW_SIG_QUALITY" begin
+        cfg = make_config(num_models=1, input_path="/x", task_mode="convolution")
+
+        ## Read and write via deprecated name fire Base.depwarn under --depwarn=yes,
+        ## so we use @test_deprecated rather than @test_logs.
+        cfg.REMOVE_LOW_SIG_QUALITY = true
+        @test (@test_deprecated cfg.REMOVE_LOW_NCP) == true
+
+        @test_deprecated cfg.REMOVE_LOW_NCP = false
+        @test cfg.REMOVE_LOW_SIG_QUALITY == false
+
+        ## Real field name still works without firing depwarn.
+        cfg.REMOVE_LOW_SIG_QUALITY = true
+        @test cfg.REMOVE_LOW_SIG_QUALITY == true
+    end
+
+    @testset "make_config accepts REMOVE_LOW_NCP kwarg" begin
+        cfg = @test_deprecated make_config(num_models=1, input_path="/x",
+                                            task_mode="convolution",
+                                            REMOVE_LOW_NCP=false)
+        @test cfg.REMOVE_LOW_SIG_QUALITY == false
+
+        cfg2 = @test_deprecated make_config(num_models=1, input_path="/x",
+                                             task_mode="convolution",
+                                             REMOVE_LOW_NCP=true)
+        @test cfg2.REMOVE_LOW_SIG_QUALITY == true
+    end
+
+    @testset "process_single_file accepts REMOVE_LOW_NCP kwarg" begin
+        ## We can't call process_single_file without a real CFRadial, but we can
+        ## confirm the kwarg is in the method signature so calls won't UndefKeywordError.
+        m1 = first(methods(Ronin.process_single_file,
+                           Tuple{NCDatasets.NCDataset, String}))
+        kwargs = Base.kwarg_decl(m1)
+        @test :REMOVE_LOW_NCP in kwargs
+        @test :REMOVE_LOW_SIG_QUALITY in kwargs
+    end
+
+    @testset "calculate_features accepts REMOVE_LOW_NCP kwarg" begin
+        m = first(methods(Ronin.calculate_features,
+                          Tuple{String, String, String, Bool}))
+        kwargs = Base.kwarg_decl(m)
+        @test :REMOVE_LOW_NCP in kwargs
+        @test :REMOVE_LOW_SIG_QUALITY in kwargs
+    end
+end
+
+###############################################################################
 # Cleanup
 ###############################################################################
 @testset "Cleanup test scratch space" begin
