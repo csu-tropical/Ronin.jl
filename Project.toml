@@ -1,7 +1,7 @@
 name = "Ronin"
 uuid = "905eca60-9fa9-4fb3-8835-f5cd63a3719c"
 authors = ["Alex DesRosiers", "Isaac Schluesche", "Michael Bell <mmbell@colostate.edu>", "Paul Reasor"]
-version = "0.1.1"
+version = "1.2.0"
 
 [deps]
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"

@@ -27,6 +27,7 @@ docs/site/
 # Training / evaluation artifacts (kept out of git; reproduced on demand) ----
 output_features_*.h5
 trained_model_*.jld2
+model_config_*.jld2
 predictions_*.h5
 predictions_*.csv
 
