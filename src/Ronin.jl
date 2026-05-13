@@ -1079,7 +1079,14 @@ module Ronin
         REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32=1.f0,
         QC_variable::String = "VG", remove_variable::String = "VV",
         replace_missing::Bool = false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String = "", return_idxer::Bool=false,
-        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)])
+        weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}= [Matrix{Union{Missing, Float32}}(undef, 0,0)],
+        REMOVE_LOW_NCP=nothing)
+
+        if REMOVE_LOW_NCP !== nothing
+            Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :calculate_features)
+            REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
+        end
 
         calculate_features(input_loc, tasks, weight_matrixes, output_file, HAS_INTERACTIVE_QC;
             verbose=verbose, REMOVE_LOW_SIG_QUALITY=REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD=SIG_QUALITY_THRESHOLD,
@@ -1088,10 +1095,32 @@ module Ronin
             write_out=write_out, QC_mask=QC_mask, mask_name=mask_name, return_idxer=return_idxer)
     end
 
+    ## Backward-compat: accept Float64 weight_matrixes (the old default). Converts
+    ## to Float32 once and forwards to the canonical method below. Common in
+    ## downstream code that builds matrices via `ones(...)` or `allowmissing(ones(...))`.
+    function calculate_features(input_loc::String, tasks::Vector{String},
+        weight_matrixes::Vector{Matrix{Union{Missing, Float64}}},
+        output_file::String, HAS_INTERACTIVE_QC::Bool; kwargs...)
+
+        Base.depwarn("`weight_matrixes` with Float64 inner type is deprecated; " *
+                     "convert via `Float32.(matrix)` for best performance.",
+                     :calculate_features)
+        wm32 = Vector{Matrix{Union{Missing, Float32}}}([
+            convert(Matrix{Union{Missing, Float32}}, m) for m in weight_matrixes])
+        return calculate_features(input_loc, tasks, wm32, output_file, HAS_INTERACTIVE_QC; kwargs...)
+    end
+
     function calculate_features(input_loc::String, tasks::Vector{String}, weight_matrixes::Vector{Matrix{Union{Missing, Float32}}}
         ,output_file::String, HAS_INTERACTIVE_QC::Bool; verbose::Bool=false,
          REMOVE_LOW_SIG_QUALITY = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR::String="NCP", REMOVE_HIGH_PGG = false, PGG_THRESHOLD::Float32=.1f0, QC_variable::String = "VG", remove_variable::String = "VV",
-         replace_missing::Bool=false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String="", return_idxer::Bool =false)
+         replace_missing::Bool=false, write_out::Bool=true, QC_mask::Bool = false, mask_name::String="", return_idxer::Bool =false,
+         REMOVE_LOW_NCP=nothing)
+
+        if REMOVE_LOW_NCP !== nothing
+            Base.depwarn("`REMOVE_LOW_NCP` is deprecated; use `REMOVE_LOW_SIG_QUALITY`.",
+                         :calculate_features)
+            REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
+        end
 
         ##If this is a directory, things get a little more complicated
         paths = Vector{String}()

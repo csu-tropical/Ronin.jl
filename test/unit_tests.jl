@@ -1658,6 +1658,36 @@ end
         @test :REMOVE_LOW_NCP in kwargs
         @test :REMOVE_LOW_SIG_QUALITY in kwargs
     end
+
+    @testset "calculate_features 4-arg tasks-vector form accepts REMOVE_LOW_NCP" begin
+        ## Dispatcher overload that takes tasks::Vector{String} instead of a path
+        ## to a tasks file. Forwards to the 5-arg canonical method.
+        m = first(methods(Ronin.calculate_features,
+                          Tuple{String, Vector{String}, String, Bool}))
+        kwargs = Base.kwarg_decl(m)
+        @test :REMOVE_LOW_NCP in kwargs
+        @test :REMOVE_LOW_SIG_QUALITY in kwargs
+    end
+
+    @testset "calculate_features 5-arg form accepts REMOVE_LOW_NCP" begin
+        ## Canonical method with weight_matrixes as a positional argument.
+        ## Used directly by some pre-1.2.0 callers (e.g. BENCHMARKING/bench_julia.jl).
+        m = first(methods(Ronin.calculate_features,
+                          Tuple{String, Vector{String},
+                                Vector{Matrix{Union{Missing, Float32}}}, String, Bool}))
+        kwargs = Base.kwarg_decl(m)
+        @test :REMOVE_LOW_NCP in kwargs
+        @test :REMOVE_LOW_SIG_QUALITY in kwargs
+    end
+
+    @testset "calculate_features accepts Float64 weight_matrixes via deprecation overload" begin
+        ## Backward-compat overload: legacy callers built weight matrices via
+        ## `allowmissing(ones(N, N))` which yields Float64 inner type. We accept
+        ## those and convert to Float32 internally.
+        @test hasmethod(Ronin.calculate_features,
+                        Tuple{String, Vector{String},
+                              Vector{Matrix{Union{Missing, Float64}}}, String, Bool})
+    end
 end
 
 ###############################################################################
