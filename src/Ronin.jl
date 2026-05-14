@@ -4051,8 +4051,13 @@ module Ronin
     """
     function QC_scan(config::ModelConfig, filepath::String, predictions::Vector{Bool}, init_idxer::Vector{Bool})
 
-        @assert (length(config.model_output_paths) == length(config.feature_output_paths)
-                 == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        if config.task_mode != "convolution"
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        else
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.mask_names))
+        end
 
         starttime = time()
 
@@ -4865,9 +4870,12 @@ module Ronin
         ###Returns precision, recall, f1, n true_postives, n false_positives, n true_negatives, n false_negatives
         scores = evaluate_model(Vector{Bool}(predictions), Vector{Bool}(targets))
 
+        task_descriptor = config.task_mode == "convolution" ?
+            [config.conv_variables] : [config.task_paths]
+
         retval = DataFrame(
                                 met_probs = [config.met_probs],
-                                task_paths = [config.task_paths],
+                                task_paths = task_descriptor,
                                 class_weights = [config.class_weights],
                                 n_trees = [config.n_trees],
                                 max_depth = [config.max_depth],
@@ -4900,21 +4908,34 @@ module Ronin
                 ###Otherwise, we need to mask out the features we want to apply the model to on the next pass
         @assert curr_model_num <= config.num_models
 
+        is_conv = config.task_mode == "convolution"
+
         ###If this is the 0th, we're just constructing the features for the first pass and don't need to do much other work
         ###This is basically useful for when we don't have a trained model and want to just get the initial set of features
         if curr_model_num > 0
             curr_model = load_model(config.model_output_paths[curr_model_num], config.task_mode)
             curr_metprobs = config.met_probs[curr_model_num]
-            curr_tasks = config.task_paths[curr_model_num]
-            curr_weights = config.task_weights[curr_model_num]
             curr_out = config.feature_output_paths[curr_model_num]
-            output_cols = get_num_tasks(curr_tasks)
+            curr_md = is_conv ? load_model_with_metadata(config.model_output_paths[curr_model_num], config.task_mode) : nothing
         else
             curr_model = ""
             curr_metprobs = ""
-            curr_tasks = config.task_paths[begin]
-            curr_weights = config.task_weights[begin]
             curr_out = config.feature_output_paths[begin]
+            curr_md = nothing
+        end
+
+        if is_conv
+            curr_tasks = String[]
+            curr_weights = nothing
+            output_cols = 0  # resolved per-file below
+        else
+            if curr_model_num > 0
+                curr_tasks = config.task_paths[curr_model_num]
+                curr_weights = config.task_weights[curr_model_num]
+            else
+                curr_tasks = config.task_paths[begin]
+                curr_weights = config.task_weights[begin]
+            end
             output_cols = get_num_tasks(curr_tasks)
         end
 
@@ -4939,9 +4960,10 @@ module Ronin
 
 
 
-        newX = X = Matrix{Float32}(undef,0,output_cols)
-        newY = Y = Matrix{Int64}(undef, 0,1)
-        idxs = Vector{}(undef,0)
+        X = is_conv ? Matrix{Float32}(undef, 0, 0) : Matrix{Float32}(undef, 0, output_cols)
+        Y = Matrix{Int64}(undef, 0, 1)
+        idxs = Vector{}(undef, 0)
+        all_feature_names = String[]
 
         for path in paths
 
@@ -4949,13 +4971,58 @@ module Ronin
                 (f.dim["range"], f.dim["time"])
             end
 
-            ###NEED to update this if it's beyond two pass so we can pass it the correct mask
-            newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true;
-                                verbose = config.verbose,
-                                REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var,
-                                remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
-                                write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
+            if is_conv
+                config_single = deepcopy(config)
+                config_single.input_path = path
+                config_single.write_out = false
+                config_single.verbose = false
+                if curr_md !== nothing
+                    config_single.selected_features = curr_md.selected_features
+                    if !isempty(curr_md.conv_variables)
+                        config_single.conv_variables = curr_md.conv_variables
+                    end
+                    config_single.masked_conv_variables = curr_md.masked_conv_variables
+                    config_single.masked_conv_kernel_types = curr_md.masked_conv_kernel_types
+                    config_single.masked_conv_kernel_sizes = curr_md.masked_conv_kernel_sizes
+                    config_single.masked_conv_threshold = curr_md.masked_conv_threshold
+                    config_single.masked_conv_met_prob_field = curr_md.masked_conv_met_prob_field
+                end
+                kernel_bank = build_kernel_bank(config_single.conv_kernel_sizes)
+                masked_conv_kb = if !isempty(config_single.masked_conv_variables)
+                    build_filtered_kernel_bank(config_single.masked_conv_kernel_types, config_single.masked_conv_kernel_sizes)
+                else
+                    ConvolutionKernel[]
+                end
+
+                cfrad = Dataset(path)
+                try
+                    fm = (QC_mask && mask_name != "") ?
+                        Matrix{Bool}(.!map(ismissing, cfrad[mask_name][:, :])) :
+                        trues(dims)
+                    result = process_single_file_conv(cfrad, config_single, kernel_bank;
+                                                      feature_mask=fm, mask_features=QC_mask)
+                    newX = result[1]
+                    newY = result[2]
+                    curr_idx_flat = result[3]
+                    feature_names = result[4]
+                    if isempty(all_feature_names)
+                        all_feature_names = feature_names
+                    end
+                    curr_idx = (reshape(curr_idx_flat, dims),)
+                    close(cfrad)
+                catch e
+                    close(cfrad)
+                    rethrow(e)
+                end
+            else
+                ###NEED to update this if it's beyond two pass so we can pass it the correct mask
+                newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true;
+                                    verbose = config.verbose,
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var,
+                                    remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
+                                    write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
+            end
 
             if (curr_model_num < config.num_models) && (curr_model_num > 0)
 
@@ -4978,8 +5045,13 @@ module Ronin
                 write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
             end
 
+            if is_conv && size(X, 2) == 0 && size(newX, 2) > 0
+                X = Matrix{Float32}(undef, 0, size(newX, 2))
+            end
             X = vcat(X, newX)::Matrix{Float32}
-            Y = vcat(Y, newY)::Matrix{Int64}
+            if newY !== false
+                Y = vcat(Y, newY)::Matrix{Int64}
+            end
 
         end
 
@@ -4994,7 +5066,12 @@ module Ronin
             fid = h5open(curr_out, "w")
 
             ###Add information to output h5 file
-            attributes(fid)["Parameters"] = get_task_params(curr_tasks)
+            if is_conv
+                params = isempty(config.selected_features) ? all_feature_names : all_feature_names[config.selected_features]
+                attributes(fid)["Parameters"] = params
+            else
+                attributes(fid)["Parameters"] = get_task_params(curr_tasks)
+            end
             attributes(fid)["MISSING_FILL_VALUE"] = config.FILL_VAL
             println()
             println("WRITING DATA TO FILE OF SHAPE $(size(X))")
@@ -5134,11 +5211,54 @@ module Ronin
 
 
     """
-    Streaming flavor of composite prediction used to
-    QC sweeps in a realtime setup.
+        composite_QC(config::ModelConfig, files::Vector{String},
+                     models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+        composite_QC(config::ModelConfig, files::Vector{String})
+
+    Streaming flavor of `composite_prediction` used to QC sweeps in a realtime
+    setup. Operates on an explicit list of CfRadial files (not `config.input_path`),
+    runs each pass of the cascade in turn, and writes `*<QC_SUFFIX>` fields back
+    into each file via `QC_scan`.
+
+    Supports both `task_mode = ""` (hand-tuned `task_paths`) and
+    `task_mode = "convolution"`. In convolution mode, per-model metadata
+    (`selected_features`, `conv_variables`, `masked_conv_*`) is loaded internally
+    from each `model_output_paths` JLD2 file; the supplied `models` vector is
+    used only for `predict_proba`.
+
+    The 2-arg form omits `models` and loads the random forests internally as
+    well — convenient for operational pipelines where the snippet is just
+    `composite_QC(load_config(path), files)`.
     """
     function composite_QC(config::ModelConfig,
                                         files::Vector{String}, models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+
+        ## Load per-model metadata once (selected_features, conv_variables, masked_conv_*).
+        ## Same pattern as composite_prediction at :4209-4219. In hand-tuned mode the
+        ## returned vectors are empty defaults and aren't used.
+        model_selected_features = Vector{Vector{Int}}()
+        model_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_kernel_types = Vector{Vector{String}}()
+        model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
+        model_masked_conv_thresholds = Vector{Float32}()
+        model_masked_conv_met_prob_fields = Vector{String}()
+        for path in config.model_output_paths
+            md = load_model_with_metadata(path, config.task_mode)
+            push!(model_selected_features, md.selected_features)
+            push!(model_conv_variables, md.conv_variables)
+            push!(model_masked_conv_variables, md.masked_conv_variables)
+            push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
+            push!(model_masked_conv_kernel_sizes, md.masked_conv_kernel_sizes)
+            push!(model_masked_conv_thresholds, md.masked_conv_threshold)
+            push!(model_masked_conv_met_prob_fields, md.masked_conv_met_prob_field)
+        end
+
+        ## Build the kernel bank once for the whole run (convolution mode only;
+        ## cheap to construct unconditionally).
+        kernel_bank = config.task_mode == "convolution" ?
+            build_kernel_bank(config.conv_kernel_sizes) :
+            ConvolutionKernel[]
 
         for file in files
 
@@ -5166,9 +5286,6 @@ module Ronin
                 QC_mask = config.QC_mask
                 for (i, model_path) in enumerate(config.model_output_paths)
 
-
-                    currt = config.task_paths[i]
-                    cw = config.task_weights[i]
                     ###REFACTOR NOTES: I THINK PROCESS_SINGLE_FILE CLOSES THE FILE SO WILL NEED TO CHANGE THAT
                     ###TO MOVE OUTSIDE LOOP
                     ###We don't need to write these out, just use them briefly
@@ -5198,11 +5315,30 @@ module Ronin
 
                     ###Need to actually pass the QC mask
                     ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
-                    X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! true) && config.HAS_INTERACTIVE_QC)
-                        , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
-                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                        QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
-                        mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+                    if config.task_mode == "convolution"
+                        config_pred = deepcopy(config)
+                        config_pred.HAS_INTERACTIVE_QC = false
+                        config_pred.selected_features = model_selected_features[i]
+                        if !isempty(model_conv_variables[i])
+                            config_pred.conv_variables = model_conv_variables[i]
+                        end
+                        config_pred.masked_conv_variables = model_masked_conv_variables[i]
+                        config_pred.masked_conv_kernel_types = model_masked_conv_kernel_types[i]
+                        config_pred.masked_conv_kernel_sizes = model_masked_conv_kernel_sizes[i]
+                        config_pred.masked_conv_threshold = model_masked_conv_thresholds[i]
+                        config_pred.masked_conv_met_prob_field = model_masked_conv_met_prob_fields[i]
+                        result = process_single_file_conv(f, config_pred, kernel_bank;
+                                                          feature_mask=feature_mask, mask_features=QC_mask)
+                        X, Y, indexer = result[1], result[2], result[3]
+                    else
+                        currt = config.task_paths[i]
+                        cw = config.task_weights[i]
+                        X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! true) && config.HAS_INTERACTIVE_QC)
+                            , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
+                            REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                            QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
+                            mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+                    end
                     final_idxer = indexer
 
                     ###If there are no gates that meet the basic QC thresholds now, we're once again done.
@@ -5284,7 +5420,22 @@ module Ronin
         end
     end
 
+    """
+        composite_QC(config::ModelConfig, files::Vector{String})
 
+    Convenience 2-arg method that loads the random forests from
+    `config.model_output_paths` internally and forwards to the 3-arg form.
+    Equivalent to:
+
+        models = [load_model(p, config.task_mode) for p in config.model_output_paths]
+        composite_QC(config, files, models)
+    """
+    function composite_QC(config::ModelConfig, files::Vector{String})
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            load_model(p, config.task_mode) for p in config.model_output_paths
+        ]
+        composite_QC(config, files, models)
+    end
 
 
 end

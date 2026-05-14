@@ -1691,6 +1691,242 @@ end
 end
 
 ###############################################################################
+# Convolution-mode orchestration: composite_prediction / composite_QC / QC_scan
+#
+# Guards against regressions where these orchestration functions assumed the
+# hand-tuned (task_paths) feature path and crashed under task_mode="convolution".
+# Each subtest stands up a minimal trained 1-pass convolution model on a
+# synthetic CfRadial, then drives a top-level entry point and asserts the
+# QC field was written back.
+###############################################################################
+
+# Helper: build a writable temporary directory under the test scratchspace
+function _orch_workdir(name::String)
+    dir = joinpath(test_scratchspace, name)
+    isdir(dir) && rm(dir; recursive=true)
+    mkpath(dir)
+    return dir
+end
+
+# Helper: train a 1-pass convolution model on a fresh synthetic CfRadial and
+# return (config, cfrad_path). The model JLD2 is written to disk with metadata,
+# and met_prob_pass_1 / mask_pass_1 fields end up in the CfRadial.
+function _train_smoke_conv_model(workdir::String)
+    cfrad_path = joinpath(workdir, "smoke.nc")
+    create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=7)
+
+    model_path = joinpath(workdir, "model_pass1.jld2")
+    feat_path  = joinpath(workdir, "feat_pass1.h5")
+
+    config = Ronin.make_config(;
+        num_models = 1,
+        input_path = cfrad_path,
+        experiment_name = "smoke_conv",
+        model_output_paths = [model_path],
+        feature_output_paths = [feat_path],
+        mask_names = ["mask_pass_0"],
+        met_probs = [(0.1f0, 0.9f0)],
+        file_preprocessed = [false],
+        task_mode = "convolution",
+        conv_variables = ["DBZ", "VEL"],
+        conv_kernel_sizes = [3],
+        HAS_INTERACTIVE_QC = true,
+        QC_var = "VG",
+        remove_var = "VV",
+        REMOVE_LOW_SIG_QUALITY = false,
+        REMOVE_HIGH_PGG = false,
+        SIG_QUALITY_VAR = "NCP",
+        n_trees = 5,
+        max_depth = 4,
+        class_weights = "balanced",
+        compute_feature_importance = false,
+        write_out = true,
+        verbose = false,
+        overwrite_output = true,
+    )
+
+    Ronin.train_multi_model(config)
+    return config, cfrad_path
+end
+
+# Helper: train a 1-pass hand-tuned model — keeps the 1.1.0 task_paths path
+# under test alongside the convolution path so the convolution branch
+# refactor cannot silently regress the legacy mode.
+function _train_smoke_handtuned_model(workdir::String)
+    cfrad_path = joinpath(workdir, "smoke_ht.nc")
+    create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=11)
+
+    model_path = joinpath(workdir, "model_ht_pass1.jld2")
+    feat_path  = joinpath(workdir, "feat_ht_pass1.h5")
+    tasks_path = joinpath(workdir, "tasks_pass1.txt")
+    create_test_config(tasks_path, "DBZ, VEL, NCP")
+
+    config = Ronin.make_config(;
+        num_models = 1,
+        input_path = cfrad_path,
+        experiment_name = "smoke_ht",
+        model_output_paths = [model_path],
+        feature_output_paths = [feat_path],
+        mask_names = ["mask_pass_0"],
+        met_probs = [(0.1f0, 0.9f0)],
+        file_preprocessed = [false],
+        task_mode = "",
+        task_paths = Union{String,Vector{String}}[tasks_path],
+        task_weights = [[Matrix{Union{Missing,Float32}}(undef, 0, 0)]],
+        HAS_INTERACTIVE_QC = true,
+        QC_var = "VG",
+        remove_var = "VV",
+        REMOVE_LOW_SIG_QUALITY = false,
+        REMOVE_HIGH_PGG = false,
+        SIG_QUALITY_VAR = "NCP",
+        n_trees = 5,
+        max_depth = 4,
+        class_weights = "balanced",
+        write_out = true,
+        verbose = false,
+        overwrite_output = true,
+    )
+
+    Ronin.train_multi_model(config)
+    return config, cfrad_path
+end
+
+@testset "Convolution mode orchestration" begin
+
+    @testset "Assertion shape: QC_scan inner does not require task_paths length in convolution mode" begin
+        ## Regression for the second user-visible crash: in convolution mode,
+        ## task_paths defaults to [""] while mask_names has num_models entries.
+        ## The inner per-file QC_scan must not assert task_paths length.
+        cfg = Ronin.make_config(
+            num_models = 2,
+            input_path = "/nonexistent",
+            experiment_name = "shape",
+            task_mode = "convolution",
+        )
+        @test length(cfg.task_paths) == 1
+        @test length(cfg.mask_names) == 2
+        ## Just exercise the assertion: passing a path that won't open should
+        ## fail *after* the assertion, on the NCDataset open, not at the assert.
+        err = try
+            Ronin.QC_scan(cfg, "/no/such/file.nc", Bool[], Bool[])
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        @test !(err isa AssertionError)
+    end
+
+    @testset "composite_prediction QC_mode=true (convolution)" begin
+        workdir = _orch_workdir("orch_compred_qc_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## Calling with QC_mode=true must not throw and must write a *_QC field.
+        Ronin.composite_prediction(config; write_predictions_out=false, QC_mode=true)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+            @test haskey(ds, "ZZ" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "QC_scan(config) (convolution)" begin
+        workdir = _orch_workdir("orch_qcscan_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## QC_scan(config) is the workflow-level entry point. Must not hit the
+        ## task_paths-length assertion in convolution mode.
+        Ronin.QC_scan(config)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 3-arg (convolution)" begin
+        workdir = _orch_workdir("orch_compositeqc3_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        Ronin.composite_QC(config, [cfrad_path], models)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 2-arg (convolution)" begin
+        workdir = _orch_workdir("orch_compositeqc2_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        Ronin.composite_QC(config, [cfrad_path])
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 3-arg (hand-tuned task_paths) — back-compat" begin
+        ## Locks in 1.1.0 behavior: the hand-tuned path must remain working
+        ## after the convolution branch refactor.
+        workdir = _orch_workdir("orch_compositeqc3_ht")
+        config, cfrad_path = _train_smoke_handtuned_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "") for p in config.model_output_paths
+        ]
+        Ronin.composite_QC(config, [cfrad_path], models)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "QC_scan(config) (hand-tuned) — back-compat" begin
+        workdir = _orch_workdir("orch_qcscan_ht")
+        config, cfrad_path = _train_smoke_handtuned_model(workdir)
+
+        Ronin.QC_scan(config)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "construct_next_pass_features (convolution)" begin
+        workdir = _orch_workdir("orch_cnpf_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## Pass index 1 on a 1-pass model: features get written to
+        ## feature_output_paths[1], no mask gets written for a "next" pass.
+        Ronin.construct_next_pass_features(config, 1; write_out=true)
+
+        @test isfile(config.feature_output_paths[1])
+        h5open(config.feature_output_paths[1]) do f
+            @test haskey(f, "X")
+            @test haskey(f, "Y")
+            @test size(f["X"][:,:], 1) > 0
+        end
+
+        rm(workdir; recursive=true)
+    end
+end
+
+###############################################################################
 # Cleanup
 ###############################################################################
 @testset "Cleanup test scratch space" begin
