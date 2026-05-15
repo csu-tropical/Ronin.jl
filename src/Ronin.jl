@@ -126,6 +126,37 @@ module Ronin
         end
     end
 
+    ## Internal: the number of feature columns a trained model expects.
+    ## A model trained on a `selected_features` subset expects that many columns;
+    ## otherwise it expects the full saved `feature_names` width. Returns 0 when
+    ## neither is known (legacy save_object models) so callers skip the check.
+    function _expected_feature_width(selected_features, feature_names)
+        !isempty(selected_features) && return length(selected_features)
+        !isempty(feature_names) && return length(feature_names)
+        return 0
+    end
+
+    ## Internal: fail fast with an actionable message when the convolution
+    ## feature matrix produced at inference is not the width the model was
+    ## trained on. The common cause is a missing prior-pass field
+    ## (e.g. met_prob_pass_<n>) which makes the masked-convolution block get
+    ## silently dropped, yielding a too-narrow X and an opaque BoundsError
+    ## deep inside the random forest.
+    function _check_feature_width(X, selected_features, feature_names, model_path, pass_i)
+        expected = _expected_feature_width(selected_features, feature_names)
+        expected == 0 && return
+        got = size(X, 2)
+        if got != expected
+            error("Feature width mismatch for pass $(pass_i) " *
+                  "(model $(basename(String(model_path)))): model expects " *
+                  "$(expected) features but $(got) were produced. This usually " *
+                  "means a required prior-pass field (e.g. met_prob_pass_<n>) is " *
+                  "absent from the CfRadial, so masked-convolution features were " *
+                  "silently dropped. Ensure earlier passes ran and wrote their " *
+                  "met_prob_pass_<n> fields before this pass.")
+        end
+    end
+
     """
         inspect_model_configuration(path::String; io::IO=stdout)
 
@@ -4214,6 +4245,7 @@ module Ronin
         model_selected_features = Vector{Vector{Int}}()
 
         model_conv_variables = Vector{Vector{String}}()
+        model_feature_names = Vector{Vector{String}}()
         model_masked_conv_variables = Vector{Vector{String}}()
         model_masked_conv_kernel_types = Vector{Vector{String}}()
         model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
@@ -4223,6 +4255,7 @@ module Ronin
             md = load_model_with_metadata(path, config.task_mode)
             push!(models, md.model)
             push!(model_selected_features, md.selected_features)
+            push!(model_feature_names, md.feature_names)
             push!(model_conv_variables, md.conv_variables)
             push!(model_masked_conv_variables, md.masked_conv_variables)
             push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
@@ -4399,6 +4432,7 @@ module Ronin
                     result = process_single_file_conv(f, config_pred, kernel_bank;
                                                       feature_mask=feature_mask, mask_features=QC_mask)
                     X, Y, indexer = result[1], result[2], result[3]
+                    _check_feature_width(X, model_selected_features[i], model_feature_names[i], model_path, i)
                 else
                     currt = config.task_paths[i]
                     cw = config.task_weights[i]
@@ -5245,6 +5279,7 @@ module Ronin
         ## Same pattern as composite_prediction at :4209-4219. In hand-tuned mode the
         ## returned vectors are empty defaults and aren't used.
         model_selected_features = Vector{Vector{Int}}()
+        model_feature_names = Vector{Vector{String}}()
         model_conv_variables = Vector{Vector{String}}()
         model_masked_conv_variables = Vector{Vector{String}}()
         model_masked_conv_kernel_types = Vector{Vector{String}}()
@@ -5254,6 +5289,7 @@ module Ronin
         for path in config.model_output_paths
             md = load_model_with_metadata(path, config.task_mode)
             push!(model_selected_features, md.selected_features)
+            push!(model_feature_names, md.feature_names)
             push!(model_conv_variables, md.conv_variables)
             push!(model_masked_conv_variables, md.masked_conv_variables)
             push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
@@ -5338,6 +5374,7 @@ module Ronin
                         result = process_single_file_conv(f, config_pred, kernel_bank;
                                                           feature_mask=feature_mask, mask_features=QC_mask)
                         X, Y, indexer = result[1], result[2], result[3]
+                        _check_feature_width(X, model_selected_features[i], model_feature_names[i], model_path, i)
                     else
                         currt = config.task_paths[i]
                         cw = config.task_weights[i]
@@ -5354,6 +5391,7 @@ module Ronin
 
                         curr_model = models[i]
                         curr_proba = config.met_probs[i]
+                        met_prob_name = "met_prob_pass_$(i)"
                         ###Here's where we need to modify. The ONLY gates that will go on to the next pass
                         ### will be the ones between the thresholds, (inclusive on both ends)
 
@@ -5399,8 +5437,20 @@ module Ronin
                         close(f)
                         ###Probably need to remove this for speed purposes... keep it in memory,
                         ###clear it for the next scan. Just pass it to QC_mask
-                        ###If this wasn't the last pass, need to write a mask for the gates to be predicted upon in the next iteration
+                        ###If this wasn't the last pass, write met_prob and mask for the next pass.
+                        ###The met_prob_pass_<i> write-back is required: subsequent passes
+                        ###(e.g. fore_mask Pass 2) consume met_prob_pass_<i> both as a plain
+                        ###conv variable and as the masked-conv met_prob field. Without it the
+                        ###masked-conv block is silently dropped, producing a too-narrow feature
+                        ###matrix and a BoundsError deep in the RF. Mirrors composite_prediction.
                         if i < config.num_models
+                            met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                            met_prob_field[indexer] .= met_probs
+                            met_prob_field = reshape(met_prob_field, scan_dims)
+                            write_field(file, met_prob_name, met_prob_field,
+                                attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                fillval=config.FILL_VAL, verbose=false)
+
                             gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
                             new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
                             ###If there are no gates of interest, write out the mask as ALL MISSINGS
@@ -5413,6 +5463,17 @@ module Ronin
                             new_mask = reshape(new_mask, scan_dims)
                             write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
                          end
+
+                        ###Save met_prob for the final pass too, so threshold sweeps /
+                        ###downstream tooling can read it back without recomputation.
+                        if i == config.num_models
+                            met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                            met_prob_field[indexer] .= met_probs
+                            met_prob_field = reshape(met_prob_field, scan_dims)
+                            write_field(file, met_prob_name, met_prob_field,
+                                attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                fillval=config.FILL_VAL, verbose=false)
+                        end
                     else
                         ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
                         ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction

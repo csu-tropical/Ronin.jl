@@ -2038,6 +2038,112 @@ end
 
         rm(workdir; recursive=true)
     end
+
+    @testset "_expected_feature_width / _check_feature_width" begin
+        ## selected_features wins when present
+        @test Ronin._expected_feature_width([1, 3, 5], ["a", "b", "c", "d"]) == 3
+        ## else fall back to full feature_names width
+        @test Ronin._expected_feature_width(Int[], ["a", "b", "c", "d"]) == 4
+        ## neither known (legacy save_object) → 0 means "skip the check"
+        @test Ronin._expected_feature_width(Int[], String[]) == 0
+
+        ## Matching width: no error
+        X_ok = zeros(Float32, 5, 4)
+        @test Ronin._check_feature_width(X_ok, Int[], ["a","b","c","d"], "m.jld2", 2) === nothing
+        ## Unknown expected width: skipped, no error
+        @test Ronin._check_feature_width(X_ok, Int[], String[], "m.jld2", 1) === nothing
+        ## Mismatch: actionable error mentioning met_prob, not a BoundsError
+        X_narrow = zeros(Float32, 5, 10)
+        err = try
+            Ronin._check_feature_width(X_narrow, Int[], ["f$(k)" for k in 1:17], "fore_mask.jld2", 2)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("Feature width mismatch", err.msg)
+        @test occursin("met_prob_pass", err.msg)
+        @test !(err isa BoundsError)
+    end
+
+    @testset "composite_QC 2-pass masked-conv (fore_mask shape) writes met_prob_pass_1" begin
+        ## Reproduces the operational fore_mask failure: Pass 2 consumes
+        ## met_prob_pass_1 as a conv variable AND as the masked-conv met_prob
+        ## field. composite_QC must write met_prob_pass_1 after Pass 1 so Pass 2
+        ## produces a full-width feature matrix (no BoundsError in the RF).
+        workdir = _orch_workdir("orch_foremask_compositeqc")
+        train_cfrad = joinpath(workdir, "train.nc")
+        create_test_cfrad(train_cfrad; range_dim=30, time_dim=40, seed=21)
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = train_cfrad,
+            experiment_name = "foremask",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "convolution",
+            conv_variables = ["DBZ", "VEL"],
+            conv_kernel_sizes = [3],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            compute_feature_importance = false,
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        ## Pass 2 adds met_prob_pass_1 as a predictor and a masked-conv block
+        ## keyed on it (masked_conv_met_prob_field auto-set to met_prob_pass_1).
+        pass_config = Dict(
+            2 => (
+                conv_variables = ["DBZ", "VEL", "met_prob_pass_1"],
+                selected_features = Int[],
+                masked_conv_variables = ["DBZ"],
+                masked_conv_kernel_types = ["mean"],
+                masked_conv_kernel_sizes = [3],
+                masked_conv_threshold = 0.1f0,
+            ),
+        )
+
+        Ronin.train_multi_model(config; pass_config=pass_config)
+        @test isfile(model1)
+        @test isfile(model2)
+
+        ## Run operational QC on a FRESH (unseen) scan via composite_QC 3-arg.
+        infer_cfrad = joinpath(workdir, "infer.nc")
+        create_test_cfrad(infer_cfrad; range_dim=30, time_dim=40, seed=99)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        ## Would BoundsError in apply_tree before the fix.
+        Ronin.composite_QC(config, [infer_cfrad], models)
+
+        NCDataset(infer_cfrad) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "met_prob_pass_2")
+            @test haskey(ds, "mask_pass_1")
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+            @test haskey(ds, "ZZ" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
 end
 
 ###############################################################################
