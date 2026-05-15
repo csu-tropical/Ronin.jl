@@ -1044,6 +1044,59 @@ end
         @test length(bank) == 4
     end
 
+    @testset "build_filtered_kernel_bank: silent size-restricted skips" begin
+        types = ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"]
+        sizes = [3, 5, 7]
+
+        ## Size-restricted Cartesian-product combos are skipped silently (the
+        ## per-scan log spam this change removes). We assert the *behavior* —
+        ## the correct subset is built — rather than log-absence, to avoid
+        ## pulling the Logging stdlib into the test deps. The skipped set is
+        ## independently characterized in "masked_conv_skipped_combos" below.
+        bank = Ronin.build_filtered_kernel_bank(types, sizes)
+
+        ## Built set: mean@{3,5,7}, gaussian@{5,7}, laplacian@3,
+        ## sobel_range@3, sobel_azi@3  = 3 + 2 + 1 + 1 + 1 = 8
+        @test length(bank) == 8
+        names = [k.name for k in bank]
+        @test "mean_3x3" in names
+        @test "gaussian_5x5" in names && "gaussian_7x7" in names
+        @test "laplacian_3x3" in names
+        @test !("gaussian_3x3" in names)
+        @test !any(n -> startswith(n, "laplacian_5") || startswith(n, "laplacian_7"), names)
+
+        ## Unknown kernel type is still a hard error (genuine misconfig).
+        @test_throws ErrorException Ronin.build_filtered_kernel_bank(["bogus"], [3])
+    end
+
+    @testset "masked_conv_skipped_combos" begin
+        ## Size-restricted kernels at non-canonical sizes are reported.
+        skipped = Ronin.masked_conv_skipped_combos(
+            ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"], [3, 5, 7])
+        @test ("gaussian", 3) in skipped
+        @test ("laplacian", 5) in skipped
+        @test ("laplacian", 7) in skipped
+        @test ("sobel_range", 5) in skipped
+        @test ("sobel_azi", 7) in skipped
+        ## Valid combinations are NOT reported as skipped.
+        @test !(("mean", 3) in skipped)
+        @test !(("mean", 7) in skipped)
+        @test !(("gaussian", 5) in skipped)
+        @test !(("laplacian", 3) in skipped)
+        @test !(("sobel_azi", 3) in skipped)
+
+        ## All-valid config → nothing skipped.
+        @test isempty(Ronin.masked_conv_skipped_combos(["mean"], [3, 5, 7]))
+        @test isempty(Ronin.masked_conv_skipped_combos(["gaussian"], [5, 7]))
+
+        ## Reported set is exactly the complement of what the bank builds.
+        types = ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"]
+        sizes = [3, 5, 7]
+        n_total = length(types) * length(sizes)
+        n_built = length(Ronin.build_filtered_kernel_bank(types, sizes))
+        @test length(Ronin.masked_conv_skipped_combos(types, sizes)) == n_total - n_built
+    end
+
     @testset "Gaussian kernel properties" begin
         g = Ronin._gaussian_kernel(5)
         @test size(g) == (5, 5)

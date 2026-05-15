@@ -59,7 +59,17 @@ end
     build_filtered_kernel_bank(kernel_types::Vector{String}, kernel_sizes::Vector{Int})
 
 Build a kernel bank from the Cartesian product of `kernel_types` and `kernel_sizes`.
-Invalid combinations (e.g., laplacian at 5x5, gaussian at 3x3) are skipped with a warning.
+
+Some kernel types are size-restricted **by design** — `laplacian`,
+`sobel_range`, and `sobel_azi` are only the canonical 3x3 stencils, and
+`gaussian` is only built at sizes >= 5 (a 3x3 Gaussian with the default sigma
+is degenerate and redundant with `mean_3x3`). Those Cartesian-product
+combinations are skipped **silently** here: callers pass arrays of sizes and
+expect to get the valid subset, so a per-call warning would be log spam
+(this runs once per scan per pass). The skipped set is reported once at the
+start of training via [`masked_conv_skipped_combos`]; it is deterministic
+from config, never data-dependent. An unknown kernel type is still a hard
+error.
 
 Supported kernel types: "mean", "gaussian", "laplacian", "sobel_range", "sobel_azi".
 """
@@ -73,33 +83,56 @@ function build_filtered_kernel_bank(kernel_types::Vector{String}, kernel_sizes::
             elseif ktype == "laplacian"
                 if k == 3
                     push!(bank, ConvolutionKernel("laplacian_3x3", Float32[0 1 0; 1 -4 1; 0 1 0]))
-                else
-                    @warn "Laplacian only supported at 3x3, skipping $(k)x$(k)"
                 end
+                # else: size-restricted by design — see masked_conv_skipped_combos
             elseif ktype == "sobel_range"
                 if k == 3
                     push!(bank, ConvolutionKernel("sobel_range_3x3", Float32[-1 -2 -1; 0 0 0; 1 2 1]))
-                else
-                    @warn "Sobel range only supported at 3x3, skipping $(k)x$(k)"
                 end
+                # else: size-restricted by design — see masked_conv_skipped_combos
             elseif ktype == "sobel_azi"
                 if k == 3
                     push!(bank, ConvolutionKernel("sobel_azi_3x3", Float32[-1 0 1; -2 0 2; -1 0 1]))
-                else
-                    @warn "Sobel azi only supported at 3x3, skipping $(k)x$(k)"
                 end
+                # else: size-restricted by design — see masked_conv_skipped_combos
             elseif ktype == "gaussian"
                 if k >= 5
                     push!(bank, ConvolutionKernel("gaussian_$(k)x$(k)", _gaussian_kernel(k)))
-                else
-                    @warn "Gaussian only supported at sizes >= 5, skipping $(k)x$(k)"
                 end
+                # else: size-restricted by design — see masked_conv_skipped_combos
             else
                 error("Unknown kernel type: $(ktype). Supported: mean, gaussian, laplacian, sobel_range, sobel_azi")
             end
         end
     end
     return bank
+end
+
+"""
+    masked_conv_skipped_combos(kernel_types, kernel_sizes) -> Vector{Tuple{String,Int}}
+
+Return the `(kernel_type, size)` pairs that `build_filtered_kernel_bank` skips
+**by design** because that kernel type is size-restricted:
+
+- `laplacian`, `sobel_range`, `sobel_azi` exist only at 3x3
+- `gaussian` exists only at sizes >= 5
+
+This is purely a reporting helper so training can surface the skipped set once
+(it is fully determined by config, not by data). The size rules below MUST be
+kept in sync with `build_filtered_kernel_bank` above. Unknown kernel types are
+intentionally not flagged here — `build_filtered_kernel_bank` errors on them.
+"""
+function masked_conv_skipped_combos(kernel_types::Vector{String}, kernel_sizes::Vector{Int})
+    skipped = Tuple{String, Int}[]
+    for ktype in kernel_types
+        for k in kernel_sizes
+            if (ktype in ("laplacian", "sobel_range", "sobel_azi") && k != 3) ||
+               (ktype == "gaussian" && k < 5)
+                push!(skipped, (ktype, k))
+            end
+        end
+    end
+    return skipped
 end
 
 """

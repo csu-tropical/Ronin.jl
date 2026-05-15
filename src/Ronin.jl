@@ -2512,6 +2512,20 @@ module Ronin
                 printstyled("  Pass $(i) config: $(length(config.conv_variables)) conv_variables, " *
                             "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features$(masked_info)\n",
                             color=:cyan)
+
+                ## One-time, training-only note: which masked-conv (type@size)
+                ## combinations are skipped by design. Reported here (not per
+                ## scan in build_filtered_kernel_bank) so operational QC runs
+                ## stay quiet; it is fully determined by config, not data.
+                if !isempty(config.masked_conv_variables)
+                    skipped = masked_conv_skipped_combos(config.masked_conv_kernel_types,
+                                                         config.masked_conv_kernel_sizes)
+                    if !isempty(skipped)
+                        combo_str = join(["$(t)@$(k)x$(k)" for (t, k) in skipped], ", ")
+                        printstyled("    Note: size-restricted masked-conv kernels not built by design: " *
+                                    "$(combo_str). Expected — not an error.\n", color=:light_black)
+                    end
+                end
             end
 
             out = config.feature_output_paths[i]
