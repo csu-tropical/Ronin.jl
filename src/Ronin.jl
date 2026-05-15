@@ -18,12 +18,12 @@ module Ronin
     using DataStructures
 
 
-    export get_NCP, airborne_ht, prob_groundgate
+    export airborne_ht, prob_groundgate
     export calc_avg, calc_std, calc_iso, process_single_file
     export parse_directory, get_num_tasks, get_task_params, remove_validation
     export calculate_features, calculate_features_conv
     export split_training_testing!, split_training_testing_validation!
-    export QC_scan, get_QC_mask
+    export QC_scan
     export evaluate_model, get_feature_importance, train_model
     export train_multi_model, train_single_pass, regenerate_masks, ModelConfig, make_config, composite_prediction, get_contingency, compute_balanced_class_weights
     export write_field, characterize_misclassified_gates, composite_QC
@@ -344,8 +344,20 @@ module Ronin
     ```julia
     task_mode::String
     ```
-    Whether to obtain feature tasks from a set of input files or user specified vector of strings. Planned to be implemented in a future release.
-    For now, codebase behavior is agnostic to its value.
+    Selects the feature-engineering regime. Codebase behavior is **not** agnostic
+    to this value — it branches across training, prediction, QC, and mask
+    generation:
+
+    - `task_mode == "convolution"` — convolution feature mode. Features are
+      derived from a kernel bank applied to `conv_variables` (plus appended
+      AHT/ELV/RNG/NRG scalars); see the Convolution Feature Mode documentation.
+      `run_hypertuning` requires this mode.
+    - `task_mode == ""` (or any value other than `"convolution"`) — legacy
+      hand-tuned predictor mode. Features come from the `task_paths` /
+      `task_weights` predictor specification (STD/ISO/AVG/RNG/NRG/PGG/AHT); see
+      the Legacy Hand-Tuned Mode documentation.
+
+    `regenerate_masks` is the only mode-agnostic pass utility.
 
     ```julia
     file_preprocessed::Vector{Bool}
@@ -1527,6 +1539,34 @@ module Ronin
                     n_trees=n_trees, max_depth=max_depth, class_weights=class_weights)
     end
 
+    """
+        train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
+                     verify=false, verify_out="model_verification.h5",
+                     n_trees=21, max_depth=14,
+                     class_weights=Float32[1., 2.], max_threads=Threads.nthreads())
+
+    In-memory overload of [`train_model`](@ref): fit a `DecisionTree`
+    `RandomForestClassifier` directly on a feature matrix `X` and target vector
+    `Y` instead of reading them from an HDF5 file.
+
+    # Arguments
+    - `X`: feature matrix (rows = gates/samples, columns = features).
+    - `Y`: target labels (`1`/`true` = meteorological, `0`/`false` = non-met),
+      reshaped to a vector internally.
+    - `model_location`: path the fitted model is written to via `save_object`.
+
+    # Keywords
+    - `n_trees`, `max_depth`: random-forest hyperparameters.
+    - `class_weights`: per-sample weight vector; must match `length(Y)` or it is
+      ignored (with a warning) and uniform weights are used.
+    - `verify` / `verify_out`: when `verify`, write predicted vs. true labels to
+      the `verify_out` HDF5 file.
+    - `max_threads`: cap on fitting threads (defaults to all available).
+
+    Prints training accuracy and timing. The file-path method
+    `train_model(input_h5, model_location; ...)` simply loads `X`/`Y` (with
+    optional `row_subset`/`col_subset`) and delegates here.
+    """
     function train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
                         verify::Bool=false, verify_out::String="model_verification.h5",
                         n_trees::Int = 21, max_depth::Int=14, class_weights::Vector{Float32} = Vector{Float32}([1.f0,2.f0]),
@@ -1825,6 +1865,39 @@ module Ronin
 
 
 
+    """
+        split_training_testing_validation!(DIR_PATHS::Vector{String},
+                                            TRAINING_PATH::String,
+                                            TESTING_PATH::String,
+                                            VALIDATION_PATH::String)
+
+    Split a directory or set of directories of cfradial files into **training,
+    testing, and held-out validation** sets, following the methodology of
+    DesRosiers and Bell 2023. This is the three-way analogue of
+    [`split_training_testing!`](@ref): it additionally carves out a validation
+    partition for unbiased final evaluation.
+
+    The default split is **72% training / 20% testing / 8% validation**. As with
+    the two-way split, this function assumes input directories contain only
+    cfradial files following standard naming conventions (thus implicitly
+    chronologically ordered), divides each case into several sections to limit
+    temporal autocorrelation while maximizing variance, and **softlinks** the
+    files into the destination directories.
+
+    An important note: always use absolute paths — relative paths break the
+    symlinks.
+
+    # Required Arguments
+    - `DIR_PATHS::Vector{String}`: directories of cfradials to split. Each
+      directory is treated as a distinct case.
+    - `TRAINING_PATH::String`: directory to softlink training files into.
+    - `TESTING_PATH::String`: directory to softlink testing files into.
+    - `VALIDATION_PATH::String`: directory to softlink the held-out validation
+      files into.
+
+    The destination directories are removed and recreated, so any existing
+    contents are discarded.
+    """
     function split_training_testing_validation!(DIR_PATHS::Vector{String}, TRAINING_PATH::String, TESTING_PATH::String, VALIDATION_PATH::String)
 
         ###TODO  - make sure to ignore .tmp_hawkedit files OTHERWISE WON'T WORK AS EXPECTED
@@ -4710,9 +4783,7 @@ module Ronin
         * `filepath::String` Name of netCDF file to write data to
         * `fieldname::String` What to call the data in the netCDF
         * `NEW_FIELD` Data dimensioned by `dim_names` to write to netCDF
-
     """
-
     function write_field(filepath::String, fieldname::String, NEW_FIELD; overwrite::Bool = true,
                 attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::T = FILL_VAL) where T <: Real
 
