@@ -1044,6 +1044,59 @@ end
         @test length(bank) == 4
     end
 
+    @testset "build_filtered_kernel_bank: silent size-restricted skips" begin
+        types = ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"]
+        sizes = [3, 5, 7]
+
+        ## Size-restricted Cartesian-product combos are skipped silently (the
+        ## per-scan log spam this change removes). We assert the *behavior* —
+        ## the correct subset is built — rather than log-absence, to avoid
+        ## pulling the Logging stdlib into the test deps. The skipped set is
+        ## independently characterized in "masked_conv_skipped_combos" below.
+        bank = Ronin.build_filtered_kernel_bank(types, sizes)
+
+        ## Built set: mean@{3,5,7}, gaussian@{5,7}, laplacian@3,
+        ## sobel_range@3, sobel_azi@3  = 3 + 2 + 1 + 1 + 1 = 8
+        @test length(bank) == 8
+        names = [k.name for k in bank]
+        @test "mean_3x3" in names
+        @test "gaussian_5x5" in names && "gaussian_7x7" in names
+        @test "laplacian_3x3" in names
+        @test !("gaussian_3x3" in names)
+        @test !any(n -> startswith(n, "laplacian_5") || startswith(n, "laplacian_7"), names)
+
+        ## Unknown kernel type is still a hard error (genuine misconfig).
+        @test_throws ErrorException Ronin.build_filtered_kernel_bank(["bogus"], [3])
+    end
+
+    @testset "masked_conv_skipped_combos" begin
+        ## Size-restricted kernels at non-canonical sizes are reported.
+        skipped = Ronin.masked_conv_skipped_combos(
+            ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"], [3, 5, 7])
+        @test ("gaussian", 3) in skipped
+        @test ("laplacian", 5) in skipped
+        @test ("laplacian", 7) in skipped
+        @test ("sobel_range", 5) in skipped
+        @test ("sobel_azi", 7) in skipped
+        ## Valid combinations are NOT reported as skipped.
+        @test !(("mean", 3) in skipped)
+        @test !(("mean", 7) in skipped)
+        @test !(("gaussian", 5) in skipped)
+        @test !(("laplacian", 3) in skipped)
+        @test !(("sobel_azi", 3) in skipped)
+
+        ## All-valid config → nothing skipped.
+        @test isempty(Ronin.masked_conv_skipped_combos(["mean"], [3, 5, 7]))
+        @test isempty(Ronin.masked_conv_skipped_combos(["gaussian"], [5, 7]))
+
+        ## Reported set is exactly the complement of what the bank builds.
+        types = ["mean", "gaussian", "laplacian", "sobel_range", "sobel_azi"]
+        sizes = [3, 5, 7]
+        n_total = length(types) * length(sizes)
+        n_built = length(Ronin.build_filtered_kernel_bank(types, sizes))
+        @test length(Ronin.masked_conv_skipped_combos(types, sizes)) == n_total - n_built
+    end
+
     @testset "Gaussian kernel properties" begin
         g = Ronin._gaussian_kernel(5)
         @test size(g) == (5, 5)
@@ -1687,6 +1740,462 @@ end
         @test hasmethod(Ronin.calculate_features,
                         Tuple{String, Vector{String},
                               Vector{Matrix{Union{Missing, Float64}}}, String, Bool})
+    end
+end
+
+###############################################################################
+# Convolution-mode orchestration: composite_prediction / composite_QC / QC_scan
+#
+# Guards against regressions where these orchestration functions assumed the
+# hand-tuned (task_paths) feature path and crashed under task_mode="convolution".
+# Each subtest stands up a minimal trained 1-pass convolution model on a
+# synthetic CfRadial, then drives a top-level entry point and asserts the
+# QC field was written back.
+###############################################################################
+
+# Helper: build a writable temporary directory under the test scratchspace
+function _orch_workdir(name::String)
+    dir = joinpath(test_scratchspace, name)
+    isdir(dir) && rm(dir; recursive=true)
+    mkpath(dir)
+    return dir
+end
+
+# Helper: train a 1-pass convolution model on a fresh synthetic CfRadial and
+# return (config, cfrad_path). The model JLD2 is written to disk with metadata,
+# and met_prob_pass_1 / mask_pass_1 fields end up in the CfRadial.
+function _train_smoke_conv_model(workdir::String)
+    cfrad_path = joinpath(workdir, "smoke.nc")
+    create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=7)
+
+    model_path = joinpath(workdir, "model_pass1.jld2")
+    feat_path  = joinpath(workdir, "feat_pass1.h5")
+
+    config = Ronin.make_config(;
+        num_models = 1,
+        input_path = cfrad_path,
+        experiment_name = "smoke_conv",
+        model_output_paths = [model_path],
+        feature_output_paths = [feat_path],
+        mask_names = ["mask_pass_0"],
+        met_probs = [(0.1f0, 0.9f0)],
+        file_preprocessed = [false],
+        task_mode = "convolution",
+        conv_variables = ["DBZ", "VEL"],
+        conv_kernel_sizes = [3],
+        HAS_INTERACTIVE_QC = true,
+        QC_var = "VG",
+        remove_var = "VV",
+        REMOVE_LOW_SIG_QUALITY = false,
+        REMOVE_HIGH_PGG = false,
+        SIG_QUALITY_VAR = "NCP",
+        n_trees = 5,
+        max_depth = 4,
+        class_weights = "balanced",
+        compute_feature_importance = false,
+        write_out = true,
+        verbose = false,
+        overwrite_output = true,
+    )
+
+    Ronin.train_multi_model(config)
+    return config, cfrad_path
+end
+
+# Helper: train a 1-pass hand-tuned model — keeps the 1.1.0 task_paths path
+# under test alongside the convolution path so the convolution branch
+# refactor cannot silently regress the legacy mode.
+function _train_smoke_handtuned_model(workdir::String)
+    cfrad_path = joinpath(workdir, "smoke_ht.nc")
+    create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=11)
+
+    model_path = joinpath(workdir, "model_ht_pass1.jld2")
+    feat_path  = joinpath(workdir, "feat_ht_pass1.h5")
+    tasks_path = joinpath(workdir, "tasks_pass1.txt")
+    create_test_config(tasks_path, "DBZ, VEL, NCP")
+
+    config = Ronin.make_config(;
+        num_models = 1,
+        input_path = cfrad_path,
+        experiment_name = "smoke_ht",
+        model_output_paths = [model_path],
+        feature_output_paths = [feat_path],
+        mask_names = ["mask_pass_0"],
+        met_probs = [(0.1f0, 0.9f0)],
+        file_preprocessed = [false],
+        task_mode = "",
+        task_paths = Union{String,Vector{String}}[tasks_path],
+        task_weights = [[Matrix{Union{Missing,Float32}}(undef, 0, 0)]],
+        HAS_INTERACTIVE_QC = true,
+        QC_var = "VG",
+        remove_var = "VV",
+        REMOVE_LOW_SIG_QUALITY = false,
+        REMOVE_HIGH_PGG = false,
+        SIG_QUALITY_VAR = "NCP",
+        n_trees = 5,
+        max_depth = 4,
+        class_weights = "balanced",
+        write_out = true,
+        verbose = false,
+        overwrite_output = true,
+    )
+
+    Ronin.train_multi_model(config)
+    return config, cfrad_path
+end
+
+@testset "Convolution mode orchestration" begin
+
+    @testset "Assertion shape: QC_scan inner does not require task_paths length in convolution mode" begin
+        ## Regression for the second user-visible crash: in convolution mode,
+        ## task_paths defaults to [""] while mask_names has num_models entries.
+        ## The inner per-file QC_scan must not assert task_paths length.
+        cfg = Ronin.make_config(
+            num_models = 2,
+            input_path = "/nonexistent",
+            experiment_name = "shape",
+            task_mode = "convolution",
+        )
+        @test length(cfg.task_paths) == 1
+        @test length(cfg.mask_names) == 2
+        ## Just exercise the assertion: passing a path that won't open should
+        ## fail *after* the assertion, on the NCDataset open, not at the assert.
+        err = try
+            Ronin.QC_scan(cfg, "/no/such/file.nc", Bool[], Bool[])
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        @test !(err isa AssertionError)
+    end
+
+    @testset "composite_prediction QC_mode=true (convolution)" begin
+        workdir = _orch_workdir("orch_compred_qc_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## Calling with QC_mode=true must not throw and must write a *_QC field.
+        Ronin.composite_prediction(config; write_predictions_out=false, QC_mode=true)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+            @test haskey(ds, "ZZ" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "QC_scan(config) (convolution)" begin
+        workdir = _orch_workdir("orch_qcscan_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## QC_scan(config) is the workflow-level entry point. Must not hit the
+        ## task_paths-length assertion in convolution mode.
+        Ronin.QC_scan(config)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 3-arg (convolution)" begin
+        workdir = _orch_workdir("orch_compositeqc3_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        Ronin.composite_QC(config, [cfrad_path], models)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 2-arg (convolution)" begin
+        workdir = _orch_workdir("orch_compositeqc2_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        Ronin.composite_QC(config, [cfrad_path])
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 3-arg (hand-tuned task_paths) — back-compat" begin
+        ## Locks in 1.1.0 behavior: the hand-tuned path must remain working
+        ## after the convolution branch refactor.
+        workdir = _orch_workdir("orch_compositeqc3_ht")
+        config, cfrad_path = _train_smoke_handtuned_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "") for p in config.model_output_paths
+        ]
+        Ronin.composite_QC(config, [cfrad_path], models)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "QC_scan(config) (hand-tuned) — back-compat" begin
+        workdir = _orch_workdir("orch_qcscan_ht")
+        config, cfrad_path = _train_smoke_handtuned_model(workdir)
+
+        Ronin.QC_scan(config)
+
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "construct_next_pass_features (convolution)" begin
+        workdir = _orch_workdir("orch_cnpf_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## Pass index 1 on a 1-pass model: features get written to
+        ## feature_output_paths[1], no mask gets written for a "next" pass.
+        Ronin.construct_next_pass_features(config, 1; write_out=true)
+
+        @test isfile(config.feature_output_paths[1])
+        h5open(config.feature_output_paths[1]) do f
+            @test haskey(f, "X")
+            @test haskey(f, "Y")
+            @test size(f["X"][:,:], 1) > 0
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "train_multi_model 2-pass (hand-tuned) — regression for md UndefVarError" begin
+        ## Hand-tuned multi-pass training used to crash in the inter-pass mask
+        ## block at src/Ronin.jl:2683 with `UndefVarError: md not defined`
+        ## because the diagnostic referenced `md.selected_features` outside the
+        ## convolution branch that binds `md`. This test trains a 2-pass
+        ## hand-tuned cascade end-to-end; if it succeeds and writes the mask
+        ## field for Pass 2, the regression is fixed.
+        workdir = _orch_workdir("orch_multipass_ht")
+        cfrad_path = joinpath(workdir, "smoke_mp.nc")
+        create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=13)
+
+        tasks1_path = joinpath(workdir, "tasks_pass1.txt")
+        tasks2_path = joinpath(workdir, "tasks_pass2.txt")
+        create_test_config(tasks1_path, "DBZ, VEL, NCP")
+        create_test_config(tasks2_path, "DBZ, NCP, RNG")
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = cfrad_path,
+            experiment_name = "mp_ht",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "",
+            task_paths = Union{String,Vector{String}}[tasks1_path, tasks2_path],
+            task_weights = [
+                [Matrix{Union{Missing,Float32}}(undef, 0, 0)],
+                [Matrix{Union{Missing,Float32}}(undef, 0, 0)],
+            ],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        Ronin.train_multi_model(config)
+
+        @test isfile(model1)
+        @test isfile(model2)
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "mask_pass_1")
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "train_multi_model 2-pass (convolution) — lock-in" begin
+        ## Companion to the hand-tuned regression test: the convolution branch
+        ## was already binding `md`, but we lacked coverage for any multi-pass
+        ## training path. This locks in the working state.
+        workdir = _orch_workdir("orch_multipass_conv")
+        cfrad_path = joinpath(workdir, "smoke_mp_conv.nc")
+        create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=17)
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = cfrad_path,
+            experiment_name = "mp_conv",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "convolution",
+            conv_variables = ["DBZ", "VEL"],
+            conv_kernel_sizes = [3],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            compute_feature_importance = false,
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        Ronin.train_multi_model(config)
+
+        @test isfile(model1)
+        @test isfile(model2)
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "mask_pass_1")
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "_expected_feature_width / _check_feature_width" begin
+        ## selected_features wins when present
+        @test Ronin._expected_feature_width([1, 3, 5], ["a", "b", "c", "d"]) == 3
+        ## else fall back to full feature_names width
+        @test Ronin._expected_feature_width(Int[], ["a", "b", "c", "d"]) == 4
+        ## neither known (legacy save_object) → 0 means "skip the check"
+        @test Ronin._expected_feature_width(Int[], String[]) == 0
+
+        ## Matching width: no error
+        X_ok = zeros(Float32, 5, 4)
+        @test Ronin._check_feature_width(X_ok, Int[], ["a","b","c","d"], "m.jld2", 2) === nothing
+        ## Unknown expected width: skipped, no error
+        @test Ronin._check_feature_width(X_ok, Int[], String[], "m.jld2", 1) === nothing
+        ## Mismatch: actionable error mentioning met_prob, not a BoundsError
+        X_narrow = zeros(Float32, 5, 10)
+        err = try
+            Ronin._check_feature_width(X_narrow, Int[], ["f$(k)" for k in 1:17], "fore_mask.jld2", 2)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("Feature width mismatch", err.msg)
+        @test occursin("met_prob_pass", err.msg)
+        @test !(err isa BoundsError)
+    end
+
+    @testset "composite_QC 2-pass masked-conv (fore_mask shape) writes met_prob_pass_1" begin
+        ## Reproduces the operational fore_mask failure: Pass 2 consumes
+        ## met_prob_pass_1 as a conv variable AND as the masked-conv met_prob
+        ## field. composite_QC must write met_prob_pass_1 after Pass 1 so Pass 2
+        ## produces a full-width feature matrix (no BoundsError in the RF).
+        workdir = _orch_workdir("orch_foremask_compositeqc")
+        train_cfrad = joinpath(workdir, "train.nc")
+        create_test_cfrad(train_cfrad; range_dim=30, time_dim=40, seed=21)
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = train_cfrad,
+            experiment_name = "foremask",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "convolution",
+            conv_variables = ["DBZ", "VEL"],
+            conv_kernel_sizes = [3],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            compute_feature_importance = false,
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        ## Pass 2 adds met_prob_pass_1 as a predictor and a masked-conv block
+        ## keyed on it (masked_conv_met_prob_field auto-set to met_prob_pass_1).
+        pass_config = Dict(
+            2 => (
+                conv_variables = ["DBZ", "VEL", "met_prob_pass_1"],
+                selected_features = Int[],
+                masked_conv_variables = ["DBZ"],
+                masked_conv_kernel_types = ["mean"],
+                masked_conv_kernel_sizes = [3],
+                masked_conv_threshold = 0.1f0,
+            ),
+        )
+
+        Ronin.train_multi_model(config; pass_config=pass_config)
+        @test isfile(model1)
+        @test isfile(model2)
+
+        ## Run operational QC on a FRESH (unseen) scan via composite_QC 3-arg.
+        infer_cfrad = joinpath(workdir, "infer.nc")
+        create_test_cfrad(infer_cfrad; range_dim=30, time_dim=40, seed=99)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        ## Would BoundsError in apply_tree before the fix.
+        Ronin.composite_QC(config, [infer_cfrad], models)
+
+        NCDataset(infer_cfrad) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "met_prob_pass_2")
+            @test haskey(ds, "mask_pass_1")
+            @test haskey(ds, "VV" * config.QC_SUFFIX)
+            @test haskey(ds, "ZZ" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
     end
 end
 

@@ -94,7 +94,22 @@ end
 
 
 """
-Function to calculate the height of a given gate 
+    airborne_ht(elevation_angle::Float32, antenna_range::Float32, aircraft_height::Float32)
+
+Earth-curvature-corrected height of a radar gate above mean sea level for an
+airborne (or elevated) platform.
+
+# Arguments
+- `elevation_angle`: beam elevation angle in **degrees** (positive above the horizon).
+- `antenna_range`: slant range from the antenna to the gate in **metres**.
+- `aircraft_height`: platform height above mean sea level in **metres**.
+
+# Returns
+The gate height in **kilometres**, accounting for the curvature of the Earth
+(`Ronin.EarthRadiusKm`) using the standard 4/3-Earth-style geometric relation.
+
+This is the per-gate kernel behind the `AHT` derived feature; `calc_aht`
+applies it across a full sweep grid.
 """
 function airborne_ht(elevation_angle::Float32, antenna_range::Float32, aircraft_height::Float32)
     ##Initial heights are in meters, convert to km 
@@ -106,6 +121,30 @@ function airborne_ht(elevation_angle::Float32, antenna_range::Float32, aircraft_
 end 
 
 
+"""
+    prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimuth)
+
+Geometric probability that a radar gate is contaminated by the ground (the `PGG`
+derived feature, per-gate kernel).
+
+Uses the beam/ground intersection geometry of Testud et al. to decide whether the
+beam can physically reach the surface, then attenuates by a Gaussian beam pattern
+(half-power beamwidth `Ronin.beamwidth`) of the offset between the beam axis and
+the ground-grazing elevation.
+
+# Arguments
+- `elevation_angle`: beam elevation angle in **degrees** (negative points toward the ground).
+- `antenna_range`: slant range to the gate in **metres**.
+- `aircraft_height`: platform height above the surface in **metres**.
+- `azimuth`: beam azimuth in **degrees**.
+
+# Returns
+A probability in `[0, 1]` (`1` = certainly ground), or `missing` if any input is
+`missing`. Returns `0` early when the gate geometrically cannot intersect the
+ground (range shorter than platform height, or elevation at/above the horizon).
+
+`calc_pgg` applies this across a full sweep grid.
+"""
 function prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimuth)
 
     if (ismissing(elevation_angle) || ismissing(antenna_range) || ismissing(aircraft_height) || ismissing(azimuth)) 
@@ -147,7 +186,24 @@ function prob_groundgate(elevation_angle, antenna_range, aircraft_height, azimut
 end 
 
 
-##Calculate the windowed standard deviation of a given variablevariable 
+"""
+    calc_std(var::AbstractMatrix; weights = std_weights, window = std_window)
+
+Windowed standard deviation of a radar field — the `STD(var)` spatial reducer
+used by both the convolution and legacy hand-tuned feature modes.
+
+For each gate, the standard deviation is taken over the surrounding `window`
+neighbourhood (default `Ronin.std_window`) after element-wise multiplication by
+`weights` (default `Ronin.std_weights`). Gates whose value is `missing` are
+excluded from each window; a window that is entirely `missing` yields
+`Ronin.FILL_VAL`. Borders are padded with `missing`.
+
+The `Union{Missing, Float32}` method preserves missing-aware reduction; the
+generic-matrix method honours the global `REPLACE_MISSING_WITH_FILL` flag and
+substitutes `FILL_VAL` for missing inputs before reducing.
+
+Returns a `Float32` matrix the same size as `var`.
+"""
 function calc_std(var::AbstractMatrix{Union{Missing, Float32}}; weights = std_weights, window = std_window)
 
     rows, cols = size(var)
@@ -168,6 +224,21 @@ function calc_std(var::AbstractMatrix{}; weights = std_weights, window = std_win
     @inbounds mapwindow((x) -> _weighted_func(x, weights, missing_std), var, window, border=Fill(missing))
 end 
 
+"""
+    calc_avg(var::Matrix; weights = avg_weights, window = avg_window)
+
+Windowed mean of a radar field — the `AVG(var)` spatial reducer used by both the
+convolution and legacy hand-tuned feature modes.
+
+For each gate, the mean is taken over the surrounding `window` neighbourhood
+(default `Ronin.avg_window`) after element-wise multiplication by `weights`
+(default `Ronin.avg_weights`). Gates whose value is `missing` are excluded from
+each window; a window that is entirely `missing` yields `Ronin.FILL_VAL`.
+Borders are padded with `missing`. The global `REPLACE_MISSING_WITH_FILL` flag,
+when set, substitutes `FILL_VAL` for missing inputs before reducing.
+
+Returns a `Float32` matrix the same size as `var`.
+"""
 function calc_avg(var::Matrix{Union{Missing, Float32}}; weights = avg_weights, window = avg_window)
 
     if ( REPLACE_MISSING_WITH_FILL)
@@ -230,6 +301,22 @@ function calc_elv(cfrad::NCDataset)
 
 end 
 
+"""
+    get_num_tasks(params_file; delimeter = ",")
+
+Count the number of predictor tasks declared in a legacy hand-tuned-mode
+configuration file.
+
+`params_file` is a path to a config file (e.g. `config.txt`) where each
+non-comment line lists `delimeter`-separated predictor tasks such as
+`STD(VEL),AVG(ZZ),PGG`. Lines beginning with `#` are treated as comments and
+skipped; empty tokens are not counted.
+
+Returns the total number of tasks as an `Int`. This is legacy-mode
+(`task_mode = ""`) machinery only — convolution mode derives its own feature
+count via `get_convolution_feature_count`. A second method,
+`get_num_tasks(tasks::Vector{String})`, simply returns `length(tasks)`.
+"""
 function get_num_tasks(params_file; delimeter = ",")
 
     tasks = readlines(params_file)
