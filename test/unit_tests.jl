@@ -1924,6 +1924,120 @@ end
 
         rm(workdir; recursive=true)
     end
+
+    @testset "train_multi_model 2-pass (hand-tuned) — regression for md UndefVarError" begin
+        ## Hand-tuned multi-pass training used to crash in the inter-pass mask
+        ## block at src/Ronin.jl:2683 with `UndefVarError: md not defined`
+        ## because the diagnostic referenced `md.selected_features` outside the
+        ## convolution branch that binds `md`. This test trains a 2-pass
+        ## hand-tuned cascade end-to-end; if it succeeds and writes the mask
+        ## field for Pass 2, the regression is fixed.
+        workdir = _orch_workdir("orch_multipass_ht")
+        cfrad_path = joinpath(workdir, "smoke_mp.nc")
+        create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=13)
+
+        tasks1_path = joinpath(workdir, "tasks_pass1.txt")
+        tasks2_path = joinpath(workdir, "tasks_pass2.txt")
+        create_test_config(tasks1_path, "DBZ, VEL, NCP")
+        create_test_config(tasks2_path, "DBZ, NCP, RNG")
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = cfrad_path,
+            experiment_name = "mp_ht",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "",
+            task_paths = Union{String,Vector{String}}[tasks1_path, tasks2_path],
+            task_weights = [
+                [Matrix{Union{Missing,Float32}}(undef, 0, 0)],
+                [Matrix{Union{Missing,Float32}}(undef, 0, 0)],
+            ],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        Ronin.train_multi_model(config)
+
+        @test isfile(model1)
+        @test isfile(model2)
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "mask_pass_1")
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "train_multi_model 2-pass (convolution) — lock-in" begin
+        ## Companion to the hand-tuned regression test: the convolution branch
+        ## was already binding `md`, but we lacked coverage for any multi-pass
+        ## training path. This locks in the working state.
+        workdir = _orch_workdir("orch_multipass_conv")
+        cfrad_path = joinpath(workdir, "smoke_mp_conv.nc")
+        create_test_cfrad(cfrad_path; range_dim=30, time_dim=40, seed=17)
+
+        model1 = joinpath(workdir, "model_pass1.jld2")
+        model2 = joinpath(workdir, "model_pass2.jld2")
+        feat1  = joinpath(workdir, "feat_pass1.h5")
+        feat2  = joinpath(workdir, "feat_pass2.h5")
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = cfrad_path,
+            experiment_name = "mp_conv",
+            model_output_paths = [model1, model2],
+            feature_output_paths = [feat1, feat2],
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            file_preprocessed = [false, false],
+            task_mode = "convolution",
+            conv_variables = ["DBZ", "VEL"],
+            conv_kernel_sizes = [3],
+            HAS_INTERACTIVE_QC = true,
+            QC_var = "VG",
+            remove_var = "VV",
+            REMOVE_LOW_SIG_QUALITY = false,
+            REMOVE_HIGH_PGG = false,
+            SIG_QUALITY_VAR = "NCP",
+            n_trees = 5,
+            max_depth = 4,
+            class_weights = "balanced",
+            compute_feature_importance = false,
+            write_out = true,
+            verbose = false,
+            overwrite_output = true,
+        )
+
+        Ronin.train_multi_model(config)
+
+        @test isfile(model1)
+        @test isfile(model2)
+        NCDataset(cfrad_path) do ds
+            @test haskey(ds, "met_prob_pass_1")
+            @test haskey(ds, "mask_pass_1")
+        end
+
+        rm(workdir; recursive=true)
+    end
 end
 
 ###############################################################################

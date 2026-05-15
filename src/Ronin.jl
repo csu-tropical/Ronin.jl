@@ -2644,6 +2644,12 @@ module Ronin
                     paths = [file_path]
                 end
 
+                ## Load model metadata once (only meaningful in convolution mode).
+                ## Hand-tuned mode leaves `md` as `nothing`; downstream code must guard.
+                md = config.task_mode == "convolution" ?
+                    load_model_with_metadata(model_path, config.task_mode) :
+                    nothing
+
                 for path in paths
 
                     dims = Dataset(path) do f
@@ -2651,8 +2657,6 @@ module Ronin
                     end
 
                     if config.task_mode == "convolution"
-                        # Load metadata from model JLD2 to match what the model expects
-                        md = load_model_with_metadata(model_path, config.task_mode)
                         config_single = deepcopy(config)
                         config_single.input_path = path
                         config_single.write_out = false
@@ -2680,7 +2684,11 @@ module Ronin
                                             write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
                     end
 
-                    printstyled("  Prediction: X size=$(size(X)), model_selected_features=$(isempty(md.selected_features) ? "none" : "$(length(md.selected_features)) indices")\n", color=:cyan)
+                    if md !== nothing
+                        printstyled("  Prediction: X size=$(size(X)), model_selected_features=$(isempty(md.selected_features) ? "none" : "$(length(md.selected_features)) indices")\n", color=:cyan)
+                    else
+                        printstyled("  Prediction: X size=$(size(X))\n", color=:cyan)
+                    end
                     met_probs = DecisionTree.predict_proba(curr_model, X)
                     if size(met_probs)[2] < 2
                         throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET"))
