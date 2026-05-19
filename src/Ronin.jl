@@ -1294,7 +1294,23 @@ module Ronin
         VT = cfrad[config.remove_var][:]
         INDEXER = [!ismissing(x) for x in VT]
 
+        if length(VT) != ngates
+            fname = try; string(NCDatasets.path(cfrad)); catch; ""; end
+            throw(DimensionMismatch(
+                "remove_var '$(config.remove_var)' has $(length(VT)) gates but " *
+                "the sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
+                "has $ngates" * (isempty(fname) ? "" : " in file $fname") * "."))
+        end
+
         if mask_features
+            if length(feature_mask) != ngates
+                fname = try; string(NCDatasets.path(cfrad)); catch; ""; end
+                throw(DimensionMismatch(
+                    "QC feature mask has $(length(feature_mask)) gates but the " *
+                    "sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
+                    "has $ngates" * (isempty(fname) ? "" : " in file $fname") *
+                    ". The saved mask field does not match this file's dimensions."))
+            end
             INDEXER = [INDEXER[i] ? maskval : false for (i, maskval) in enumerate(feature_mask[:])]
         end
 
@@ -4358,15 +4374,28 @@ module Ronin
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version
         for file in files
             curr_starttime = time()
-                ###Get dimensions
+                ###Get dimensions, and detect the CfRadial contiguous ragged-array
+                ###representation (n_points / ray_start_index / ray_n_gates), which
+                ###Ronin's gridded (range × time) feature path cannot ingest.
+                ###Skip ragged files with a clear warning rather than crashing.
 
-            scan_dims = redirect_stdout(devnull) do
+            is_ragged, scan_dims = redirect_stdout(devnull) do
 
-                scan_dims = NCDataset(file) do f
-                    (dimsize(f["range"]).range, dimsize(f["time"]).time)
+                NCDataset(file) do f
+                    ragged = haskey(f.dim, "n_points") ||
+                             ("ray_n_gates" in keys(f)) ||
+                             ("ray_start_index" in keys(f))
+                    (ragged, (dimsize(f["range"]).range, dimsize(f["time"]).time))
                 end
+            end
 
-                scan_dims
+            if is_ragged
+                printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
+                            "representation), unsupported by the gridded prediction " *
+                            "path: $(file)\n         Convert to a gridded CfRadial " *
+                            "(e.g. RadxConvert -const_ngate) to process this file.\n",
+                            color=:yellow)
+                continue
             end
 
             ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
@@ -5394,9 +5423,25 @@ module Ronin
                 if isdir(file)
                     continue
                 end
-                ###Get dimensions
-                scan_dims = NCDataset(file) do f
-                    (dimsize(f["range"]).range, dimsize(f["time"]).time)
+                ###Get dimensions, and detect the CfRadial contiguous ragged-array
+                ###representation (n_points / ray_start_index / ray_n_gates), which
+                ###Ronin's gridded (range × time) feature path cannot ingest.
+                ###Skip ragged files with a clear warning rather than crashing the
+                ###whole volume/day chunk.
+                is_ragged, scan_dims = NCDataset(file) do f
+                    ragged = haskey(f.dim, "n_points") ||
+                             ("ray_n_gates" in keys(f)) ||
+                             ("ray_start_index" in keys(f))
+                    (ragged, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+                end
+
+                if is_ragged
+                    printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
+                                "representation), unsupported by the gridded QC path: " *
+                                "$(file)\n         Convert to a gridded CfRadial " *
+                                "(e.g. RadxConvert -const_ngate) to QC this file.\n",
+                                color=:yellow)
+                    continue
                 end
 
                 ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
