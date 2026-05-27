@@ -216,6 +216,96 @@ module Ronin
         end
     end
 
+    ## Internal layout adapter. Presents a single CfRadial sweep — the root of a
+    ## v1 file or one /sweep_NNNN subgroup of a v2 file — with a uniform read /
+    ## write surface. Georeference variables (altitude, latitude, longitude, ...)
+    ## live at root in v1 and in a /georeference sub-sub-group in v2; the
+    ## `georef` field routes accesses accordingly. Not exported.
+    struct SweepView
+        data::NCDataset                       # v1: root; v2: /sweep_NNNN subgroup
+        georef::Union{NCDataset, Nothing}     # v1: nothing (georef vars live in `data`); v2: data.group["georeference"]
+        sweep_name::String                    # ""  for v1, "sweep_NNNN" for v2
+    end
+
+    Base.getindex(v::SweepView, name) = v.data[name]
+    Base.haskey(v::SweepView, name)   = haskey(v.data, name)
+    Base.keys(v::SweepView)           = keys(v.data)
+    dim_size(v::SweepView, name)      = v.data.dim[name]
+
+    ## Read a georeference variable (altitude / latitude / longitude / ...)
+    ## from the correct location for this layout: root for v1, /georeference
+    ## subgroup for v2.
+    function georef(v::SweepView, name)
+        if v.georef === nothing
+            return v.data[name]
+        else
+            return v.georef[name]
+        end
+    end
+
+    ## Defensive subgroup helpers — NCDatasets exposes child groups via
+    ## `f.group`, but some older versions or edge layouts can make naive
+    ## access throw; wrap in try/catch and return safe defaults.
+    function _has_subgroup(f::NCDataset, name::AbstractString)
+        try
+            return haskey(f.group, String(name))
+        catch
+            return false
+        end
+    end
+    function _subgroup_names(f::NCDataset)
+        try
+            return [String(g) for g in keys(f.group)]
+        catch
+            return String[]
+        end
+    end
+
+    ## Return one SweepView per QC-able sweep in the file.
+    ##   :ok          → single view at the file root (v1 single- or multi-sweep
+    ##                  concatenated; today's behavior).
+    ##   :cfradial2   → one view per /sweep_NNNN group, each pointing at its
+    ##                  /georeference subgroup if present.
+    ## Throws for :ragged / :unsupported; callers are expected to classify
+    ## with `_detect_cfrad_layout` and skip those layouts before calling here.
+    function sweep_views(f::NCDataset)
+        layout, _ = _detect_cfrad_layout(f)
+        if layout == :ok
+            return [SweepView(f, nothing, "")]
+        elseif layout == :cfradial2
+            ## Prefer the spec-canonical sweep_group_name(sweep) variable if
+            ## present; otherwise discover by scanning child groups.
+            names = String[]
+            if "sweep_group_name" in keys(f)
+                try
+                    for nm in f["sweep_group_name"][:]
+                        push!(names, String(nm))
+                    end
+                catch
+                    # fall through to subgroup scan
+                end
+            end
+            if isempty(names)
+                for s in _subgroup_names(f)
+                    startswith(s, "sweep_") && push!(names, s)
+                end
+                sort!(names)
+            end
+            views = SweepView[]
+            for nm in names
+                _has_subgroup(f, nm) || continue
+                sg = f.group[nm]
+                gr = _has_subgroup(sg, "georeference") ? sg.group["georeference"] : nothing
+                push!(views, SweepView(sg, gr, nm))
+            end
+            return views
+        else
+            throw(ArgumentError("sweep_views: unsupported CfRadial layout " *
+                                ":$(layout). Filter with _detect_cfrad_layout " *
+                                "before calling sweep_views."))
+        end
+    end
+
     """
         inspect_model_configuration(path::String; io::IO=stdout)
 
