@@ -2200,6 +2200,225 @@ end
 end
 
 ###############################################################################
+# CfRadial 2.0 support: synthesized v1/v2 fixtures + equivalence test
+###############################################################################
+
+## Produce one deterministic set of sweep data, then write it into either a
+## CfRadial 1.x flat layout or a CfRadial 2.0 hierarchical (/sweep_NNNN +
+## /georeference) layout. Both files contain *identical* radar field bytes;
+## the only difference is on-disk structure. This lets us assert that
+## composite_QC produces identical outputs on the two layouts.
+function _gen_sweep_data(range_dim::Int, time_dim::Int, seed::Int)
+    rng = MersenneTwister(seed)
+    times  = collect(Float32, 1:time_dim)
+    ranges = collect(Float32, 150:150:150*range_dim)
+    alts   = fill(Float32(3000.0), time_dim)
+    elevs  = Float32.(rand(rng, collect(-20:0.5:20), time_dim))
+    azims  = Float32.(rand(rng, collect(0:1:359),  time_dim))
+    VEL    = Matrix{Union{Missing, Float32}}(Float32.(rand(rng, -30:0.1:30, range_dim, time_dim)))
+    DBZ    = Matrix{Union{Missing, Float32}}(Float32.(rand(rng, -10:0.5:65, range_dim, time_dim)))
+    NCP    = Matrix{Union{Missing, Float32}}(Float32.(rand(rng, collect(range(0.0, 1.0, length=100)), range_dim, time_dim)))
+    VG     = copy(VEL)
+    nmd_mask = rand(rng, Bool, range_dim, time_dim)
+    VG[nmd_mask] .= missing
+    return (; times, ranges, alts, elevs, azims, VEL, DBZ, NCP, VG)
+end
+
+function _write_v1_cfrad(path, data)
+    isfile(path) && rm(path)
+    ds = NCDataset(path, "c")
+    defDim(ds, "range", length(data.ranges))
+    defDim(ds, "time",  length(data.times))
+    defVar(ds, "time",      Float32, ("time",),  attrib=Dict("units"=>"seconds"))[:] = data.times
+    defVar(ds, "range",     Float32, ("range",), attrib=Dict("units"=>"m"))[:] = data.ranges
+    defVar(ds, "altitude",  Float32, ("time",),  attrib=Dict("units"=>"m"))[:] = data.alts
+    defVar(ds, "elevation", Float32, ("time",),  attrib=Dict("units"=>"degrees"))[:] = data.elevs
+    defVar(ds, "azimuth",   Float32, ("time",),  attrib=Dict("units"=>"degrees"))[:] = data.azims
+    defVar(ds, "VV",  data.VEL, ("range","time"), attrib=Dict("units"=>"m/s"))
+    defVar(ds, "VEL", data.VEL, ("range","time"), attrib=Dict("units"=>"m/s"))
+    defVar(ds, "ZZ",  data.DBZ, ("range","time"), attrib=Dict("units"=>"dBZ"))
+    defVar(ds, "DBZ", data.DBZ, ("range","time"), attrib=Dict("units"=>"dBZ"))
+    defVar(ds, "NCP", data.NCP, ("range","time"), attrib=Dict("units"=>"unitless"))
+    defVar(ds, "VG",  data.VG,  ("range","time"), attrib=Dict("units"=>"m/s"))
+    close(ds)
+    return path
+end
+
+function _write_v2_cfrad(path, sweep_data_list)
+    isfile(path) && rm(path)
+    ds = NCDataset(path, "c")
+    ds.attrib["Conventions"] = "Cf/Radial-2.0"
+    n_sweeps = length(sweep_data_list)
+    defDim(ds, "sweep", n_sweeps)
+    defDim(ds, "string_length_32", 32)
+    sg_name_var = defVar(ds, "sweep_group_name", Char, ("string_length_32","sweep"))
+    for (si, _) in enumerate(sweep_data_list)
+        name = "sweep_" * lpad(string(si), 4, '0')
+        for (j, c) in enumerate(name)
+            sg_name_var[j, si] = c
+        end
+        for j in (length(name)+1):32
+            sg_name_var[j, si] = '\0'
+        end
+    end
+    for (si, data) in enumerate(sweep_data_list)
+        sg_name = "sweep_" * lpad(string(si), 4, '0')
+        sg = defGroup(ds, sg_name)
+        defDim(sg, "range", length(data.ranges))
+        defDim(sg, "time",  length(data.times))
+        defVar(sg, "time",      Float32, ("time",),  attrib=Dict("units"=>"seconds"))[:] = data.times
+        defVar(sg, "range",     Float32, ("range",), attrib=Dict("units"=>"m"))[:] = data.ranges
+        defVar(sg, "elevation", Float32, ("time",),  attrib=Dict("units"=>"degrees"))[:] = data.elevs
+        defVar(sg, "azimuth",   Float32, ("time",),  attrib=Dict("units"=>"degrees"))[:] = data.azims
+        defVar(sg, "VV",  data.VEL, ("range","time"), attrib=Dict("units"=>"m/s"))
+        defVar(sg, "VEL", data.VEL, ("range","time"), attrib=Dict("units"=>"m/s"))
+        defVar(sg, "ZZ",  data.DBZ, ("range","time"), attrib=Dict("units"=>"dBZ"))
+        defVar(sg, "DBZ", data.DBZ, ("range","time"), attrib=Dict("units"=>"dBZ"))
+        defVar(sg, "NCP", data.NCP, ("range","time"), attrib=Dict("units"=>"unitless"))
+        defVar(sg, "VG",  data.VG,  ("range","time"), attrib=Dict("units"=>"m/s"))
+        # CfRadial 2.0 stores georeference vars under /sweep_NNNN/georeference
+        gref = defGroup(sg, "georeference")
+        defVar(gref, "altitude", Float32, ("time",), attrib=Dict("units"=>"m"))[:] = data.alts
+    end
+    close(ds)
+    return path
+end
+
+## Build a config + train a tiny model that both layouts can be QC'd with.
+function _v2_train_minimal(workdir, train_path)
+    model_path = joinpath(workdir, "model_pass1.jld2")
+    feat_path  = joinpath(workdir, "feat_pass1.h5")
+    config = make_config(
+        num_models = 1,
+        input_path = train_path,
+        experiment_name = "v2eq",
+        task_mode = "convolution",
+        conv_variables = ["DBZ", "VEL"],
+        conv_kernel_sizes = [3],
+        REMOVE_LOW_SIG_QUALITY = false,
+        REMOVE_HIGH_PGG = false,
+        SIG_QUALITY_VAR = "NCP",
+        QC_var = "VG",
+        remove_var = "VV",
+        VARS_TO_QC = ["DBZ", "VEL"],
+        met_probs = [(0.0f0, 0.5f0)],
+        HAS_INTERACTIVE_QC = true,
+        QC_mask = false,
+        n_trees = 5,
+        max_depth = 4,
+        class_weights = "balanced",
+        verbose = false,
+    )
+    config.model_output_paths   = [model_path]
+    config.feature_output_paths = [feat_path]
+    train_multi_model(config)
+    return config, model_path
+end
+
+@testset "CfRadial 2.0 layout support" begin
+    workdir = joinpath(test_scratchspace, "v2_layout")
+    isdir(workdir) && rm(workdir; recursive=true)
+    mkdir(workdir)
+
+    range_dim = 12
+    time_dim  = 16
+    data = _gen_sweep_data(range_dim, time_dim, 4242)
+
+    ## Build v1 and v2 fixtures with byte-identical sweep data, plus a v1
+    ## training-data file the model is trained on (so both inference targets
+    ## start from the same trained model).
+    v1_train = joinpath(workdir, "v1_train.nc"); _write_v1_cfrad(v1_train, data)
+    v1_infer = joinpath(workdir, "v1_infer.nc"); _write_v1_cfrad(v1_infer, data)
+    v2_infer = joinpath(workdir, "v2_infer.nc"); _write_v2_cfrad(v2_infer, [data])
+
+    @testset "sweep_views factory" begin
+        v1_views = NCDataset(v1_infer) do f; Ronin.sweep_views(f); end
+        v2_views = NCDataset(v2_infer) do f; Ronin.sweep_views(f); end
+        @test length(v1_views) == 1
+        @test length(v2_views) == 1
+        @test v1_views[1].sweep_name == ""
+        @test v2_views[1].sweep_name == "sweep_0001"
+        @test v1_views[1].georef === nothing
+        @test v2_views[1].georef !== nothing
+    end
+
+    @testset "georef routes correctly per layout" begin
+        ## v1 reads altitude at root; v2 reads it from /sweep_NNNN/georeference.
+        NCDataset(v1_infer) do f
+            v = Ronin.sweep_views(f)[1]
+            @test Float32.(Ronin.georef(v, "altitude")[:]) == data.alts
+        end
+        NCDataset(v2_infer) do f
+            v = Ronin.sweep_views(f)[1]
+            @test Float32.(Ronin.georef(v, "altitude")[:]) == data.alts
+        end
+    end
+
+    ## Train one model on the v1 file; both inference files use it.
+    config, model_path = _v2_train_minimal(workdir, v1_train)
+
+    @testset "composite_QC: v1 vs v2 outputs are byte-identical" begin
+        ## Run composite_QC against v1 (writes at root) and v2 (writes into
+        ## /sweep_0001). For the same model and same input bytes, the
+        ## met_prob, mask, and per-variable QC fields should be identical.
+        Ronin.composite_QC(config, [v1_infer])
+        Ronin.composite_QC(config, [v2_infer])
+
+        v1_mp, v1_dbzqc, v1_velqc = NCDataset(v1_infer) do f
+            (f["met_prob_pass_1"][:,:], f["DBZ_QC"][:,:], f["VEL_QC"][:,:])
+        end
+        v2_mp, v2_dbzqc, v2_velqc = NCDataset(v2_infer) do f
+            sg = f.group["sweep_0001"]
+            (sg["met_prob_pass_1"][:,:], sg["DBZ_QC"][:,:], sg["VEL_QC"][:,:])
+        end
+
+        @test isequal(v1_mp,   v2_mp)
+        @test isequal(v1_dbzqc, v2_dbzqc)
+        @test isequal(v1_velqc, v2_velqc)
+
+        ## And — crucially — v2 outputs land in /sweep_0001, NOT at root.
+        NCDataset(v2_infer) do f
+            @test !("DBZ_QC" in keys(f))
+            @test !("VEL_QC" in keys(f))
+            @test !("met_prob_pass_1" in keys(f))
+            sg = f.group["sweep_0001"]
+            @test "DBZ_QC" in keys(sg)
+            @test "VEL_QC" in keys(sg)
+            @test "met_prob_pass_1" in keys(sg)
+        end
+    end
+
+    @testset "composite_QC: multi-sweep v2 writes per-sweep" begin
+        ## Build a 2-sweep v2 file with *different* data per sweep, run
+        ## composite_QC, and assert that each /sweep_NNNN group ends up with
+        ## its own independent met_prob_pass_1 / DBZ_QC / VEL_QC.
+        data_a = _gen_sweep_data(range_dim, time_dim, 1111)
+        data_b = _gen_sweep_data(range_dim, time_dim, 2222)
+        v2_multi = joinpath(workdir, "v2_multi.nc")
+        _write_v2_cfrad(v2_multi, [data_a, data_b])
+
+        Ronin.composite_QC(config, [v2_multi])
+
+        NCDataset(v2_multi) do f
+            sg1 = f.group["sweep_0001"]
+            sg2 = f.group["sweep_0002"]
+            for sg in (sg1, sg2)
+                @test "met_prob_pass_1" in keys(sg)
+                @test "DBZ_QC" in keys(sg)
+                @test "VEL_QC" in keys(sg)
+            end
+            ## Different inputs ⇒ different per-sweep outputs (sanity that
+            ## one sweep's writes did not bleed into the other's group).
+            mp1 = sg1["met_prob_pass_1"][:,:]
+            mp2 = sg2["met_prob_pass_1"][:,:]
+            @test !isequal(mp1, mp2)
+        end
+    end
+
+    rm(workdir; recursive=true)
+end
+
+###############################################################################
 # Cleanup
 ###############################################################################
 @testset "Cleanup test scratch space" begin
