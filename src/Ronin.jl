@@ -157,6 +157,65 @@ module Ronin
         end
     end
 
+    ## Classify a CfRadial file's on-disk layout. Ronin's feature path assumes
+    ## the flat CfRadial 1.x gridded layout: root-level `range`/`time` dims with
+    ## field variables shaped (range, time). Returns `(layout, scan_dims)`:
+    ##   :ok          — flat v1 gridded; scan_dims = (nrange, ntime)
+    ##   :cfradial2   — hierarchical v2 (sweep_*/ groups); scan_dims = (0, 0)
+    ##   :ragged      — contiguous ragged-array (n_points / ray_n_gates); (0, 0)
+    ##   :unsupported — root missing `range` or `time` for other reasons; (0, 0)
+    function _detect_cfrad_layout(f::NCDataset)
+        has_root_range = "range" in keys(f)
+        has_root_time  = "time"  in keys(f)
+        convs = try
+            lowercase(string(get(f.attrib, "Conventions", "")))
+        catch
+            ""
+        end
+        grp_names = try
+            collect(keys(f.group))
+        catch
+            String[]
+        end
+        has_sweep_group = any(g -> startswith(string(g), "sweep"), grp_names)
+        is_v2 = ("sweep_group_name" in keys(f)) || has_sweep_group ||
+                (occursin("2.0", convs) && occursin("cfradial", convs))
+        is_ragged = haskey(f.dim, "n_points") ||
+                    ("ray_n_gates" in keys(f)) ||
+                    ("ray_start_index" in keys(f))
+        if is_v2
+            return (:cfradial2, (0, 0))
+        elseif is_ragged
+            return (:ragged, (0, 0))
+        elseif !has_root_range || !has_root_time
+            return (:unsupported, (0, 0))
+        else
+            return (:ok, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+        end
+    end
+
+    ## Emit a yellow WARNING describing why a file is being skipped by the
+    ## gridded QC / prediction path. No-op for `:ok`.
+    function _warn_unsupported_cfrad(layout::Symbol, file::AbstractString)
+        if layout == :cfradial2
+            printstyled("WARNING: Skipping CfRadial 2.0 (hierarchical sweep " *
+                        "groups), unsupported by the gridded path: $(file)\n" *
+                        "         Convert to CfRadial 1.x (e.g. RadxConvert " *
+                        "-cfradial1 -const_ngate) to process this file.\n",
+                        color=:yellow)
+        elseif layout == :ragged
+            printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
+                        "representation), unsupported by the gridded path: " *
+                        "$(file)\n         Convert to a gridded CfRadial " *
+                        "(e.g. RadxConvert -const_ngate) to process this file.\n",
+                        color=:yellow)
+        elseif layout == :unsupported
+            printstyled("WARNING: Skipping file with unsupported CfRadial " *
+                        "layout (no root `range`/`time` variable): $(file)\n",
+                        color=:yellow)
+        end
+    end
+
     """
         inspect_model_configuration(path::String; io::IO=stdout)
 
@@ -4374,27 +4433,18 @@ module Ronin
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version
         for file in files
             curr_starttime = time()
-                ###Get dimensions, and detect the CfRadial contiguous ragged-array
-                ###representation (n_points / ray_start_index / ray_n_gates), which
-                ###Ronin's gridded (range × time) feature path cannot ingest.
-                ###Skip ragged files with a clear warning rather than crashing.
+                ###Classify the CfRadial layout and skip files the gridded
+                ###feature path cannot ingest (CfRadial 2.0 hierarchical sweep
+                ###groups, ragged n_points arrays, or root layouts missing
+                ###`range`/`time`).
 
-            is_ragged, scan_dims = redirect_stdout(devnull) do
-
+            layout, scan_dims = redirect_stdout(devnull) do
                 NCDataset(file) do f
-                    ragged = haskey(f.dim, "n_points") ||
-                             ("ray_n_gates" in keys(f)) ||
-                             ("ray_start_index" in keys(f))
-                    (ragged, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+                    _detect_cfrad_layout(f)
                 end
             end
-
-            if is_ragged
-                printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
-                            "representation), unsupported by the gridded prediction " *
-                            "path: $(file)\n         Convert to a gridded CfRadial " *
-                            "(e.g. RadxConvert -const_ngate) to process this file.\n",
-                            color=:yellow)
+            if layout != :ok
+                _warn_unsupported_cfrad(layout, file)
                 continue
             end
 
@@ -5423,24 +5473,16 @@ module Ronin
                 if isdir(file)
                     continue
                 end
-                ###Get dimensions, and detect the CfRadial contiguous ragged-array
-                ###representation (n_points / ray_start_index / ray_n_gates), which
-                ###Ronin's gridded (range × time) feature path cannot ingest.
-                ###Skip ragged files with a clear warning rather than crashing the
-                ###whole volume/day chunk.
-                is_ragged, scan_dims = NCDataset(file) do f
-                    ragged = haskey(f.dim, "n_points") ||
-                             ("ray_n_gates" in keys(f)) ||
-                             ("ray_start_index" in keys(f))
-                    (ragged, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+                ###Classify the CfRadial layout and skip files that the gridded
+                ###feature path cannot ingest (CfRadial 2.0 hierarchical sweep
+                ###groups, ragged n_points arrays, or root layouts missing
+                ###`range`/`time`). This keeps process_day_chunks alive on a
+                ###mixed-format batch instead of crashing the whole volume.
+                layout, scan_dims = NCDataset(file) do f
+                    _detect_cfrad_layout(f)
                 end
-
-                if is_ragged
-                    printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
-                                "representation), unsupported by the gridded QC path: " *
-                                "$(file)\n         Convert to a gridded CfRadial " *
-                                "(e.g. RadxConvert -const_ngate) to QC this file.\n",
-                                color=:yellow)
+                if layout != :ok
+                    _warn_unsupported_cfrad(layout, file)
                     continue
                 end
 
