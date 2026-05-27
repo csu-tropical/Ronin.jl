@@ -1,12 +1,44 @@
 module Ronin
 
+    ## NCDatasets must come before the file includes so that the SweepView
+    ## struct (which carries `NCDataset` fields and is annotated on methods in
+    ## RoninFeatures.jl / RoninConvolutions.jl) is fully defined when those
+    ## files are evaluated. The rest of the heavy `using` block stays below.
+    using NCDatasets
+
+    ## Internal layout adapter. Presents a single CfRadial sweep — the root of
+    ## a v1 file or one /sweep_NNNN subgroup of a v2 file — with a uniform
+    ## read/write surface. Georeference variables (altitude, latitude,
+    ## longitude, ...) live at root in v1 and in a /georeference sub-sub-group
+    ## in v2; the `georef` field routes accesses accordingly. Not exported.
+    struct SweepView
+        data::NCDataset                       # v1: root; v2: /sweep_NNNN subgroup
+        georef::Union{NCDataset, Nothing}     # v1: nothing (georef vars live in `data`); v2: data.group["georeference"]
+        sweep_name::String                    # ""  for v1, "sweep_NNNN" for v2
+    end
+
+    Base.getindex(v::SweepView, name) = v.data[name]
+    Base.haskey(v::SweepView, name)   = haskey(v.data, name)
+    Base.keys(v::SweepView)           = keys(v.data)
+    dim_size(v::SweepView, name)      = v.data.dim[name]
+
+    ## Read a georeference variable (altitude / latitude / longitude / ...)
+    ## from the correct location for this layout: root for v1, /georeference
+    ## subgroup for v2.
+    function georef(v::SweepView, name)
+        if v.georef === nothing
+            return v.data[name]
+        else
+            return v.georef[name]
+        end
+    end
+
     include("./RoninFeatures.jl")
     include("./RoninConvolutions.jl")
     include("./Io.jl")
     include("./DecisionTree/DecisionTree.jl")
 
 
-    using NCDatasets
     using ImageFiltering
     using Statistics
     using Images
@@ -18,12 +50,12 @@ module Ronin
     using DataStructures
 
 
-    export get_NCP, airborne_ht, prob_groundgate
+    export airborne_ht, prob_groundgate
     export calc_avg, calc_std, calc_iso, process_single_file
     export parse_directory, get_num_tasks, get_task_params, remove_validation
     export calculate_features, calculate_features_conv
     export split_training_testing!, split_training_testing_validation!
-    export QC_scan, get_QC_mask
+    export QC_scan
     export evaluate_model, get_feature_importance, train_model
     export train_multi_model, train_single_pass, regenerate_masks, ModelConfig, make_config, composite_prediction, get_contingency, compute_balanced_class_weights
     export write_field, characterize_misclassified_gates, composite_QC
@@ -38,31 +70,31 @@ module Ronin
         load_model(path::String, task_mode::String)
 
     Load a trained model from a JLD2 file, handling both storage formats:
-      - `save_object` format (plain model, no keys)
-      - `JLD2.jldsave` format (keyed: "model", "selected_features", etc.)
+      - `save_object` format (single key `"single_stored_object"`)
+      - `JLD2.jldsave` format (keyed: `"model"`, `"selected_features"`, etc.)
 
-    Returns the model object regardless of which format was used.
+    Returns the model object regardless of which format was used. The
+    `task_mode` argument is accepted for API compatibility but ignored;
+    layout is inferred from the file's keys.
     """
     function load_model(path::String, task_mode::String)
-        if task_mode == "convolution"
-            data = JLD2.load(path)
-            if data isa Dict && haskey(data, "model")
-                return data["model"]
-            elseif data isa Dict && haskey(data, "single_stored_object")
-                # Saved with save_object (wraps in "single_stored_object" key)
-                return data["single_stored_object"]
-            else
-                return data
-            end
+        data = JLD2.load(path)
+        if data isa Dict && haskey(data, "model")
+            return data["model"]
+        elseif data isa Dict && haskey(data, "single_stored_object")
+            return data["single_stored_object"]
         else
-            return load_object(path)
+            return data
         end
     end
 
     """
         load_model_with_metadata(path::String, task_mode::String)
 
-    Load a trained model and its metadata from a JLD2 file.
+    Load a trained model and its metadata from a JLD2 file. Accepts either
+    storage layout (single-key `save_object` or multi-key `JLD2.jldsave`).
+    `task_mode` is kept for API compatibility but is ignored; layout is
+    inferred from the file's keys.
 
     Returns a NamedTuple with fields:
       - `model`: the trained RF ensemble
@@ -72,49 +104,36 @@ module Ronin
       - `importances`: Vector{Float64} of feature importance scores (empty if not saved)
     """
     function load_model_with_metadata(path::String, task_mode::String)
-        if task_mode == "convolution"
-            data = JLD2.load(path)
-            if data isa Dict
-                model = if haskey(data, "model")
-                    data["model"]
-                elseif haskey(data, "single_stored_object")
-                    data["single_stored_object"]
-                else
-                    data
-                end
-                selected = get(data, "selected_features", Int[])
-                recommended = get(data, "recommended_features", Int[])
-                feat_names = get(data, "feature_names", String[])
-                imps = get(data, "importances", Float64[])
-                conv_vars = get(data, "conv_variables", String[])
-                masked_conv_vars = get(data, "masked_conv_variables", String[])
-                masked_conv_ktypes = get(data, "masked_conv_kernel_types", String[])
-                masked_conv_ksizes = get(data, "masked_conv_kernel_sizes", Int[])
-                masked_conv_thresh = get(data, "masked_conv_threshold", 0.1f0)
-                masked_conv_mpf = get(data, "masked_conv_met_prob_field", "")
-                return (model=model, selected_features=selected,
-                        recommended_features=recommended,
-                        feature_names=feat_names, importances=imps,
-                        conv_variables=conv_vars,
-                        masked_conv_variables=masked_conv_vars,
-                        masked_conv_kernel_types=masked_conv_ktypes,
-                        masked_conv_kernel_sizes=masked_conv_ksizes,
-                        masked_conv_threshold=masked_conv_thresh,
-                        masked_conv_met_prob_field=masked_conv_mpf)
+        data = JLD2.load(path)
+        if data isa Dict
+            model = if haskey(data, "model")
+                data["model"]
+            elseif haskey(data, "single_stored_object")
+                data["single_stored_object"]
             else
-                return (model=data, selected_features=Int[],
-                        recommended_features=Int[],
-                        feature_names=String[], importances=Float64[],
-                        conv_variables=String[],
-                        masked_conv_variables=String[],
-                        masked_conv_kernel_types=String[],
-                        masked_conv_kernel_sizes=Int[],
-                        masked_conv_threshold=0.1f0,
-                        masked_conv_met_prob_field="")
+                data
             end
+            selected = get(data, "selected_features", Int[])
+            recommended = get(data, "recommended_features", Int[])
+            feat_names = get(data, "feature_names", String[])
+            imps = get(data, "importances", Float64[])
+            conv_vars = get(data, "conv_variables", String[])
+            masked_conv_vars = get(data, "masked_conv_variables", String[])
+            masked_conv_ktypes = get(data, "masked_conv_kernel_types", String[])
+            masked_conv_ksizes = get(data, "masked_conv_kernel_sizes", Int[])
+            masked_conv_thresh = get(data, "masked_conv_threshold", 0.1f0)
+            masked_conv_mpf = get(data, "masked_conv_met_prob_field", "")
+            return (model=model, selected_features=selected,
+                    recommended_features=recommended,
+                    feature_names=feat_names, importances=imps,
+                    conv_variables=conv_vars,
+                    masked_conv_variables=masked_conv_vars,
+                    masked_conv_kernel_types=masked_conv_ktypes,
+                    masked_conv_kernel_sizes=masked_conv_ksizes,
+                    masked_conv_threshold=masked_conv_thresh,
+                    masked_conv_met_prob_field=masked_conv_mpf)
         else
-            model = load_object(path)
-            return (model=model, selected_features=Int[],
+            return (model=data, selected_features=Int[],
                     recommended_features=Int[],
                     feature_names=String[], importances=Float64[],
                     conv_variables=String[],
@@ -123,6 +142,160 @@ module Ronin
                     masked_conv_kernel_sizes=Int[],
                     masked_conv_threshold=0.1f0,
                     masked_conv_met_prob_field="")
+        end
+    end
+
+    ## Internal: the number of feature columns a trained model expects.
+    ## A model trained on a `selected_features` subset expects that many columns;
+    ## otherwise it expects the full saved `feature_names` width. Returns 0 when
+    ## neither is known (legacy save_object models) so callers skip the check.
+    function _expected_feature_width(selected_features, feature_names)
+        !isempty(selected_features) && return length(selected_features)
+        !isempty(feature_names) && return length(feature_names)
+        return 0
+    end
+
+    ## Internal: fail fast with an actionable message when the convolution
+    ## feature matrix produced at inference is not the width the model was
+    ## trained on. The common cause is a missing prior-pass field
+    ## (e.g. met_prob_pass_<n>) which makes the masked-convolution block get
+    ## silently dropped, yielding a too-narrow X and an opaque BoundsError
+    ## deep inside the random forest.
+    function _check_feature_width(X, selected_features, feature_names, model_path, pass_i)
+        expected = _expected_feature_width(selected_features, feature_names)
+        expected == 0 && return
+        got = size(X, 2)
+        if got != expected
+            error("Feature width mismatch for pass $(pass_i) " *
+                  "(model $(basename(String(model_path)))): model expects " *
+                  "$(expected) features but $(got) were produced. This usually " *
+                  "means a required prior-pass field (e.g. met_prob_pass_<n>) is " *
+                  "absent from the CfRadial, so masked-convolution features were " *
+                  "silently dropped. Ensure earlier passes ran and wrote their " *
+                  "met_prob_pass_<n> fields before this pass.")
+        end
+    end
+
+    ## Classify a CfRadial file's on-disk layout. Ronin's feature path assumes
+    ## the flat CfRadial 1.x gridded layout: root-level `range`/`time` dims with
+    ## field variables shaped (range, time). Returns `(layout, scan_dims)`:
+    ##   :ok          — flat v1 gridded; scan_dims = (nrange, ntime)
+    ##   :cfradial2   — hierarchical v2 (sweep_*/ groups); scan_dims = (0, 0)
+    ##   :ragged      — contiguous ragged-array (n_points / ray_n_gates); (0, 0)
+    ##   :unsupported — root missing `range` or `time` for other reasons; (0, 0)
+    function _detect_cfrad_layout(f::NCDataset)
+        has_root_range = "range" in keys(f)
+        has_root_time  = "time"  in keys(f)
+        convs = try
+            lowercase(string(get(f.attrib, "Conventions", "")))
+        catch
+            ""
+        end
+        grp_names = try
+            collect(keys(f.group))
+        catch
+            String[]
+        end
+        has_sweep_group = any(g -> startswith(string(g), "sweep"), grp_names)
+        is_v2 = ("sweep_group_name" in keys(f)) || has_sweep_group ||
+                (occursin("2.0", convs) && occursin("cfradial", convs))
+        is_ragged = haskey(f.dim, "n_points") ||
+                    ("ray_n_gates" in keys(f)) ||
+                    ("ray_start_index" in keys(f))
+        if is_v2
+            return (:cfradial2, (0, 0))
+        elseif is_ragged
+            return (:ragged, (0, 0))
+        elseif !has_root_range || !has_root_time
+            return (:unsupported, (0, 0))
+        else
+            return (:ok, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+        end
+    end
+
+    ## Emit a yellow WARNING describing why a file is being skipped by the
+    ## driver paths. No-op for `:ok` and `:cfradial2` (CfRadial 2.0 is
+    ## processed natively via per-sweep iteration; only ragged-array layouts
+    ## and other unsupported root layouts are skipped).
+    function _warn_unsupported_cfrad(layout::Symbol, file::AbstractString)
+        if layout == :ragged
+            printstyled("WARNING: Skipping ragged-array CfRadial (n_points " *
+                        "representation), unsupported by the gridded path: " *
+                        "$(file)\n         Convert to a gridded CfRadial " *
+                        "(e.g. RadxConvert -const_ngate) to process this file.\n",
+                        color=:yellow)
+        elseif layout == :unsupported
+            printstyled("WARNING: Skipping file with unsupported CfRadial " *
+                        "layout (no root `range`/`time` variable and no " *
+                        "/sweep_NNNN groups): $(file)\n",
+                        color=:yellow)
+        end
+    end
+
+    ## SweepView struct + getindex/haskey/keys/dim_size/georef are defined at
+    ## the top of the module (above the includes), so methods dispatching on
+    ## SweepView in RoninFeatures.jl / RoninConvolutions.jl resolve correctly.
+
+    ## Defensive subgroup helpers — NCDatasets exposes child groups via
+    ## `f.group`, but some older versions or edge layouts can make naive
+    ## access throw; wrap in try/catch and return safe defaults.
+    function _has_subgroup(f::NCDataset, name::AbstractString)
+        try
+            return haskey(f.group, String(name))
+        catch
+            return false
+        end
+    end
+    function _subgroup_names(f::NCDataset)
+        try
+            return [String(g) for g in keys(f.group)]
+        catch
+            return String[]
+        end
+    end
+
+    ## Return one SweepView per QC-able sweep in the file.
+    ##   :ok          → single view at the file root (v1 single- or multi-sweep
+    ##                  concatenated; today's behavior).
+    ##   :cfradial2   → one view per /sweep_NNNN group, each pointing at its
+    ##                  /georeference subgroup if present.
+    ## Throws for :ragged / :unsupported; callers are expected to classify
+    ## with `_detect_cfrad_layout` and skip those layouts before calling here.
+    function sweep_views(f::NCDataset)
+        layout, _ = _detect_cfrad_layout(f)
+        if layout == :ok
+            return [SweepView(f, nothing, "")]
+        elseif layout == :cfradial2
+            ## Prefer the spec-canonical sweep_group_name(sweep) variable if
+            ## present; otherwise discover by scanning child groups.
+            names = String[]
+            if "sweep_group_name" in keys(f)
+                try
+                    for nm in f["sweep_group_name"][:]
+                        push!(names, String(nm))
+                    end
+                catch
+                    # fall through to subgroup scan
+                end
+            end
+            if isempty(names)
+                for s in _subgroup_names(f)
+                    startswith(s, "sweep_") && push!(names, s)
+                end
+                sort!(names)
+            end
+            views = SweepView[]
+            for nm in names
+                _has_subgroup(f, nm) || continue
+                sg = f.group[nm]
+                gr = _has_subgroup(sg, "georeference") ? sg.group["georeference"] : nothing
+                push!(views, SweepView(sg, gr, nm))
+            end
+            return views
+        else
+            throw(ArgumentError("sweep_views: unsupported CfRadial layout " *
+                                ":$(layout). Filter with _detect_cfrad_layout " *
+                                "before calling sweep_views."))
         end
     end
 
@@ -313,8 +486,20 @@ module Ronin
     ```julia
     task_mode::String
     ```
-    Whether to obtain feature tasks from a set of input files or user specified vector of strings. Planned to be implemented in a future release.
-    For now, codebase behavior is agnostic to its value.
+    Selects the feature-engineering regime. Codebase behavior is **not** agnostic
+    to this value — it branches across training, prediction, QC, and mask
+    generation:
+
+    - `task_mode == "convolution"` — convolution feature mode. Features are
+      derived from a kernel bank applied to `conv_variables` (plus appended
+      AHT/ELV/RNG/NRG scalars); see the Convolution Feature Mode documentation.
+      `run_hypertuning` requires this mode.
+    - `task_mode == ""` (or any value other than `"convolution"`) — legacy
+      hand-tuned predictor mode. Features come from the `task_paths` /
+      `task_weights` predictor specification (STD/ISO/AVG/RNG/NRG/PGG/AHT); see
+      the Legacy Hand-Tuned Mode documentation.
+
+    `regenerate_masks` is the only mode-agnostic pass utility.
 
     ```julia
     file_preprocessed::Vector{Bool}
@@ -1240,31 +1425,51 @@ module Ronin
 
     Convolution-mode equivalent of `process_single_file`. Computes convolution features
     for a single sweep, builds the validity mask and INDEXER, and returns (X, Y, INDEXER).
+
+    Operates on a `SweepView` so CfRadial 2.0 sweep subgroups work the same as
+    v1 root datasets. The `NCDataset` method is a back-compat shim that wraps
+    the dataset as a v1 root view.
     """
-    function process_single_file_conv(cfrad::NCDataset, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
+    function process_single_file_conv(v::SweepView, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
                                        feature_mask::AbstractMatrix{Bool}=placeholder_mask, mask_features::Bool=false)
 
-        cfrad_dims = (cfrad.dim["range"], cfrad.dim["time"])
+        cfrad_dims = (dim_size(v, "range"), dim_size(v, "time"))
         ngates = cfrad_dims[1] * cfrad_dims[2]
 
         # Build INDEXER: valid where remove_var is non-missing
-        VT = cfrad[config.remove_var][:]
+        VT = v[config.remove_var][:]
         INDEXER = [!ismissing(x) for x in VT]
 
+        if length(VT) != ngates
+            fname = try; string(NCDatasets.path(v.data)); catch; ""; end
+            throw(DimensionMismatch(
+                "remove_var '$(config.remove_var)' has $(length(VT)) gates but " *
+                "the sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
+                "has $ngates" * (isempty(fname) ? "" : " in file $fname") * "."))
+        end
+
         if mask_features
+            if length(feature_mask) != ngates
+                fname = try; string(NCDatasets.path(v.data)); catch; ""; end
+                throw(DimensionMismatch(
+                    "QC feature mask has $(length(feature_mask)) gates but the " *
+                    "sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
+                    "has $ngates" * (isempty(fname) ? "" : " in file $fname") *
+                    ". The saved mask field does not match this file's dimensions."))
+            end
             INDEXER = [INDEXER[i] ? maskval : false for (i, maskval) in enumerate(feature_mask[:])]
         end
 
         # PGG thresholding
         PGG = nothing
         if config.REMOVE_HIGH_PGG
-            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
+            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(v)[:]]
             INDEXER[INDEXER] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         end
 
         # Signal quality thresholding
         if config.REMOVE_LOW_SIG_QUALITY
-            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, config.SIG_QUALITY_VAR)[:]]
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(v, config.SIG_QUALITY_VAR)[:]]
             INDEXER[INDEXER] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end
 
@@ -1280,13 +1485,13 @@ module Ronin
         if !isempty(config.masked_conv_variables) && config.masked_conv_met_prob_field != ""
             masked_conv_kb = build_filtered_kernel_bank(config.masked_conv_kernel_types,
                                                          config.masked_conv_kernel_sizes)
-            if config.masked_conv_met_prob_field in keys(cfrad)
-                mp_raw = load_conv_variable(cfrad, config.masked_conv_met_prob_field,
+            if config.masked_conv_met_prob_field in keys(v)
+                mp_raw = load_conv_variable(v, config.masked_conv_met_prob_field,
                                              valid_mask, config.SIG_QUALITY_VAR)
                 mp_f32 = Matrix{Float32}(undef, cfrad_dims...)
                 for j in 1:cfrad_dims[2], i in 1:cfrad_dims[1]
-                    v = mp_raw[i, j]
-                    mp_f32[i, j] = (ismissing(v) || (v isa AbstractFloat && isnan(v))) ? 0.0f0 : Float32(v)
+                    val = mp_raw[i, j]
+                    mp_f32[i, j] = (ismissing(val) || (val isa AbstractFloat && isnan(val))) ? 0.0f0 : Float32(val)
                 end
                 met_prob_mask = mp_f32 .>= config.masked_conv_threshold
             else
@@ -1295,7 +1500,7 @@ module Ronin
         end
 
         # Compute convolution features
-        X_full, feature_names = compute_convolution_features(cfrad, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR;
+        X_full, feature_names = compute_convolution_features(v, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR;
             masked_conv_variables = config.masked_conv_variables,
             masked_conv_kernel_bank = masked_conv_kb,
             masked_conv_threshold = config.masked_conv_threshold,
@@ -1311,14 +1516,21 @@ module Ronin
 
         # Build Y if interactive QC
         if config.HAS_INTERACTIVE_QC
-            VG = cfrad[config.QC_var][:][INDEXER]
-            VV = cfrad[config.remove_var][:][INDEXER]
+            VG = v[config.QC_var][:][INDEXER]
+            VV = v[config.remove_var][:][INDEXER]
             Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
             return (X, Y, INDEXER, feature_names)
         else
             return (X, false, INDEXER, feature_names)
         end
     end
+
+    ## Back-compat shim: NCDataset → wrap as v1 root SweepView and delegate.
+    process_single_file_conv(cfrad::NCDataset, config::ModelConfig,
+                             kernel_bank::Vector{ConvolutionKernel};
+                             kwargs...) =
+        process_single_file_conv(SweepView(cfrad, nothing, ""), config,
+                                 kernel_bank; kwargs...)
 
 
     """
@@ -1356,46 +1568,52 @@ module Ronin
         starttime = time()
 
         for path in paths
-            cfrad = Dataset(path)
+            layout, _ = NCDataset(path) do f; _detect_cfrad_layout(f); end
+            if layout == :ragged || layout == :unsupported
+                _warn_unsupported_cfrad(layout, path)
+                continue
+            end
+
+            pathstarttime = time()
             try
-                pathstarttime = time()
-                dims = (cfrad.dim["range"], cfrad.dim["time"])
+                NCDataset(path) do f
+                    for sv in sweep_views(f)
+                        dims = (dim_size(sv, "range"), dim_size(sv, "time"))
 
-                fm = if QC_mask && mask_name != ""
-                    Matrix{Bool}(.!map(ismissing, cfrad[mask_name][:, :]))
-                else
-                    trues(dims)
+                        fm = if QC_mask && mask_name != ""
+                            Matrix{Bool}(.!map(ismissing, sv[mask_name][:, :]))
+                        else
+                            trues(dims)
+                        end
+
+                        result = process_single_file_conv(sv, config, kernel_bank;
+                                                           feature_mask=fm, mask_features=QC_mask)
+                        newX = result[1]
+                        newY = result[2]
+                        indexer = result[3]
+                        feature_names = result[4]
+
+                        if isempty(all_feature_names)
+                            all_feature_names = feature_names
+                        end
+
+                        X = vcat(X, newX)::Matrix{Float32}
+                        if newY !== false
+                            Y = vcat(Y, newY)::Matrix{Int64}
+                        end
+                        push!(idxs, reshape(indexer, dims))
+                    end
                 end
-
-                result = process_single_file_conv(cfrad, config, kernel_bank;
-                                                   feature_mask=fm, mask_features=QC_mask)
-                newX = result[1]
-                newY = result[2]
-                indexer = result[3]
-                feature_names = result[4]
-
-                if isempty(all_feature_names)
-                    all_feature_names = feature_names
-                end
-
-                close(cfrad)
 
                 if config.verbose
                     println("Processed $(path) in $(round(time() - pathstarttime, digits=2)) seconds [conv mode]")
                 end
-
-                X = vcat(X, newX)::Matrix{Float32}
-                if newY !== false
-                    Y = vcat(Y, newY)::Matrix{Int64}
-                end
-                push!(idxs, reshape(indexer, dims))
 
             catch e
                 if isa(e, DimensionMismatch)
                     printstyled(Base.stderr, "POSSIBLE ERRONEOUS CFRAD DIMENSIONS... SKIPPING $(path)\n"; color=:red)
                     continue
                 else
-                    close(cfrad)
                     throw(e)
                 end
             end
@@ -1496,6 +1714,34 @@ module Ronin
                     n_trees=n_trees, max_depth=max_depth, class_weights=class_weights)
     end
 
+    """
+        train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
+                     verify=false, verify_out="model_verification.h5",
+                     n_trees=21, max_depth=14,
+                     class_weights=Float32[1., 2.], max_threads=Threads.nthreads())
+
+    In-memory overload of [`train_model`](@ref): fit a `DecisionTree`
+    `RandomForestClassifier` directly on a feature matrix `X` and target vector
+    `Y` instead of reading them from an HDF5 file.
+
+    # Arguments
+    - `X`: feature matrix (rows = gates/samples, columns = features).
+    - `Y`: target labels (`1`/`true` = meteorological, `0`/`false` = non-met),
+      reshaped to a vector internally.
+    - `model_location`: path the fitted model is written to via `save_object`.
+
+    # Keywords
+    - `n_trees`, `max_depth`: random-forest hyperparameters.
+    - `class_weights`: per-sample weight vector; must match `length(Y)` or it is
+      ignored (with a warning) and uniform weights are used.
+    - `verify` / `verify_out`: when `verify`, write predicted vs. true labels to
+      the `verify_out` HDF5 file.
+    - `max_threads`: cap on fitting threads (defaults to all available).
+
+    Prints training accuracy and timing. The file-path method
+    `train_model(input_h5, model_location; ...)` simply loads `X`/`Y` (with
+    optional `row_subset`/`col_subset`) and delegates here.
+    """
     function train_model(X::Matrix, Y::Union{Matrix, Vector}, model_location::String;
                         verify::Bool=false, verify_out::String="model_verification.h5",
                         n_trees::Int = 21, max_depth::Int=14, class_weights::Vector{Float32} = Vector{Float32}([1.f0,2.f0]),
@@ -1794,6 +2040,39 @@ module Ronin
 
 
 
+    """
+        split_training_testing_validation!(DIR_PATHS::Vector{String},
+                                            TRAINING_PATH::String,
+                                            TESTING_PATH::String,
+                                            VALIDATION_PATH::String)
+
+    Split a directory or set of directories of cfradial files into **training,
+    testing, and held-out validation** sets, following the methodology of
+    DesRosiers and Bell 2023. This is the three-way analogue of
+    [`split_training_testing!`](@ref): it additionally carves out a validation
+    partition for unbiased final evaluation.
+
+    The default split is **72% training / 20% testing / 8% validation**. As with
+    the two-way split, this function assumes input directories contain only
+    cfradial files following standard naming conventions (thus implicitly
+    chronologically ordered), divides each case into several sections to limit
+    temporal autocorrelation while maximizing variance, and **softlinks** the
+    files into the destination directories.
+
+    An important note: always use absolute paths — relative paths break the
+    symlinks.
+
+    # Required Arguments
+    - `DIR_PATHS::Vector{String}`: directories of cfradials to split. Each
+      directory is treated as a distinct case.
+    - `TRAINING_PATH::String`: directory to softlink training files into.
+    - `TESTING_PATH::String`: directory to softlink testing files into.
+    - `VALIDATION_PATH::String`: directory to softlink the held-out validation
+      files into.
+
+    The destination directories are removed and recreated, so any existing
+    contents are discarded.
+    """
     function split_training_testing_validation!(DIR_PATHS::Vector{String}, TRAINING_PATH::String, TESTING_PATH::String, VALIDATION_PATH::String)
 
         ###TODO  - make sure to ignore .tmp_hawkedit files OTHERWISE WON'T WORK AS EXPECTED
@@ -2481,6 +2760,20 @@ module Ronin
                 printstyled("  Pass $(i) config: $(length(config.conv_variables)) conv_variables, " *
                             "$(isempty(config.selected_features) ? "all" : "$(length(config.selected_features))") features$(masked_info)\n",
                             color=:cyan)
+
+                ## One-time, training-only note: which masked-conv (type@size)
+                ## combinations are skipped by design. Reported here (not per
+                ## scan in build_filtered_kernel_bank) so operational QC runs
+                ## stay quiet; it is fully determined by config, not data.
+                if !isempty(config.masked_conv_variables)
+                    skipped = masked_conv_skipped_combos(config.masked_conv_kernel_types,
+                                                         config.masked_conv_kernel_sizes)
+                    if !isempty(skipped)
+                        combo_str = join(["$(t)@$(k)x$(k)" for (t, k) in skipped], ", ")
+                        printstyled("    Note: size-restricted masked-conv kernels not built by design: " *
+                                    "$(combo_str). Expected — not an error.\n", color=:light_black)
+                    end
+                end
             end
 
             out = config.feature_output_paths[i]
@@ -2644,72 +2937,105 @@ module Ronin
                     paths = [file_path]
                 end
 
+                ## Load model metadata once (only meaningful in convolution mode).
+                ## Hand-tuned mode leaves `md` as `nothing`; downstream code must guard.
+                md = config.task_mode == "convolution" ?
+                    load_model_with_metadata(model_path, config.task_mode) :
+                    nothing
+
+                kernel_bank_train = config.task_mode == "convolution" ?
+                    build_kernel_bank(config.conv_kernel_sizes) :
+                    ConvolutionKernel[]
+
                 for path in paths
 
-                    dims = Dataset(path) do f
-                        (f.dim["range"], f.dim["time"])
+                    layout, _ = NCDataset(path) do f; _detect_cfrad_layout(f); end
+                    if layout == :ragged || layout == :unsupported
+                        _warn_unsupported_cfrad(layout, path)
+                        continue
                     end
 
-                    if config.task_mode == "convolution"
-                        # Load metadata from model JLD2 to match what the model expects
-                        md = load_model_with_metadata(model_path, config.task_mode)
-                        config_single = deepcopy(config)
-                        config_single.input_path = path
-                        config_single.write_out = false
-                        config_single.selected_features = md.selected_features
-                        if !isempty(md.conv_variables)
-                            config_single.conv_variables = md.conv_variables
+                    NCDataset(path, "a") do f
+                        for sv in sweep_views(f)
+                            dims = (dim_size(sv, "range"), dim_size(sv, "time"))
+
+                            if config.task_mode == "convolution"
+                                fm = (QC_mask && mask_name != "") ?
+                                    Matrix{Bool}(.!map(ismissing, sv[mask_name][:, :])) :
+                                    trues(dims)
+                                config_single = deepcopy(config)
+                                config_single.input_path = path
+                                config_single.write_out = false
+                                config_single.selected_features = md.selected_features
+                                if !isempty(md.conv_variables)
+                                    config_single.conv_variables = md.conv_variables
+                                end
+                                config_single.masked_conv_variables = md.masked_conv_variables
+                                config_single.masked_conv_kernel_types = md.masked_conv_kernel_types
+                                config_single.masked_conv_kernel_sizes = md.masked_conv_kernel_sizes
+                                config_single.masked_conv_threshold = md.masked_conv_threshold
+                                config_single.masked_conv_met_prob_field = md.masked_conv_met_prob_field
+                                result = process_single_file_conv(sv, config_single, kernel_bank_train;
+                                                                   feature_mask=fm, mask_features=QC_mask)
+                                X = result[1]
+                                indexer = result[3]
+                            else
+                                currt = config.task_paths[i]
+                                cw = config.task_weights[i]
+                                result = process_single_file(sv, currt;
+                                                              HAS_INTERACTIVE_QC = true,
+                                                              REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY,
+                                                              SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD,
+                                                              SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                                              REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG,
+                                                              PGG_THRESHOLD = config.PGG_THRESHOLD,
+                                                              QC_variable = config.QC_var,
+                                                              remove_variable = config.remove_var,
+                                                              replace_missing = config.replace_missing,
+                                                              mask_features = QC_mask,
+                                                              feature_mask = QC_mask ? Matrix{Bool}(.!map(ismissing, sv[mask_name][:, :])) : [true true; false false],
+                                                              weight_matrixes = cw)
+                                X = result[1]
+                                indexer = result[3]
+                            end
+
+                            if md !== nothing
+                                printstyled("  Prediction: X size=$(size(X)), model_selected_features=$(isempty(md.selected_features) ? "none" : "$(length(md.selected_features)) indices")\n", color=:cyan)
+                            else
+                                printstyled("  Prediction: X size=$(size(X))\n", color=:cyan)
+                            end
+                            met_probs = DecisionTree.predict_proba(curr_model, X)
+                            if size(met_probs)[2] < 2
+                                throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET"))
+                            end
+                            met_probs = met_probs[:, 2]
+                            valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
+                            print("RESULTANT GATES: $(sum(valid_idxs))")
+
+                            ## Save met_prob predictions for all valid gates so subsequent passes
+                            ## can use them as predictors and masks can be regenerated with different
+                            ## thresholds without re-running the model
+                            met_prob_field = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+                            met_prob_idxer = copy(indexer)
+                            met_prob_field[met_prob_idxer] .= Float32.(met_probs)
+                            met_prob_field = reshape(met_prob_field, dims)
+                            met_prob_name = "met_prob_pass_$(i)"
+                            _define_or_overwrite!(sv, met_prob_name, met_prob_field;
+                                attribs=Dict("Units" => "probability",
+                                             "Description" => "RF meteorological probability from pass $(i)"))
+
+                            ##Create mask field, fill it, and then write out
+                            new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+
+                            idxer_flat = copy(indexer)
+                            idxer_flat[idxer_flat] .= Vector{Bool}(valid_idxs)
+                            new_mask[idxer_flat] .= 1.
+                            new_mask = reshape(new_mask, dims)
+
+                            _define_or_overwrite!(sv, config.mask_names[i+1], new_mask;
+                                attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
                         end
-                        config_single.masked_conv_variables = md.masked_conv_variables
-                        config_single.masked_conv_kernel_types = md.masked_conv_kernel_types
-                        config_single.masked_conv_kernel_sizes = md.masked_conv_kernel_sizes
-                        config_single.masked_conv_threshold = md.masked_conv_threshold
-                        config_single.masked_conv_met_prob_field = md.masked_conv_met_prob_field
-                        X, Y, idxer_list = calculate_features_conv(config_single, out;
-                                                                     QC_mask=QC_mask, mask_name=mask_name,
-                                                                     write_out=false, return_idxer=true)
-                        idxer = idxer_list
-                    else
-                        currt = config.task_paths[i]
-                        cw = config.task_weights[i]
-                        X, Y, idxer = calculate_features(path, currt, out, true;
-                                            verbose = config.verbose,
-                                            REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
-                                            REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var,
-                                            remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
-                                            write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=cw)
                     end
-
-                    printstyled("  Prediction: X size=$(size(X)), model_selected_features=$(isempty(md.selected_features) ? "none" : "$(length(md.selected_features)) indices")\n", color=:cyan)
-                    met_probs = DecisionTree.predict_proba(curr_model, X)
-                    if size(met_probs)[2] < 2
-                        throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET"))
-                    end
-                    met_probs = met_probs[:, 2]
-                    valid_idxs = (met_probs .>= minimum(curr_metprobs)) .& (met_probs .<= maximum(curr_metprobs))
-                    print("RESULTANT GATES: $(sum(valid_idxs))")
-
-                    ## Save met_prob predictions for all valid gates so subsequent passes
-                    ## can use them as predictors and masks can be regenerated with different
-                    ## thresholds without re-running the model
-                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-                    met_prob_idxer = copy(idxer[1][:])
-                    met_prob_field[met_prob_idxer] .= Float32.(met_probs)
-                    met_prob_field = reshape(met_prob_field, dims)
-                    met_prob_name = "met_prob_pass_$(i)"
-                    write_field(path, met_prob_name, met_prob_field,
-                        attribs=Dict("Units" => "probability",
-                                     "Description" => "RF meteorological probability from pass $(i)"))
-
-                    ##Create mask field, fill it, and then write out
-                    new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-
-                    idxer = idxer[1][:]
-                    idxer[idxer] .= Vector{Bool}(valid_idxs)
-                    new_mask[idxer] .= 1.
-                    new_mask = reshape(new_mask, dims)
-
-                    write_field(path, config.mask_names[i+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
 
                 end
             end
@@ -2739,30 +3065,37 @@ module Ronin
 
         paths = isdir(config.input_path) ? parse_directory(config.input_path) : [config.input_path]
         met_prob_name = "met_prob_pass_$(pass)"
+        n_sweeps_total = 0
 
         for path in paths
-            dims = Dataset(path) do f
-                (f.dim["range"], f.dim["time"])
+            layout, _ = NCDataset(path) do f; _detect_cfrad_layout(f); end
+            if layout == :ragged || layout == :unsupported
+                _warn_unsupported_cfrad(layout, path)
+                continue
             end
 
-            met_prob_field = Dataset(path) do f
-                f[met_prob_name][:, :]
-            end
+            NCDataset(path, "a") do f
+                for sv in sweep_views(f)
+                    dims = (dim_size(sv, "range"), dim_size(sv, "time"))
+                    met_prob_field = sv[met_prob_name][:, :]
 
-            new_mask = Matrix{Union{Missing, Float32}}(missings(dims))
-            for j in 1:dims[2], i in 1:dims[1]
-                v = met_prob_field[i, j]
-                if !ismissing(v) && v >= met_probs_threshold[1] && v <= met_probs_threshold[2]
-                    new_mask[i, j] = 1.0f0
+                    new_mask = Matrix{Union{Missing, Float32}}(missings(dims))
+                    for j in 1:dims[2], i in 1:dims[1]
+                        x = met_prob_field[i, j]
+                        if !ismissing(x) && x >= met_probs_threshold[1] && x <= met_probs_threshold[2]
+                            new_mask[i, j] = 1.0f0
+                        end
+                    end
+
+                    _define_or_overwrite!(sv, config.mask_names[pass + 1], new_mask;
+                        attribs=Dict("Units" => "Bool",
+                                     "Description" => "Gates between met prob thresholds"),
+                        verbose=false)
+                    n_sweeps_total += 1
                 end
             end
-
-            write_field(path, config.mask_names[pass + 1], new_mask,
-                attribs=Dict("Units" => "Bool",
-                             "Description" => "Gates between met prob thresholds"),
-                verbose=false)
         end
-        printstyled("Regenerated masks for pass $(pass+1) with threshold $(met_probs_threshold) ($(length(paths)) files)\n", color=:green)
+        printstyled("Regenerated masks for pass $(pass+1) with threshold $(met_probs_threshold) ($(length(paths)) files, $(n_sweeps_total) sweeps)\n", color=:green)
     end
 
     """
@@ -2970,62 +3303,93 @@ module Ronin
         files_done = Threads.Atomic{Int}(0)
         start_time = time()
 
+        kernel_bank_shared = config.task_mode == "convolution" ?
+            build_kernel_bank(config.conv_kernel_sizes) :
+            ConvolutionKernel[]
+
         Threads.@threads for fi in 1:n_paths
             path = paths[fi]
 
-            dims = Dataset(path) do f
-                (f.dim["range"], f.dim["time"])
+            layout, _ = NCDataset(path) do f; _detect_cfrad_layout(f); end
+            if layout == :ragged || layout == :unsupported
+                _warn_unsupported_cfrad(layout, path)
+                done = Threads.atomic_add!(files_done, 1)
+                continue
             end
 
-            if config.task_mode == "convolution"
-                config_single = deepcopy(config)
-                config_single.input_path = path
-                config_single.write_out = false
-                config_single.selected_features = md.selected_features
-                config_single.verbose = false
-                X_mask, Y_mask, idxer = calculate_features_conv(config_single, out;
-                                                                 QC_mask=QC_mask, mask_name=mask_name,
-                                                                 write_out=false, return_idxer=true)
-            else
-                currt = config.task_paths[pass]
-                cw = config.task_weights[pass]
-                X_mask, Y_mask, idxer = calculate_features(path, currt, out, true;
-                                    verbose = false,
-                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY,
-                                    SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD,
-                                    SIG_QUALITY_VAR=config.SIG_QUALITY_VAR,
-                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG,
-                                    PGG_THRESHOLD=config.PGG_THRESHOLD, QC_variable = config.QC_var,
-                                    remove_variable = config.remove_var,
-                                    replace_missing = config.replace_missing, return_idxer=true,
-                                    write_out = false, QC_mask = QC_mask, mask_name = mask_name,
-                                    weight_matrixes=cw)
+            NCDataset(path, "a") do f
+                for sv in sweep_views(f)
+                    dims = (dim_size(sv, "range"), dim_size(sv, "time"))
+
+                    if config.task_mode == "convolution"
+                        fm = (QC_mask && mask_name != "") ?
+                            Matrix{Bool}(.!map(ismissing, sv[mask_name][:, :])) :
+                            trues(dims)
+                        config_single = deepcopy(config)
+                        config_single.input_path = path
+                        config_single.write_out = false
+                        config_single.selected_features = md.selected_features
+                        if !isempty(md.conv_variables)
+                            config_single.conv_variables = md.conv_variables
+                        end
+                        config_single.masked_conv_variables = md.masked_conv_variables
+                        config_single.masked_conv_kernel_types = md.masked_conv_kernel_types
+                        config_single.masked_conv_kernel_sizes = md.masked_conv_kernel_sizes
+                        config_single.masked_conv_threshold = md.masked_conv_threshold
+                        config_single.masked_conv_met_prob_field = md.masked_conv_met_prob_field
+                        config_single.verbose = false
+                        result = process_single_file_conv(sv, config_single, kernel_bank_shared;
+                                                           feature_mask=fm, mask_features=QC_mask)
+                        X_mask = result[1]
+                        indexer = result[3]
+                    else
+                        currt = config.task_paths[pass]
+                        cw = config.task_weights[pass]
+                        result = process_single_file(sv, currt;
+                                                      HAS_INTERACTIVE_QC = true,
+                                                      REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY,
+                                                      SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD,
+                                                      SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                                      REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG,
+                                                      PGG_THRESHOLD = config.PGG_THRESHOLD,
+                                                      QC_variable = config.QC_var,
+                                                      remove_variable = config.remove_var,
+                                                      replace_missing = config.replace_missing,
+                                                      mask_features = QC_mask,
+                                                      feature_mask = QC_mask ? Matrix{Bool}(.!map(ismissing, sv[mask_name][:, :])) : [true true; false false],
+                                                      weight_matrixes = cw)
+                        X_mask = result[1]
+                        indexer = result[3]
+                    end
+
+                    met_probs_pred = DecisionTree.predict_proba(curr_model, X_mask)
+                    if size(met_probs_pred, 2) < 2
+                        throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET for $(path):/$(sv.sweep_name)"))
+                    end
+                    met_probs_pred = met_probs_pred[:, 2]
+                    valid_idxs = (met_probs_pred .>= minimum(curr_metprobs)) .& (met_probs_pred .<= maximum(curr_metprobs))
+
+                    ## Save met_prob predictions into this sweep
+                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+                    met_prob_idxer = copy(indexer)
+                    met_prob_field[met_prob_idxer] .= Float32.(met_probs_pred)
+                    met_prob_field = reshape(met_prob_field, dims)
+                    _define_or_overwrite!(sv, "met_prob_pass_$(pass)", met_prob_field;
+                        attribs=Dict("Units" => "probability",
+                                     "Description" => "RF meteorological probability from pass $(pass)"),
+                        verbose=false)
+
+                    ## Create mask for next pass
+                    new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
+                    idxer_flat = copy(indexer)
+                    idxer_flat[idxer_flat] .= Vector{Bool}(valid_idxs)
+                    new_mask[idxer_flat] .= 1.
+                    new_mask = reshape(new_mask, dims)
+                    _define_or_overwrite!(sv, config.mask_names[pass + 1], new_mask;
+                        attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"),
+                        verbose=false)
+                end
             end
-
-            met_probs_pred = DecisionTree.predict_proba(curr_model, X_mask)
-            if size(met_probs_pred, 2) < 2
-                throw(DomainError(1, "ERROR: ONLY ONE CLASS IN INPUT DATASET for $(path)"))
-            end
-            met_probs_pred = met_probs_pred[:, 2]
-            valid_idxs = (met_probs_pred .>= minimum(curr_metprobs)) .& (met_probs_pred .<= maximum(curr_metprobs))
-
-            ## Save met_prob predictions
-            met_prob_field = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-            met_prob_idxer = copy(idxer[1][:])
-            met_prob_field[met_prob_idxer] .= Float32.(met_probs_pred)
-            met_prob_field = reshape(met_prob_field, dims)
-            write_field(path, "met_prob_pass_$(pass)", met_prob_field,
-                attribs=Dict("Units" => "probability",
-                             "Description" => "RF meteorological probability from pass $(pass)"))
-
-            ## Create mask for next pass
-            new_mask = Matrix{Union{Missing, Float32}}(missings(dims))[:]
-            idxer_flat = idxer[1][:]
-            idxer_flat[idxer_flat] .= Vector{Bool}(valid_idxs)
-            new_mask[idxer_flat] .= 1.
-            new_mask = reshape(new_mask, dims)
-            write_field(path, config.mask_names[pass + 1], new_mask,
-                attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
 
             done = Threads.atomic_add!(files_done, 1)
             if done % 50 == 0 || done == n_paths
@@ -4049,10 +4413,80 @@ module Ronin
 
         `config::ModelConfig`
     """
+    ## Per-sweep QC writer. Operates on an already-open SweepView (root for v1,
+    ## /sweep_NNNN for v2) and writes <var><QC_SUFFIX> fields into the right
+    ## subgroup. The (config, filepath, ...) form below is the legacy entry
+    ## that opens the file and delegates to this for the single sweep view.
+    function QC_scan(config::ModelConfig, v::SweepView,
+                     predictions::Vector{Bool}, init_idxer::Vector{Bool})
+
+        if config.task_mode != "convolution"
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        else
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.mask_names))
+        end
+
+        starttime = time()
+        sweep_dims = (dim_size(v, "range"), dim_size(v, "time"))
+
+        src_path = try; string(NCDatasets.path(v.data)); catch; "[unknown file]"; end
+        where_label = isempty(v.sweep_name) ? src_path : "$(src_path):/$(v.sweep_name)"
+
+        for var in config.VARS_TO_QC
+            printstyled("QC-ING $(var) in $(where_label)\n", color=:green)
+            NEW_FIELD = missings(Float32, sweep_dims)
+
+            if predictions != Vector{Bool}(undef, 0)
+                QCED_FIELDS = v[var][:][init_idxer]
+                NEW_FIELD_ATTRS = Dict(
+                    "units" => v[var].attrib["units"],
+                    "long_name" => "Random Forest Model QC'ed $(var) field"
+                )
+
+                initial_count = count(.!map(ismissing, QCED_FIELDS))
+                print("INITIAL COUNT: $(initial_count)")
+                QCED_FIELDS = map(x -> Bool(predictions[x[1]]) ? x[2] : missing, enumerate(QCED_FIELDS))
+                final_count = count(.!map(ismissing, QCED_FIELDS))
+
+                NEW_FIELD = NEW_FIELD[:]
+                NEW_FIELD[init_idxer] = QCED_FIELDS
+                NEW_FIELD = Matrix{Union{Missing, Float32}}(reshape(NEW_FIELD, sweep_dims))
+            else
+                NEW_FIELD = missings(Float32, sweep_dims)
+                NEW_FIELD_ATTRS = Dict(
+                    "units" => v[var].attrib["units"],
+                    "long_name" => "Random Forest Model QC'ed $(var) field"
+                )
+                initial_count = 0
+                final_count = 0
+            end
+
+            _define_or_overwrite!(v, var * config.QC_SUFFIX, NEW_FIELD;
+                                   attribs = NEW_FIELD_ATTRS,
+                                   fillval = config.FILL_VAL,
+                                   verbose = config.verbose,
+                                   context = where_label)
+
+            if config.verbose
+                println("\r\nCompleted in $(time()-starttime ) seconds")
+                println()
+                printstyled("REMOVED $(initial_count - final_count) PRESUMED NON-METEORLOGICAL DATAPOINTS\n", color=:green)
+                println("FINAL COUNT OF DATAPOINTS IN $(var): $(final_count)")
+            end
+        end
+    end
+
     function QC_scan(config::ModelConfig, filepath::String, predictions::Vector{Bool}, init_idxer::Vector{Bool})
 
-        @assert (length(config.model_output_paths) == length(config.feature_output_paths)
-                 == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        if config.task_mode != "convolution"
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.task_paths) == length(config.task_weights) == length(config.mask_names))
+        else
+            @assert (length(config.model_output_paths) == length(config.feature_output_paths)
+                     == length(config.met_probs) == length(config.mask_names))
+        end
 
         starttime = time()
 
@@ -4201,6 +4635,7 @@ module Ronin
         model_selected_features = Vector{Vector{Int}}()
 
         model_conv_variables = Vector{Vector{String}}()
+        model_feature_names = Vector{Vector{String}}()
         model_masked_conv_variables = Vector{Vector{String}}()
         model_masked_conv_kernel_types = Vector{Vector{String}}()
         model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
@@ -4210,6 +4645,7 @@ module Ronin
             md = load_model_with_metadata(path, config.task_mode)
             push!(models, md.model)
             push!(model_selected_features, md.selected_features)
+            push!(model_feature_names, md.feature_names)
             push!(model_conv_variables, md.conv_variables)
             push!(model_masked_conv_variables, md.masked_conv_variables)
             push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
@@ -4225,298 +4661,291 @@ module Ronin
         ###Probably can section this off into a different function later since it's also reused in the streaming/realtime version
         for file in files
             curr_starttime = time()
-                ###Get dimensions
+                ###Classify the CfRadial layout. Ragged and unsupported layouts
+                ###are still skipped with a warning. CfRadial 2.0 is processed
+                ###natively below via per-sweep iteration (one SweepView per
+                ###/sweep_NNNN group; v1 yields a single view at root).
 
-            scan_dims = redirect_stdout(devnull) do
-
-                scan_dims = NCDataset(file) do f
-                    (dimsize(f["range"]).range, dimsize(f["time"]).time)
+            layout, _ = redirect_stdout(devnull) do
+                NCDataset(file) do f
+                    _detect_cfrad_layout(f)
                 end
-
-                scan_dims
+            end
+            if layout == :ragged || layout == :unsupported
+                _warn_unsupported_cfrad(layout, file)
+                continue
             end
 
-            ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
-            init_idxer = Vector{Bool}(undef, 0)
-            ###Keep indexer returned by the last pass of the model. This will describe where predictions
-            ###are made on the last set of gates
-            final_idxer = Vector{Bool}(undef, 0)
-
-            ###Current verification, final predictions, and probabilites
-            curr_Y = Vector{Bool}(undef, 0)
-            final_predictions = Vector{Bool}(undef, 0)
-            curr_probs = fill(-1.0, scan_dims[:])
-
-            ###For multi-pass models, iteratively construct predictions vector by applying models one at a time
-            for (i, model_path) in enumerate(config.model_output_paths)
-
-                met_prob_name = "met_prob_pass_$(i)"
-                curr_proba = config.met_probs[i]
-                met_threshold = maximum(curr_proba)
-                nmd_threshold = minimum(curr_proba)
-
-                ## --- Fast path: read saved probabilities instead of recomputing ---
-                ## When skip_existing_met_probs=true and met_prob_pass_<i> already exists,
-                ## we only need the cheap QC indexer + verification labels, not the
-                ## expensive convolution features or RF prediction.
-                can_skip_computation = false
-                if skip_existing_met_probs
-                    can_skip_computation = NCDataset(file) do ds
-                        haskey(ds, met_prob_name)
+            ###Open the file once for the whole cascade. The do-block closes
+            ###the handle (flushing writes) before we iterate the next file.
+            redirect_stdout(devnull) do
+                NCDataset(file, "a") do f
+                    views = sweep_views(f)
+                    if isempty(views)
+                        printstyled("WARNING: no QC-able sweeps in $(file); " *
+                                    "skipping\n", color=:yellow)
+                        return
                     end
-                end
+                    for v in views
+                        scan_dims = (dim_size(v, "range"), dim_size(v, "time"))
 
-                if can_skip_computation
-                    ## Read saved probabilities and build indexer cheaply
-                    f = redirect_stdout(devnull) do
-                        NCDataset(file, "r")
-                    end
+                        ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
+                        init_idxer = Vector{Bool}(undef, 0)
+                        ###Keep indexer returned by the last pass of the model. This will describe where predictions
+                        ###are made on the last set of gates
+                        final_idxer = Vector{Bool}(undef, 0)
 
-                    ## Reconstruct the QC indexer (cheap — no convolutions)
-                    VT = f[config.remove_var][:]
-                    indexer = [!ismissing(x) for x in VT]
+                        ###Current verification, final predictions, and probabilites
+                        curr_Y = Vector{Bool}(undef, 0)
+                        final_predictions = Vector{Bool}(undef, 0)
+                        curr_probs = fill(-1.0, scan_dims[:])
 
-                    if i > 1
-                        mask_name = config.mask_names[i]
-                        feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
-                        indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
-                    elseif config.QC_mask
-                        mask_name = config.mask_names[i]
-                        feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
-                        indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
-                    end
+                        ###For multi-pass models, iteratively construct predictions vector by applying models one at a time
+                        for (i, model_path) in enumerate(config.model_output_paths)
 
-                    if config.REMOVE_HIGH_PGG
-                        PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(f)[:]]
-                        indexer[indexer] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[indexer]]
-                    end
-                    if config.REMOVE_LOW_SIG_QUALITY
-                        SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(f, config.SIG_QUALITY_VAR)[:]]
-                        indexer[indexer] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[indexer]]
-                    end
+                            met_prob_name = "met_prob_pass_$(i)"
+                            curr_proba = config.met_probs[i]
+                            met_threshold = maximum(curr_proba)
+                            nmd_threshold = minimum(curr_proba)
 
-                    ## Read saved met_probs for this pass
-                    saved_probs = f[met_prob_name][:]
-                    met_probs = Float32[ismissing(x) ? Float32(-1.0) : Float32(x) for x in saved_probs[:]][indexer]
+                            ## --- Fast path: read saved probabilities instead of recomputing ---
+                            ## When skip_existing_met_probs=true and met_prob_pass_<i> already exists
+                            ## in this sweep view, we only need the cheap QC indexer + verification
+                            ## labels, not the expensive convolution features or RF prediction.
+                            can_skip_computation = skip_existing_met_probs && haskey(v, met_prob_name)
 
-                    ## Build Y if interactive QC
-                    if ((!QC_mode) && config.HAS_INTERACTIVE_QC)
-                        VG = f[config.QC_var][:][indexer]
-                        VV = f[config.remove_var][:][indexer]
-                        Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
-                    else
-                        Y = false
-                    end
+                            if can_skip_computation
+                                ## Reconstruct the QC indexer (cheap — no convolutions)
+                                VT = v[config.remove_var][:]
+                                indexer = [!ismissing(x) for x in VT]
 
-                    close(f)
+                                if i > 1
+                                    mask_name = config.mask_names[i]
+                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
+                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                elseif config.QC_mask
+                                    mask_name = config.mask_names[i]
+                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
+                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                end
 
-                    final_idxer = indexer
-                    curr_probs[indexer] .= met_probs[:]
+                                if config.REMOVE_HIGH_PGG
+                                    PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(v)[:]]
+                                    indexer[indexer] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[indexer]]
+                                end
+                                if config.REMOVE_LOW_SIG_QUALITY
+                                    SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(v, config.SIG_QUALITY_VAR)[:]]
+                                    indexer[indexer] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[indexer]]
+                                end
 
-                    append!(pass_probs[i], met_probs)
+                                ## Read saved met_probs for this pass
+                                saved_probs = v[met_prob_name][:]
+                                met_probs = Float32[ismissing(x) ? Float32(-1.0) : Float32(x) for x in saved_probs[:]][indexer]
 
-                    if i == 1
-                        init_idxer = copy(indexer)
-                        curr_Y = copy(Y)
-                        final_predictions = fill(false, sum(indexer))
-                        final_predictions[met_probs .< nmd_threshold] .= false
-                        final_predictions[met_probs .> met_threshold] .= true
-                    elseif i == config.num_models
-                        valid_idxs = indexer[init_idxer]
-                        curr_preds = final_predictions[valid_idxs]
-                        curr_preds[met_probs .>= met_threshold] .= true
-                        curr_preds[met_probs .<  nmd_threshold] .= false
-                        final_predictions[valid_idxs] .= curr_preds
-                    else
-                        valid_idxs = indexer[init_idxer]
-                        curr_preds = final_predictions[valid_idxs]
-                        curr_preds[met_probs .< nmd_threshold] .= false
-                        curr_preds[met_probs .> met_threshold] .= true
-                        final_predictions[valid_idxs] .= curr_preds
-                    end
+                                ## Build Y if interactive QC
+                                if ((!QC_mode) && config.HAS_INTERACTIVE_QC)
+                                    VG = v[config.QC_var][:][indexer]
+                                    VV = v[config.remove_var][:][indexer]
+                                    Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
+                                else
+                                    Y = false
+                                end
 
-                    continue
-                end
+                                final_idxer = indexer
+                                curr_probs[indexer] .= met_probs[:]
 
-                ## --- Normal path: compute features and run RF prediction ---
+                                append!(pass_probs[i], met_probs)
 
-                ###REFACTOR NOTES: I THINK PROCESS_SINGLE_FILE CLOSES THE FILE SO WILL NEED TO CHANGE THAT
-                ###TO MOVE OUTSIDE LOOP
-                ###We don't need to write these out, just use them briefly
-                f = redirect_stdout(devnull) do
-                    NCDataset(file, "a")
-                end
+                                if i == 1
+                                    init_idxer = copy(indexer)
+                                    curr_Y = copy(Y)
+                                    final_predictions = fill(false, sum(indexer))
+                                    final_predictions[met_probs .< nmd_threshold] .= false
+                                    final_predictions[met_probs .> met_threshold] .= true
+                                elseif i == config.num_models
+                                    valid_idxs = indexer[init_idxer]
+                                    curr_preds = final_predictions[valid_idxs]
+                                    curr_preds[met_probs .>= met_threshold] .= true
+                                    curr_preds[met_probs .<  nmd_threshold] .= false
+                                    final_predictions[valid_idxs] .= curr_preds
+                                else
+                                    valid_idxs = indexer[init_idxer]
+                                    curr_preds = final_predictions[valid_idxs]
+                                    curr_preds[met_probs .< nmd_threshold] .= false
+                                    curr_preds[met_probs .> met_threshold] .= true
+                                    final_predictions[valid_idxs] .= curr_preds
+                                end
 
-                if i > 1
-                    QC_mask = true
-                else
-                    QC_mask = config.QC_mask
-                end
+                                continue
+                            end
 
-                QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
+                            ## --- Normal path: compute features and run RF prediction ---
 
-                if QC_mask
-                    feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
-                else
-                    feature_mask = [true true; false false]
-                end
+                            if i > 1
+                                QC_mask = true
+                            else
+                                QC_mask = config.QC_mask
+                            end
+
+                            QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
+
+                            if QC_mask
+                                feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
+                            else
+                                feature_mask = [true true; false false]
+                            end
 
 
-                ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file
-                if sum(feature_mask) == 0
-                    break
-                end
+                            ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file
+                            if sum(feature_mask) == 0
+                                break
+                            end
 
-                ###Need to actually pass the QC mask
-                ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
+                            ###Need to actually pass the QC mask
+                            ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
 
-                if config.task_mode == "convolution"
-                    kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
-                    config_pred = deepcopy(config)
-                    config_pred.HAS_INTERACTIVE_QC = ((!QC_mode) && config.HAS_INTERACTIVE_QC)
-                    config_pred.selected_features = model_selected_features[i]
-                    if !isempty(model_conv_variables[i])
-                        config_pred.conv_variables = model_conv_variables[i]
-                    end
-                    config_pred.masked_conv_variables = model_masked_conv_variables[i]
-                    config_pred.masked_conv_kernel_types = model_masked_conv_kernel_types[i]
-                    config_pred.masked_conv_kernel_sizes = model_masked_conv_kernel_sizes[i]
-                    config_pred.masked_conv_threshold = model_masked_conv_thresholds[i]
-                    config_pred.masked_conv_met_prob_field = model_masked_conv_met_prob_fields[i]
-                    result = process_single_file_conv(f, config_pred, kernel_bank;
-                                                      feature_mask=feature_mask, mask_features=QC_mask)
-                    X, Y, indexer = result[1], result[2], result[3]
-                else
-                    currt = config.task_paths[i]
-                    cw = config.task_weights[i]
-                    X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
-                        , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
-                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                        QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
-                        mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
-                end
-                final_idxer = indexer
-                ###If there are no gates that meet the basic QC thresholds now, we're once again done.
-                if sum(indexer) != 0
+                            if config.task_mode == "convolution"
+                                kernel_bank = build_kernel_bank(config.conv_kernel_sizes)
+                                config_pred = deepcopy(config)
+                                config_pred.HAS_INTERACTIVE_QC = ((!QC_mode) && config.HAS_INTERACTIVE_QC)
+                                config_pred.selected_features = model_selected_features[i]
+                                if !isempty(model_conv_variables[i])
+                                    config_pred.conv_variables = model_conv_variables[i]
+                                end
+                                config_pred.masked_conv_variables = model_masked_conv_variables[i]
+                                config_pred.masked_conv_kernel_types = model_masked_conv_kernel_types[i]
+                                config_pred.masked_conv_kernel_sizes = model_masked_conv_kernel_sizes[i]
+                                config_pred.masked_conv_threshold = model_masked_conv_thresholds[i]
+                                config_pred.masked_conv_met_prob_field = model_masked_conv_met_prob_fields[i]
+                                result = process_single_file_conv(v, config_pred, kernel_bank;
+                                                                  feature_mask=feature_mask, mask_features=QC_mask)
+                                X, Y, indexer = result[1], result[2], result[3]
+                                _check_feature_width(X, model_selected_features[i], model_feature_names[i], model_path, i)
+                            else
+                                currt = config.task_paths[i]
+                                cw = config.task_weights[i]
+                                X, Y, indexer = process_single_file(v, currt, HAS_INTERACTIVE_QC = ((! QC_mode) && config.HAS_INTERACTIVE_QC)
+                                    , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                    QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
+                                    mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+                            end
+                            final_idxer = indexer
+                            ###If there are no gates that meet the basic QC thresholds now, we're once again done.
+                            if sum(indexer) != 0
 
-                    curr_model = models[i]
-                    ###Here's where we need to modify. The ONLY gates that will go on to the next pass
-                    ### will be the ones between the thresholds, (inclusive on both ends)
+                                curr_model = models[i]
+                                ###Here's where we need to modify. The ONLY gates that will go on to the next pass
+                                ### will be the ones between the thresholds, (inclusive on both ends)
 
-                    met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
-                    curr_probs[indexer] .= met_probs[:]
-                    append!(pass_probs[i], Float32.(met_probs))
+                                met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                                curr_probs[indexer] .= met_probs[:]
+                                append!(pass_probs[i], Float32.(met_probs))
 
-                    if i == 1
-                        init_idxer = copy(indexer)
-                        curr_Y = copy(Y)
-                        ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on
-                        final_predictions = fill(false, sum(indexer))
-                            ###Set gates below predicted threshold to non-met
-                        final_predictions[met_probs .< nmd_threshold] .= false
-                        final_predictions[met_probs .> met_threshold] .= true
+                                if i == 1
+                                    init_idxer = copy(indexer)
+                                    curr_Y = copy(Y)
+                                    ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on
+                                    final_predictions = fill(false, sum(indexer))
+                                        ###Set gates below predicted threshold to non-met
+                                    final_predictions[met_probs .< nmd_threshold] .= false
+                                    final_predictions[met_probs .> met_threshold] .= true
 
-                    elseif i == config.num_models
-                        ###Some weird syntax here because Julia doesn't like double indexing
-                        ###Grab spots in the scan where the gates were both passing minimum quality control thresholds
-                        ###and also have passed previous passes. Do this to ensure dimensional consistency with the
-                        ###final prediction vector.
-                        valid_idxs = indexer[init_idxer]
-                        ###Grab locations in the prediction vector where this pass is being applied.
-                        curr_preds = final_predictions[valid_idxs]
-                        ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done!
-                        curr_preds[met_probs .>= met_threshold] .= true
-                        curr_preds[met_probs .<  nmd_threshold] .= false
-                        ###Reassign
-                        final_predictions[valid_idxs] .= curr_preds
-                    else
-                        ###Indexer has NOT yet been applied so index in to the existing predictions
-                        valid_idxs = indexer[init_idxer]
-                        ###Grab locations in the prediction vector where this pass is being applied.
-                        curr_preds = final_predictions[valid_idxs]
-                        curr_preds[met_probs .< nmd_threshold] .= false
-                        curr_preds[met_probs .> met_threshold] .= true
+                                elseif i == config.num_models
+                                    ###Some weird syntax here because Julia doesn't like double indexing
+                                    ###Grab spots in the scan where the gates were both passing minimum quality control thresholds
+                                    ###and also have passed previous passes. Do this to ensure dimensional consistency with the
+                                    ###final prediction vector.
+                                    valid_idxs = indexer[init_idxer]
+                                    ###Grab locations in the prediction vector where this pass is being applied.
+                                    curr_preds = final_predictions[valid_idxs]
+                                    ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done!
+                                    curr_preds[met_probs .>= met_threshold] .= true
+                                    curr_preds[met_probs .<  nmd_threshold] .= false
+                                    ###Reassign
+                                    final_predictions[valid_idxs] .= curr_preds
+                                else
+                                    ###Indexer has NOT yet been applied so index in to the existing predictions
+                                    valid_idxs = indexer[init_idxer]
+                                    ###Grab locations in the prediction vector where this pass is being applied.
+                                    curr_preds = final_predictions[valid_idxs]
+                                    curr_preds[met_probs .< nmd_threshold] .= false
+                                    curr_preds[met_probs .> met_threshold] .= true
 
-                        final_predictions[valid_idxs] .= curr_preds
+                                    final_predictions[valid_idxs] .= curr_preds
 
-                    end
-                    close(f)
-                    ###If this wasn't the last pass, write met_prob and mask for the next pass
-                    if i < config.num_models
-                        mask_name_next = config.mask_names[i+1]
+                                end
+                                ###If this wasn't the last pass, write met_prob and mask for the next pass
+                                if i < config.num_models
+                                    mask_name_next = config.mask_names[i+1]
 
-                        ## Write met_prob_pass_<i> so the next pass can use it as a feature
-                        met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                        met_prob_field[indexer] .= met_probs
-                        met_prob_field = reshape(met_prob_field, scan_dims)
-                        write_field(file, met_prob_name, met_prob_field,
-                            attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
-                            fillval=config.FILL_VAL, verbose=false)
+                                    ## Write met_prob_pass_<i> so the next pass can use it as a feature
+                                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    met_prob_field[indexer] .= met_probs
+                                    met_prob_field = reshape(met_prob_field, scan_dims)
+                                    _define_or_overwrite!(v, met_prob_name, met_prob_field;
+                                        attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                        fillval=config.FILL_VAL, verbose=false)
 
-                        ## Write mask for gates between thresholds
-                        gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
-                        new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                        if sum(gates_of_interest) != 0
-                            @assert length(gates_of_interest) == sum(indexer)
-                            indexer[indexer] .= gates_of_interest
-                            new_mask[indexer] .= 1.
+                                    ## Write mask for gates between thresholds
+                                    gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
+                                    new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    if sum(gates_of_interest) != 0
+                                        @assert length(gates_of_interest) == sum(indexer)
+                                        indexer[indexer] .= gates_of_interest
+                                        new_mask[indexer] .= 1.
+                                    end
+                                    new_mask = reshape(new_mask, scan_dims)
+                                    _define_or_overwrite!(v, mask_name_next, new_mask;
+                                        attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"),
+                                        fillval=config.FILL_VAL, verbose=false)
+                                end
+
+                                ## Save met_prob for final pass too, so threshold sweeps can skip recomputation
+                                if i == config.num_models
+                                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    met_prob_field[indexer] .= met_probs
+                                    met_prob_field = reshape(met_prob_field, scan_dims)
+                                    _define_or_overwrite!(v, met_prob_name, met_prob_field;
+                                        attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                        fillval=config.FILL_VAL, verbose=false)
+                                end
+                            else
+                                ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
+                                ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction
+                                break
+                            end
+
+
+                        end # end pass loop
+
+
+                        ###Probably put the below into a separate function for code clarity
+                        if QC_mode
+                            QC_scan(config, v, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
+                            if config.verbose
+                                printstyled("COMPLETED FULL QC OF $(file)" *
+                                            (isempty(v.sweep_name) ? "" : ":/$(v.sweep_name)") *
+                                            " IN $(round((time() - curr_starttime), digits = 2)) SECONDS\n",
+                                            color=:green)
+                            end
+                        else
+                            if final_predictions != Vector{Bool}(undef, 0)
+                                ##Add indexer to the indexer list
+                                push!(init_idxers, init_idxer)
+                                ###Add verification to full array
+                                values = vcat(values, curr_Y)
+                                ##We only care about the probabilities where the indexer is
+                                total_met_probs = vcat(total_met_probs, curr_probs[:][init_idxer])
+
+                                ###Add on to final predictions
+                                ###Prediction vector has been interatively constructed so will comport with the verification
+                                predictions = vcat(predictions, final_predictions)
+                            end
                         end
-                        new_mask = reshape(new_mask, scan_dims)
-                        write_field(file, mask_name_next, new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL, verbose=false)
-                    end
-
-                    ## Save met_prob for final pass too, so threshold sweeps can skip recomputation
-                    if i == config.num_models
-                        met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                        met_prob_field[indexer] .= met_probs
-                        met_prob_field = reshape(met_prob_field, scan_dims)
-                        write_field(file, met_prob_name, met_prob_field,
-                            attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
-                            fillval=config.FILL_VAL, verbose=false)
-                    end
-                else
-                    ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
-                    ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction
-                    break
-                end
-
-
-            end
-
-
-            ###Probably put the below into a separate function for code clarity
-            if QC_mode
-                QC_scan(config, file, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
-                if config.verbose
-                    printstyled("COMPLETED FULL QC OF $(file) IN $(round((time() - curr_starttime), digits = 2)) SECONDS\n", color=:green)
-                end
-            else
-                if final_predictions != Vector{Bool}(undef, 0)
-                    ##Add indexer to the indexer list
-                    push!(init_idxers, init_idxer)
-                    ###Add verification to full array
-                    values = vcat(values, curr_Y)
-                    ##We only care about the probabilities where the indexer is
-                    total_met_probs = vcat(total_met_probs, curr_probs[:][init_idxer])
-                    ##First need to determine the differenc between the initial indexer and the full scan?
-
-                                # ###init_indexer contains the gates in the scan that did not meet the basic quality control thresholds.
-                                # ###A space will be needed in the predictions for each positive value here.
-                                # ###Difference of final_indxer and init_index contains gates that were marked as non-meteorological throughout the course
-                                # ###of applying the composite model. The final prediction then is ONLY on the gates that are still valid
-                                # ###in final_idxer
-                                # ###We are interested in returning the predictions and the validation for a set of gates
-                                # curr_predictions = fill(false, (sum(init_idxer)))
-                                # ###The only gates the final pass of the model applied a prediction to will be those where
-                                # ###BOTH the final indexer and the initial indexer flagged as valid. Assign the model predictions to these gates.
-                                # pred_idxer = (final_idxer[init_idxer] .== true)
-                                # curr_predictions[pred_idxer] = final_predictions
-
-                    ###Add on to final predictions
-                    ###Prediction vector has been interatively constructed so will comport with the verification
-                    predictions = vcat(predictions, final_predictions)
-                end
-            end
+                    end # end sweep loop
+                end # end NCDataset do-block
+            end # end redirect_stdout
 
         end
 
@@ -4642,6 +5071,46 @@ module Ronin
 
 
 
+    ## Define a 2D field on an already-open NCDataset (or sweep subgroup),
+    ## overwriting in place if the variable already exists. No file open/close
+    ## — caller owns the handle. Use this inside loops that already hold the
+    ## file open, both to skip the open/close churn and (for CfRadial 2.0) to
+    ## write into the right /sweep_NNNN subgroup instead of the root.
+    function _define_or_overwrite!(target::NCDataset, fieldname::String, NEW_FIELD;
+                                    overwrite::Bool = true,
+                                    attribs::Dict = Dict(),
+                                    dim_names::Tuple = ("range", "time"),
+                                    verbose::Bool = true,
+                                    fillval::T = FILL_VAL,
+                                    context::String = "") where T <: Real
+        try
+            defVar(target, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
+        catch e
+            ## If the variable already exists and overwrite is set, simply
+            ## overwrite it (values + non-_FillValue attributes).
+            if isa(e, NCDatasets.NetCDFError) && e.msg == "NetCDF: String match to name in use" && overwrite
+                if verbose
+                    where_str = isempty(context) ? "" : " in $(context)"
+                    printstyled("$(fieldname) already exists$(where_str)... overwriting\n", color=:yellow)
+                end
+                target[fieldname][:,:] = NEW_FIELD
+                if attribs != Dict("" => "")
+                    for key in keys(attribs)
+                        key == "_FillValue" && continue
+                        target[fieldname].attrib[key] = attribs[key]
+                    end
+                end
+            else
+                throw(e)
+            end
+        end
+    end
+
+    ## SweepView convenience: write into the view's data subgroup (root for v1,
+    ## /sweep_NNNN for v2).
+    _define_or_overwrite!(v::SweepView, fieldname::String, NEW_FIELD; kwargs...) =
+        _define_or_overwrite!(v.data, fieldname, NEW_FIELD; kwargs...)
+
     """
         write_field(filepath::String, fieldname::String, NEW_FIELD, overwrite::Bool = true, attribs::Dict = Dict(), dim_names::Tuple = ("range", "time"), verbose::Bool=true)
         Helper function to write/overwrite a 2D field to a netCDF file
@@ -4649,13 +5118,9 @@ module Ronin
         * `filepath::String` Name of netCDF file to write data to
         * `fieldname::String` What to call the data in the netCDF
         * `NEW_FIELD` Data dimensioned by `dim_names` to write to netCDF
-
     """
-
     function write_field(filepath::String, fieldname::String, NEW_FIELD; overwrite::Bool = true,
                 attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::T = FILL_VAL) where T <: Real
-
-
 
         if ! isfile(filepath)
             ds = NCDataset(filepath, "c")
@@ -4666,28 +5131,11 @@ module Ronin
             NCDataset(filepath, "a")
         end
 
-
         try
-            defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
-        catch e
-            ###If the variable already exists and overwrite is set, simply overwrite it
-            if isa(e, NCDatasets.NetCDFError) && e.msg == "NetCDF: String match to name in use" && overwrite
-                if verbose
-                    printstyled("$(fieldname) already exists in $(filepath)... overwriting\n", color=:yellow)
-                end
-                input_set[fieldname][:,:] = NEW_FIELD
-
-                if attribs != Dict("" => "")
-                    for key in keys(attribs)
-                        if key == "_FillValue"
-                            continue
-                        end
-                        input_set[fieldname].attrib[key] = attribs[key]
-                    end
-                end
-            else
-                throw(e)
-            end
+            _define_or_overwrite!(input_set, fieldname, NEW_FIELD;
+                                   overwrite=overwrite, attribs=attribs,
+                                   dim_names=dim_names, verbose=verbose,
+                                   fillval=fillval, context=filepath)
         finally
             close(input_set)
         end
@@ -4865,9 +5313,12 @@ module Ronin
         ###Returns precision, recall, f1, n true_postives, n false_positives, n true_negatives, n false_negatives
         scores = evaluate_model(Vector{Bool}(predictions), Vector{Bool}(targets))
 
+        task_descriptor = config.task_mode == "convolution" ?
+            [config.conv_variables] : [config.task_paths]
+
         retval = DataFrame(
                                 met_probs = [config.met_probs],
-                                task_paths = [config.task_paths],
+                                task_paths = task_descriptor,
                                 class_weights = [config.class_weights],
                                 n_trees = [config.n_trees],
                                 max_depth = [config.max_depth],
@@ -4900,21 +5351,34 @@ module Ronin
                 ###Otherwise, we need to mask out the features we want to apply the model to on the next pass
         @assert curr_model_num <= config.num_models
 
+        is_conv = config.task_mode == "convolution"
+
         ###If this is the 0th, we're just constructing the features for the first pass and don't need to do much other work
         ###This is basically useful for when we don't have a trained model and want to just get the initial set of features
         if curr_model_num > 0
             curr_model = load_model(config.model_output_paths[curr_model_num], config.task_mode)
             curr_metprobs = config.met_probs[curr_model_num]
-            curr_tasks = config.task_paths[curr_model_num]
-            curr_weights = config.task_weights[curr_model_num]
             curr_out = config.feature_output_paths[curr_model_num]
-            output_cols = get_num_tasks(curr_tasks)
+            curr_md = is_conv ? load_model_with_metadata(config.model_output_paths[curr_model_num], config.task_mode) : nothing
         else
             curr_model = ""
             curr_metprobs = ""
-            curr_tasks = config.task_paths[begin]
-            curr_weights = config.task_weights[begin]
             curr_out = config.feature_output_paths[begin]
+            curr_md = nothing
+        end
+
+        if is_conv
+            curr_tasks = String[]
+            curr_weights = nothing
+            output_cols = 0  # resolved per-file below
+        else
+            if curr_model_num > 0
+                curr_tasks = config.task_paths[curr_model_num]
+                curr_weights = config.task_weights[curr_model_num]
+            else
+                curr_tasks = config.task_paths[begin]
+                curr_weights = config.task_weights[begin]
+            end
             output_cols = get_num_tasks(curr_tasks)
         end
 
@@ -4939,9 +5403,10 @@ module Ronin
 
 
 
-        newX = X = Matrix{Float32}(undef,0,output_cols)
-        newY = Y = Matrix{Int64}(undef, 0,1)
-        idxs = Vector{}(undef,0)
+        X = is_conv ? Matrix{Float32}(undef, 0, 0) : Matrix{Float32}(undef, 0, output_cols)
+        Y = Matrix{Int64}(undef, 0, 1)
+        idxs = Vector{}(undef, 0)
+        all_feature_names = String[]
 
         for path in paths
 
@@ -4949,13 +5414,58 @@ module Ronin
                 (f.dim["range"], f.dim["time"])
             end
 
-            ###NEED to update this if it's beyond two pass so we can pass it the correct mask
-            newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true;
-                                verbose = config.verbose,
-                                REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                                REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var,
-                                remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
-                                write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
+            if is_conv
+                config_single = deepcopy(config)
+                config_single.input_path = path
+                config_single.write_out = false
+                config_single.verbose = false
+                if curr_md !== nothing
+                    config_single.selected_features = curr_md.selected_features
+                    if !isempty(curr_md.conv_variables)
+                        config_single.conv_variables = curr_md.conv_variables
+                    end
+                    config_single.masked_conv_variables = curr_md.masked_conv_variables
+                    config_single.masked_conv_kernel_types = curr_md.masked_conv_kernel_types
+                    config_single.masked_conv_kernel_sizes = curr_md.masked_conv_kernel_sizes
+                    config_single.masked_conv_threshold = curr_md.masked_conv_threshold
+                    config_single.masked_conv_met_prob_field = curr_md.masked_conv_met_prob_field
+                end
+                kernel_bank = build_kernel_bank(config_single.conv_kernel_sizes)
+                masked_conv_kb = if !isempty(config_single.masked_conv_variables)
+                    build_filtered_kernel_bank(config_single.masked_conv_kernel_types, config_single.masked_conv_kernel_sizes)
+                else
+                    ConvolutionKernel[]
+                end
+
+                cfrad = Dataset(path)
+                try
+                    fm = (QC_mask && mask_name != "") ?
+                        Matrix{Bool}(.!map(ismissing, cfrad[mask_name][:, :])) :
+                        trues(dims)
+                    result = process_single_file_conv(cfrad, config_single, kernel_bank;
+                                                      feature_mask=fm, mask_features=QC_mask)
+                    newX = result[1]
+                    newY = result[2]
+                    curr_idx_flat = result[3]
+                    feature_names = result[4]
+                    if isempty(all_feature_names)
+                        all_feature_names = feature_names
+                    end
+                    curr_idx = (reshape(curr_idx_flat, dims),)
+                    close(cfrad)
+                catch e
+                    close(cfrad)
+                    rethrow(e)
+                end
+            else
+                ###NEED to update this if it's beyond two pass so we can pass it the correct mask
+                newX, newY, curr_idx = calculate_features(path, curr_tasks, curr_out, true;
+                                    verbose = config.verbose,
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                    REMOVE_HIGH_PGG=config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD, QC_variable = config.QC_var,
+                                    remove_variable = config.remove_var, replace_missing = config.replace_missing, return_idxer=true,
+                                    write_out = false, QC_mask = QC_mask, mask_name = mask_name, weight_matrixes=curr_weights)
+            end
 
             if (curr_model_num < config.num_models) && (curr_model_num > 0)
 
@@ -4978,8 +5488,13 @@ module Ronin
                 write_field(path, config.mask_names[curr_model_num+1], new_mask, attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"))
             end
 
+            if is_conv && size(X, 2) == 0 && size(newX, 2) > 0
+                X = Matrix{Float32}(undef, 0, size(newX, 2))
+            end
             X = vcat(X, newX)::Matrix{Float32}
-            Y = vcat(Y, newY)::Matrix{Int64}
+            if newY !== false
+                Y = vcat(Y, newY)::Matrix{Int64}
+            end
 
         end
 
@@ -4994,7 +5509,12 @@ module Ronin
             fid = h5open(curr_out, "w")
 
             ###Add information to output h5 file
-            attributes(fid)["Parameters"] = get_task_params(curr_tasks)
+            if is_conv
+                params = isempty(config.selected_features) ? all_feature_names : all_feature_names[config.selected_features]
+                attributes(fid)["Parameters"] = params
+            else
+                attributes(fid)["Parameters"] = get_task_params(curr_tasks)
+            end
             attributes(fid)["MISSING_FILL_VALUE"] = config.FILL_VAL
             println()
             println("WRITING DATA TO FILE OF SHAPE $(size(X))")
@@ -5134,157 +5654,272 @@ module Ronin
 
 
     """
-    Streaming flavor of composite prediction used to
-    QC sweeps in a realtime setup.
+        composite_QC(config::ModelConfig, files::Vector{String},
+                     models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+        composite_QC(config::ModelConfig, files::Vector{String})
+
+    Streaming flavor of `composite_prediction` used to QC sweeps in a realtime
+    setup. Operates on an explicit list of CfRadial files (not `config.input_path`),
+    runs each pass of the cascade in turn, and writes `*<QC_SUFFIX>` fields back
+    into each file via `QC_scan`.
+
+    Supports both `task_mode = ""` (hand-tuned `task_paths`) and
+    `task_mode = "convolution"`. In convolution mode, per-model metadata
+    (`selected_features`, `conv_variables`, `masked_conv_*`) is loaded internally
+    from each `model_output_paths` JLD2 file; the supplied `models` vector is
+    used only for `predict_proba`.
+
+    The 2-arg form omits `models` and loads the random forests internally as
+    well — convenient for operational pipelines where the snippet is just
+    `composite_QC(load_config(path), files)`.
     """
     function composite_QC(config::ModelConfig,
                                         files::Vector{String}, models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+
+        ## Load per-model metadata once (selected_features, conv_variables, masked_conv_*).
+        ## Same pattern as composite_prediction at :4209-4219. In hand-tuned mode the
+        ## returned vectors are empty defaults and aren't used.
+        model_selected_features = Vector{Vector{Int}}()
+        model_feature_names = Vector{Vector{String}}()
+        model_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_variables = Vector{Vector{String}}()
+        model_masked_conv_kernel_types = Vector{Vector{String}}()
+        model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
+        model_masked_conv_thresholds = Vector{Float32}()
+        model_masked_conv_met_prob_fields = Vector{String}()
+        for path in config.model_output_paths
+            md = load_model_with_metadata(path, config.task_mode)
+            push!(model_selected_features, md.selected_features)
+            push!(model_feature_names, md.feature_names)
+            push!(model_conv_variables, md.conv_variables)
+            push!(model_masked_conv_variables, md.masked_conv_variables)
+            push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
+            push!(model_masked_conv_kernel_sizes, md.masked_conv_kernel_sizes)
+            push!(model_masked_conv_thresholds, md.masked_conv_threshold)
+            push!(model_masked_conv_met_prob_fields, md.masked_conv_met_prob_field)
+        end
+
+        ## Build the kernel bank once for the whole run (convolution mode only;
+        ## cheap to construct unconditionally).
+        kernel_bank = config.task_mode == "convolution" ?
+            build_kernel_bank(config.conv_kernel_sizes) :
+            ConvolutionKernel[]
 
         for file in files
 
                 if isdir(file)
                     continue
                 end
-                ###Get dimensions
-                scan_dims = NCDataset(file) do f
-                    (dimsize(f["range"]).range, dimsize(f["time"]).time)
+                ###Classify the CfRadial layout. Ragged-array files and any
+                ###file missing root `range`/`time` for non-v2 reasons are still
+                ###skipped with a warning so process_day_chunks survives a
+                ###mixed-format batch. CfRadial 2.0 is handled natively below
+                ###via the per-sweep iteration (one SweepView per /sweep_NNNN).
+                layout, _ = NCDataset(file) do f
+                    _detect_cfrad_layout(f)
+                end
+                if layout == :ragged || layout == :unsupported
+                    _warn_unsupported_cfrad(layout, file)
+                    continue
                 end
 
-                ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
-                init_idxer = Vector{Bool}(undef, 0)
-                ###Keep indexer returned by the last pass of the model. This will describe where predictions
-                ###are made on the last set of gates
-                final_idxer = Vector{Bool}(undef, 0)
-
-                ###Current verification, final predictions, and probabilites
-                curr_Y = Vector{Bool}(undef, 0)
-                final_predictions = Vector{Bool}(undef, 0)
-                curr_probs = fill(-1.0, scan_dims[:])
-
-                ###For multi-pass models, iteratively construct predictions vector by applying models one at a time
-                # Initialize QC mask as the original mask specified in the config. This will be updated to be the new mask after each pass of the model, but we need to start with the original mask for the first pass.
-                QC_mask = config.QC_mask
-                for (i, model_path) in enumerate(config.model_output_paths)
-
-
-                    currt = config.task_paths[i]
-                    cw = config.task_weights[i]
-                    ###REFACTOR NOTES: I THINK PROCESS_SINGLE_FILE CLOSES THE FILE SO WILL NEED TO CHANGE THAT
-                    ###TO MOVE OUTSIDE LOOP
-                    ###We don't need to write these out, just use them briefly
-                    f = redirect_stdout(devnull) do
-                        NCDataset(file, "a")
+                ###Open the file once for the whole cascade (across all sweeps,
+                ###all passes). Each pass writes back into the same handle.
+                NCDataset(file, "a") do f
+                    views = sweep_views(f)
+                    if isempty(views)
+                        printstyled("WARNING: no QC-able sweeps in $(file); " *
+                                    "skipping\n", color=:yellow)
+                        return
                     end
+                    for v in views
+                        scan_dims = (dim_size(v, "range"), dim_size(v, "time"))
 
-                    if i > 1
-                        QC_mask = true
-                    else
+                        ###init_idxer contains the gates that pass the first-level QC checks (NCP, PGG) + inital mask
+                        init_idxer = Vector{Bool}(undef, 0)
+                        ###Keep indexer returned by the last pass of the model. This will describe where predictions
+                        ###are made on the last set of gates
+                        final_idxer = Vector{Bool}(undef, 0)
+
+                        ###Current verification, final predictions, and probabilites
+                        curr_Y = Vector{Bool}(undef, 0)
+                        final_predictions = Vector{Bool}(undef, 0)
+                        curr_probs = fill(-1.0, scan_dims[:])
+
+                        ###For multi-pass models, iteratively construct predictions vector by applying models one at a time
+                        # Initialize QC mask as the original mask specified in the config. This will be updated to be the new mask after each pass of the model, but we need to start with the original mask for the first pass.
                         QC_mask = config.QC_mask
-                    end
+                        for (i, model_path) in enumerate(config.model_output_paths)
 
-                    QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
-
-                    if QC_mask
-                        feature_mask = Matrix{Bool}(.! map(ismissing, f[mask_name]))
-                    else
-                        feature_mask = [true true; false false]
-                    end
-
-
-                    ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file
-                    if sum(feature_mask) == 0
-                        break
-                    end
-
-                    ###Need to actually pass the QC mask
-                    ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
-                    X, Y, indexer = process_single_file(f, currt, HAS_INTERACTIVE_QC = ((! true) && config.HAS_INTERACTIVE_QC)
-                        , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
-                        REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
-                        QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
-                        mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
-                    final_idxer = indexer
-
-                    ###If there are no gates that meet the basic QC thresholds now, we're once again done.
-                    if sum(indexer) != 0
-
-                        curr_model = models[i]
-                        curr_proba = config.met_probs[i]
-                        ###Here's where we need to modify. The ONLY gates that will go on to the next pass
-                        ### will be the ones between the thresholds, (inclusive on both ends)
-
-                        met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
-                        curr_probs[indexer] .= met_probs[:]
-
-                        met_threshold = maximum(curr_proba)
-                        nmd_threshold = minimum(curr_proba)
-
-                        if i == 1
-                            init_idxer = copy(indexer)
-                            curr_Y = copy(Y)
-                            ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on
-                            final_predictions = fill(false, sum(indexer))
-                                ###Set gates below predicted threshold to non-met
-                            final_predictions[met_probs .< nmd_threshold] .= false
-                            final_predictions[met_probs .> met_threshold] .= true
-
-                        elseif i == config.num_models
-                            ###Some weird syntax here because Julia doesn't like double indexing
-                            ###Grab spots in the scan where the gates were both passing minimum quality control thresholds
-                            ###and also have passed previous passes. Do this to ensure dimensional consistency with the
-                            ###final prediction vector.
-                            valid_idxs = indexer[init_idxer]
-                            ###Grab locations in the prediction vector where this pass is being applied.
-                            curr_preds = final_predictions[valid_idxs]
-                            ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done!
-                            curr_preds[met_probs .>= met_threshold] .= true
-                            curr_preds[met_probs .<  nmd_threshold] .= false
-                            ###Reassign
-                            final_predictions[valid_idxs] .= curr_preds
-                        else
-                            ###Indexer has NOT yet been applied so index in to the existing predictions
-                            valid_idxs = indexer[init_idxer]
-                            ###Grab locations in the prediction vector where this pass is being applied.
-                            curr_preds = final_predictions[valid_idxs]
-                            curr_preds[met_probs .< nmd_threshold] .= false
-                            curr_preds[met_probs .> met_threshold] .= true
-
-                            final_predictions[valid_idxs] .= curr_preds
-
-                        end
-                        close(f)
-                        ###Probably need to remove this for speed purposes... keep it in memory,
-                        ###clear it for the next scan. Just pass it to QC_mask
-                        ###If this wasn't the last pass, need to write a mask for the gates to be predicted upon in the next iteration
-                        if i < config.num_models
-                            gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
-                            new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
-                            ###If there are no gates of interest, write out the mask as ALL MISSINGS
-                            ###Otherwise, fill in the gates of interest with 1's
-                            if sum(gates_of_interest) != 0
-                                @assert length(gates_of_interest) == sum(indexer)
-                                indexer[indexer] .= gates_of_interest
-                                new_mask[indexer] .= 1.
+                            if i > 1
+                                QC_mask = true
+                            else
+                                QC_mask = config.QC_mask
                             end
-                            new_mask = reshape(new_mask, scan_dims)
-                            write_field(file, config.mask_names[i+1], new_mask,  attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"), fillval=config.FILL_VAL)
-                         end
-                    else
-                        ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
-                        ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction
-                        break
-                    end
+
+                            QC_mask ? mask_name = config.mask_names[i] : mask_name = ""
+
+                            if QC_mask
+                                feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
+                            else
+                                feature_mask = [true true; false false]
+                            end
 
 
-                end
+                            ###If there are zero features of interest because they've all been masked out, we're done. Continue to next model, and eventaully to next file
+                            if sum(feature_mask) == 0
+                                break
+                            end
+
+                            ###Need to actually pass the QC mask
+                            ###indexer will contain true where gates in the file both were NOT masked out AND met the basic QC thresholds
+                            if config.task_mode == "convolution"
+                                config_pred = deepcopy(config)
+                                config_pred.HAS_INTERACTIVE_QC = false
+                                config_pred.selected_features = model_selected_features[i]
+                                if !isempty(model_conv_variables[i])
+                                    config_pred.conv_variables = model_conv_variables[i]
+                                end
+                                config_pred.masked_conv_variables = model_masked_conv_variables[i]
+                                config_pred.masked_conv_kernel_types = model_masked_conv_kernel_types[i]
+                                config_pred.masked_conv_kernel_sizes = model_masked_conv_kernel_sizes[i]
+                                config_pred.masked_conv_threshold = model_masked_conv_thresholds[i]
+                                config_pred.masked_conv_met_prob_field = model_masked_conv_met_prob_fields[i]
+                                result = process_single_file_conv(v, config_pred, kernel_bank;
+                                                                  feature_mask=feature_mask, mask_features=QC_mask)
+                                X, Y, indexer = result[1], result[2], result[3]
+                                _check_feature_width(X, model_selected_features[i], model_feature_names[i], model_path, i)
+                            else
+                                currt = config.task_paths[i]
+                                cw = config.task_weights[i]
+                                X, Y, indexer = process_single_file(v, currt, HAS_INTERACTIVE_QC = ((! true) && config.HAS_INTERACTIVE_QC)
+                                    , REMOVE_HIGH_PGG = config.REMOVE_HIGH_PGG, PGG_THRESHOLD = config.PGG_THRESHOLD,
+                                    REMOVE_LOW_SIG_QUALITY = config.REMOVE_LOW_SIG_QUALITY, SIG_QUALITY_THRESHOLD = config.SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR = config.SIG_QUALITY_VAR,
+                                    QC_variable = config.QC_var, replace_missing = config.replace_missing, remove_variable = config.remove_var,
+                                    mask_features = QC_mask, feature_mask = feature_mask, weight_matrixes=cw)
+                            end
+                            final_idxer = indexer
+
+                            ###If there are no gates that meet the basic QC thresholds now, we're once again done.
+                            if sum(indexer) != 0
+
+                                curr_model = models[i]
+                                curr_proba = config.met_probs[i]
+                                met_prob_name = "met_prob_pass_$(i)"
+                                ###Here's where we need to modify. The ONLY gates that will go on to the next pass
+                                ### will be the ones between the thresholds, (inclusive on both ends)
+
+                                met_probs = DecisionTree.predict_proba(curr_model, X)[:, 2]
+                                curr_probs[indexer] .= met_probs[:]
+
+                                met_threshold = maximum(curr_proba)
+                                nmd_threshold = minimum(curr_proba)
+
+                                if i == 1
+                                    init_idxer = copy(indexer)
+                                    curr_Y = copy(Y)
+                                    ###Instantiate prediction vector - the gates that meet the basic thresholds/masking on pass 1 are the ones we want to predict on
+                                    final_predictions = fill(false, sum(indexer))
+                                        ###Set gates below predicted threshold to non-met
+                                    final_predictions[met_probs .< nmd_threshold] .= false
+                                    final_predictions[met_probs .> met_threshold] .= true
+
+                                elseif i == config.num_models
+                                    ###Some weird syntax here because Julia doesn't like double indexing
+                                    ###Grab spots in the scan where the gates were both passing minimum quality control thresholds
+                                    ###and also have passed previous passes. Do this to ensure dimensional consistency with the
+                                    ###final prediction vector.
+                                    valid_idxs = indexer[init_idxer]
+                                    ###Grab locations in the prediction vector where this pass is being applied.
+                                    curr_preds = final_predictions[valid_idxs]
+                                    ###Final pass: just take the model's (majority vote) predictions for the class of the gates and we're done!
+                                    curr_preds[met_probs .>= met_threshold] .= true
+                                    curr_preds[met_probs .<  nmd_threshold] .= false
+                                    ###Reassign
+                                    final_predictions[valid_idxs] .= curr_preds
+                                else
+                                    ###Indexer has NOT yet been applied so index in to the existing predictions
+                                    valid_idxs = indexer[init_idxer]
+                                    ###Grab locations in the prediction vector where this pass is being applied.
+                                    curr_preds = final_predictions[valid_idxs]
+                                    curr_preds[met_probs .< nmd_threshold] .= false
+                                    curr_preds[met_probs .> met_threshold] .= true
+
+                                    final_predictions[valid_idxs] .= curr_preds
+
+                                end
+                                ###If this wasn't the last pass, write met_prob and mask for the next pass.
+                                ###The met_prob_pass_<i> write-back is required: subsequent passes
+                                ###(e.g. fore_mask Pass 2) consume met_prob_pass_<i> both as a plain
+                                ###conv variable and as the masked-conv met_prob field. Without it the
+                                ###masked-conv block is silently dropped, producing a too-narrow feature
+                                ###matrix and a BoundsError deep in the RF. Mirrors composite_prediction.
+                                if i < config.num_models
+                                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    met_prob_field[indexer] .= met_probs
+                                    met_prob_field = reshape(met_prob_field, scan_dims)
+                                    _define_or_overwrite!(v, met_prob_name, met_prob_field;
+                                        attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                        fillval=config.FILL_VAL, verbose=false)
+
+                                    gates_of_interest = (met_probs .>= nmd_threshold) .& (met_probs .<= met_threshold)
+                                    new_mask = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    ###If there are no gates of interest, write out the mask as ALL MISSINGS
+                                    ###Otherwise, fill in the gates of interest with 1's
+                                    if sum(gates_of_interest) != 0
+                                        @assert length(gates_of_interest) == sum(indexer)
+                                        indexer[indexer] .= gates_of_interest
+                                        new_mask[indexer] .= 1.
+                                    end
+                                    new_mask = reshape(new_mask, scan_dims)
+                                    _define_or_overwrite!(v, config.mask_names[i+1], new_mask;
+                                        attribs=Dict("Units" => "Bool", "Description" => "Gates between met prob thresholds"),
+                                        fillval=config.FILL_VAL)
+                                 end
+
+                                ###Save met_prob for the final pass too, so threshold sweeps /
+                                ###downstream tooling can read it back without recomputation.
+                                if i == config.num_models
+                                    met_prob_field = Matrix{Union{Missing, Float32}}(missings(scan_dims))[:]
+                                    met_prob_field[indexer] .= met_probs
+                                    met_prob_field = reshape(met_prob_field, scan_dims)
+                                    _define_or_overwrite!(v, met_prob_name, met_prob_field;
+                                        attribs=Dict("Units" => "Probability", "Description" => "Meteorological probability from pass $(i)"),
+                                        fillval=config.FILL_VAL, verbose=false)
+                                end
+                            else
+                                ###If the sum of the indexer is zero, we're done. There's nothing to predict upon.
+                                ###This will only happen on the first pass of the model, so we won't have to worry about actually making a prediction
+                                break
+                            end
 
 
-                ###Probably put the below into a separate function for code clarity
-                QC_scan(config, file, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
+                        end # end pass loop
+
+
+                        ###Probably put the below into a separate function for code clarity
+                        QC_scan(config, v, Vector{Bool}(final_predictions), Vector{Bool}(init_idxer))
+                    end # end sweep loop
+                end # end NCDataset do-block
         end
     end
 
+    """
+        composite_QC(config::ModelConfig, files::Vector{String})
 
+    Convenience 2-arg method that loads the random forests from
+    `config.model_output_paths` internally and forwards to the 3-arg form.
+    Equivalent to:
+
+        models = [load_model(p, config.task_mode) for p in config.model_output_paths]
+        composite_QC(config, files, models)
+    """
+    function composite_QC(config::ModelConfig, files::Vector{String})
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            load_model(p, config.task_mode) for p in config.model_output_paths
+        ]
+        composite_QC(config, files, models)
+    end
 
 
 end
