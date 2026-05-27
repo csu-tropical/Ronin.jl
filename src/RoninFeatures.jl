@@ -502,7 +502,7 @@ get_task_params(tasks::Vector{String}, variablelist) = tasks
             values in `feature_mask` are false. 
 
 """
-function process_single_file(cfrad::NCDataset, argfile_path::String; HAS_INTERACTIVE_QC::Bool = false,
+function process_single_file(v::SweepView, argfile_path::String; HAS_INTERACTIVE_QC::Bool = false,
     REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP",
     REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0,
      QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool=false,
@@ -517,15 +517,41 @@ function process_single_file(cfrad::NCDataset, argfile_path::String; HAS_INTERAC
         REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
     end
 
-    valid_vars = keys(cfrad)
+    valid_vars = keys(v)
     curr_tasks = get_task_params(argfile_path, valid_vars)
 
-    process_single_file(cfrad, curr_tasks; HAS_INTERACTIVE_QC=HAS_INTERACTIVE_QC, REMOVE_LOW_SIG_QUALITY=REMOVE_LOW_SIG_QUALITY,
+    process_single_file(v, curr_tasks; HAS_INTERACTIVE_QC=HAS_INTERACTIVE_QC, REMOVE_LOW_SIG_QUALITY=REMOVE_LOW_SIG_QUALITY,
                         SIG_QUALITY_THRESHOLD=SIG_QUALITY_THRESHOLD, SIG_QUALITY_VAR=SIG_QUALITY_VAR,
                         REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD=PGG_THRESHOLD, QC_variable = QC_variable,
                         remove_variable = remove_variable, replace_missing = replace_missing,
                         mask_features = mask_features, feature_mask =feature_mask, weight_matrixes = weight_matrixes)
 
+end
+
+## Back-compat shim: NCDataset → wrap as v1 root SweepView and delegate.
+## Kwargs are spelled out (rather than slurped via kwargs...) so that
+## `Base.kwarg_decl` introspection — used by the v1.1.0 deprecation tests —
+## continues to see REMOVE_LOW_NCP / REMOVE_LOW_SIG_QUALITY explicitly.
+function process_single_file(cfrad::NCDataset, argfile_path::String;
+    HAS_INTERACTIVE_QC::Bool = false,
+    REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP",
+    REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0,
+    QC_variable::String = "VG", remove_variable::String = "VV", replace_missing::Bool = false,
+    mask_features::Bool = false, feature_mask::Matrix{Bool} = [true true ; false false;],
+    weight_matrixes::Vector{Matrix{Union{Missing, Float32}}} = [Matrix{Union{Missing, Float32}}(undef, 0, 0)],
+    REMOVE_LOW_NCP = nothing)
+
+    process_single_file(SweepView(cfrad, nothing, ""), argfile_path;
+        HAS_INTERACTIVE_QC = HAS_INTERACTIVE_QC,
+        REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_SIG_QUALITY,
+        SIG_QUALITY_THRESHOLD = SIG_QUALITY_THRESHOLD,
+        SIG_QUALITY_VAR = SIG_QUALITY_VAR,
+        REMOVE_HIGH_PGG = REMOVE_HIGH_PGG, PGG_THRESHOLD = PGG_THRESHOLD,
+        QC_variable = QC_variable, remove_variable = remove_variable,
+        replace_missing = replace_missing,
+        mask_features = mask_features, feature_mask = feature_mask,
+        weight_matrixes = weight_matrixes,
+        REMOVE_LOW_NCP = REMOVE_LOW_NCP)
 end
 
 
