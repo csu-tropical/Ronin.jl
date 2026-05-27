@@ -4965,6 +4965,46 @@ module Ronin
 
 
 
+    ## Define a 2D field on an already-open NCDataset (or sweep subgroup),
+    ## overwriting in place if the variable already exists. No file open/close
+    ## — caller owns the handle. Use this inside loops that already hold the
+    ## file open, both to skip the open/close churn and (for CfRadial 2.0) to
+    ## write into the right /sweep_NNNN subgroup instead of the root.
+    function _define_or_overwrite!(target::NCDataset, fieldname::String, NEW_FIELD;
+                                    overwrite::Bool = true,
+                                    attribs::Dict = Dict(),
+                                    dim_names::Tuple = ("range", "time"),
+                                    verbose::Bool = true,
+                                    fillval::T = FILL_VAL,
+                                    context::String = "") where T <: Real
+        try
+            defVar(target, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
+        catch e
+            ## If the variable already exists and overwrite is set, simply
+            ## overwrite it (values + non-_FillValue attributes).
+            if isa(e, NCDatasets.NetCDFError) && e.msg == "NetCDF: String match to name in use" && overwrite
+                if verbose
+                    where_str = isempty(context) ? "" : " in $(context)"
+                    printstyled("$(fieldname) already exists$(where_str)... overwriting\n", color=:yellow)
+                end
+                target[fieldname][:,:] = NEW_FIELD
+                if attribs != Dict("" => "")
+                    for key in keys(attribs)
+                        key == "_FillValue" && continue
+                        target[fieldname].attrib[key] = attribs[key]
+                    end
+                end
+            else
+                throw(e)
+            end
+        end
+    end
+
+    ## SweepView convenience: write into the view's data subgroup (root for v1,
+    ## /sweep_NNNN for v2).
+    _define_or_overwrite!(v::SweepView, fieldname::String, NEW_FIELD; kwargs...) =
+        _define_or_overwrite!(v.data, fieldname, NEW_FIELD; kwargs...)
+
     """
         write_field(filepath::String, fieldname::String, NEW_FIELD, overwrite::Bool = true, attribs::Dict = Dict(), dim_names::Tuple = ("range", "time"), verbose::Bool=true)
         Helper function to write/overwrite a 2D field to a netCDF file
@@ -4976,8 +5016,6 @@ module Ronin
     function write_field(filepath::String, fieldname::String, NEW_FIELD; overwrite::Bool = true,
                 attribs::Dict = Dict(), dim_names::Tuple=("range", "time"), verbose::Bool=true, fillval::T = FILL_VAL) where T <: Real
 
-
-
         if ! isfile(filepath)
             ds = NCDataset(filepath, "c")
             close(ds)
@@ -4987,28 +5025,11 @@ module Ronin
             NCDataset(filepath, "a")
         end
 
-
         try
-            defVar(input_set, fieldname, NEW_FIELD, dim_names, fillvalue = fillval; attrib=attribs)
-        catch e
-            ###If the variable already exists and overwrite is set, simply overwrite it
-            if isa(e, NCDatasets.NetCDFError) && e.msg == "NetCDF: String match to name in use" && overwrite
-                if verbose
-                    printstyled("$(fieldname) already exists in $(filepath)... overwriting\n", color=:yellow)
-                end
-                input_set[fieldname][:,:] = NEW_FIELD
-
-                if attribs != Dict("" => "")
-                    for key in keys(attribs)
-                        if key == "_FillValue"
-                            continue
-                        end
-                        input_set[fieldname].attrib[key] = attribs[key]
-                    end
-                end
-            else
-                throw(e)
-            end
+            _define_or_overwrite!(input_set, fieldname, NEW_FIELD;
+                                   overwrite=overwrite, attribs=attribs,
+                                   dim_names=dim_names, verbose=verbose,
+                                   fillval=fillval, context=filepath)
         finally
             close(input_set)
         end
