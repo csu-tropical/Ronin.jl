@@ -70,31 +70,31 @@ module Ronin
         load_model(path::String, task_mode::String)
 
     Load a trained model from a JLD2 file, handling both storage formats:
-      - `save_object` format (plain model, no keys)
-      - `JLD2.jldsave` format (keyed: "model", "selected_features", etc.)
+      - `save_object` format (single key `"single_stored_object"`)
+      - `JLD2.jldsave` format (keyed: `"model"`, `"selected_features"`, etc.)
 
-    Returns the model object regardless of which format was used.
+    Returns the model object regardless of which format was used. The
+    `task_mode` argument is accepted for API compatibility but ignored;
+    layout is inferred from the file's keys.
     """
     function load_model(path::String, task_mode::String)
-        if task_mode == "convolution"
-            data = JLD2.load(path)
-            if data isa Dict && haskey(data, "model")
-                return data["model"]
-            elseif data isa Dict && haskey(data, "single_stored_object")
-                # Saved with save_object (wraps in "single_stored_object" key)
-                return data["single_stored_object"]
-            else
-                return data
-            end
+        data = JLD2.load(path)
+        if data isa Dict && haskey(data, "model")
+            return data["model"]
+        elseif data isa Dict && haskey(data, "single_stored_object")
+            return data["single_stored_object"]
         else
-            return load_object(path)
+            return data
         end
     end
 
     """
         load_model_with_metadata(path::String, task_mode::String)
 
-    Load a trained model and its metadata from a JLD2 file.
+    Load a trained model and its metadata from a JLD2 file. Accepts either
+    storage layout (single-key `save_object` or multi-key `JLD2.jldsave`).
+    `task_mode` is kept for API compatibility but is ignored; layout is
+    inferred from the file's keys.
 
     Returns a NamedTuple with fields:
       - `model`: the trained RF ensemble
@@ -104,49 +104,36 @@ module Ronin
       - `importances`: Vector{Float64} of feature importance scores (empty if not saved)
     """
     function load_model_with_metadata(path::String, task_mode::String)
-        if task_mode == "convolution"
-            data = JLD2.load(path)
-            if data isa Dict
-                model = if haskey(data, "model")
-                    data["model"]
-                elseif haskey(data, "single_stored_object")
-                    data["single_stored_object"]
-                else
-                    data
-                end
-                selected = get(data, "selected_features", Int[])
-                recommended = get(data, "recommended_features", Int[])
-                feat_names = get(data, "feature_names", String[])
-                imps = get(data, "importances", Float64[])
-                conv_vars = get(data, "conv_variables", String[])
-                masked_conv_vars = get(data, "masked_conv_variables", String[])
-                masked_conv_ktypes = get(data, "masked_conv_kernel_types", String[])
-                masked_conv_ksizes = get(data, "masked_conv_kernel_sizes", Int[])
-                masked_conv_thresh = get(data, "masked_conv_threshold", 0.1f0)
-                masked_conv_mpf = get(data, "masked_conv_met_prob_field", "")
-                return (model=model, selected_features=selected,
-                        recommended_features=recommended,
-                        feature_names=feat_names, importances=imps,
-                        conv_variables=conv_vars,
-                        masked_conv_variables=masked_conv_vars,
-                        masked_conv_kernel_types=masked_conv_ktypes,
-                        masked_conv_kernel_sizes=masked_conv_ksizes,
-                        masked_conv_threshold=masked_conv_thresh,
-                        masked_conv_met_prob_field=masked_conv_mpf)
+        data = JLD2.load(path)
+        if data isa Dict
+            model = if haskey(data, "model")
+                data["model"]
+            elseif haskey(data, "single_stored_object")
+                data["single_stored_object"]
             else
-                return (model=data, selected_features=Int[],
-                        recommended_features=Int[],
-                        feature_names=String[], importances=Float64[],
-                        conv_variables=String[],
-                        masked_conv_variables=String[],
-                        masked_conv_kernel_types=String[],
-                        masked_conv_kernel_sizes=Int[],
-                        masked_conv_threshold=0.1f0,
-                        masked_conv_met_prob_field="")
+                data
             end
+            selected = get(data, "selected_features", Int[])
+            recommended = get(data, "recommended_features", Int[])
+            feat_names = get(data, "feature_names", String[])
+            imps = get(data, "importances", Float64[])
+            conv_vars = get(data, "conv_variables", String[])
+            masked_conv_vars = get(data, "masked_conv_variables", String[])
+            masked_conv_ktypes = get(data, "masked_conv_kernel_types", String[])
+            masked_conv_ksizes = get(data, "masked_conv_kernel_sizes", Int[])
+            masked_conv_thresh = get(data, "masked_conv_threshold", 0.1f0)
+            masked_conv_mpf = get(data, "masked_conv_met_prob_field", "")
+            return (model=model, selected_features=selected,
+                    recommended_features=recommended,
+                    feature_names=feat_names, importances=imps,
+                    conv_variables=conv_vars,
+                    masked_conv_variables=masked_conv_vars,
+                    masked_conv_kernel_types=masked_conv_ktypes,
+                    masked_conv_kernel_sizes=masked_conv_ksizes,
+                    masked_conv_threshold=masked_conv_thresh,
+                    masked_conv_met_prob_field=masked_conv_mpf)
         else
-            model = load_object(path)
-            return (model=model, selected_features=Int[],
+            return (model=data, selected_features=Int[],
                     recommended_features=Int[],
                     feature_names=String[], importances=Float64[],
                     conv_variables=String[],

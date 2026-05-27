@@ -1444,6 +1444,37 @@ end
 
         rm(model_path)
     end
+
+    ## Regression: issue #41. compute_importance unconditionally re-saves
+    ## the model with jldsave, so a non-convolution workflow ends up with
+    ## a multi-key file. The loader must accept that regardless of task_mode.
+    @testset "jldsave multi-key file with non-convolution task_mode" begin
+        model_path = joinpath(test_scratchspace, "test_model_issue41.jld2")
+        isfile(model_path) && rm(model_path)
+
+        Random.seed!(42)
+        n = 100
+        X = randn(Float32, n, 4)
+        Y = [x > 0 ? 1 : 0 for x in X[:, 1]]
+        model = Ronin.DecisionTree.build_forest(Y, X, 2, 5, 0.7, 4)
+
+        JLD2.jldsave(model_path;
+            model=model,
+            selected_features=Int[],
+            recommended_features=[1, 3],
+            feature_names=["a", "b", "c", "d"],
+            importances=[0.1, 0.001, 0.05, 0.02])
+
+        md = Ronin.load_model_with_metadata(model_path, "")
+        @test md.model isa Ronin.DecisionTree.Ensemble
+        @test md.recommended_features == [1, 3]
+        @test md.feature_names == ["a", "b", "c", "d"]
+
+        m = Ronin.load_model(model_path, "")
+        @test m isa Ronin.DecisionTree.Ensemble
+
+        rm(model_path)
+    end
 end
 
 @testset "inspect_model_configuration" begin
