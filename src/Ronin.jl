@@ -1,12 +1,44 @@
 module Ronin
 
+    ## NCDatasets must come before the file includes so that the SweepView
+    ## struct (which carries `NCDataset` fields and is annotated on methods in
+    ## RoninFeatures.jl / RoninConvolutions.jl) is fully defined when those
+    ## files are evaluated. The rest of the heavy `using` block stays below.
+    using NCDatasets
+
+    ## Internal layout adapter. Presents a single CfRadial sweep — the root of
+    ## a v1 file or one /sweep_NNNN subgroup of a v2 file — with a uniform
+    ## read/write surface. Georeference variables (altitude, latitude,
+    ## longitude, ...) live at root in v1 and in a /georeference sub-sub-group
+    ## in v2; the `georef` field routes accesses accordingly. Not exported.
+    struct SweepView
+        data::NCDataset                       # v1: root; v2: /sweep_NNNN subgroup
+        georef::Union{NCDataset, Nothing}     # v1: nothing (georef vars live in `data`); v2: data.group["georeference"]
+        sweep_name::String                    # ""  for v1, "sweep_NNNN" for v2
+    end
+
+    Base.getindex(v::SweepView, name) = v.data[name]
+    Base.haskey(v::SweepView, name)   = haskey(v.data, name)
+    Base.keys(v::SweepView)           = keys(v.data)
+    dim_size(v::SweepView, name)      = v.data.dim[name]
+
+    ## Read a georeference variable (altitude / latitude / longitude / ...)
+    ## from the correct location for this layout: root for v1, /georeference
+    ## subgroup for v2.
+    function georef(v::SweepView, name)
+        if v.georef === nothing
+            return v.data[name]
+        else
+            return v.georef[name]
+        end
+    end
+
     include("./RoninFeatures.jl")
     include("./RoninConvolutions.jl")
     include("./Io.jl")
     include("./DecisionTree/DecisionTree.jl")
 
 
-    using NCDatasets
     using ImageFiltering
     using Statistics
     using Images
@@ -216,32 +248,9 @@ module Ronin
         end
     end
 
-    ## Internal layout adapter. Presents a single CfRadial sweep — the root of a
-    ## v1 file or one /sweep_NNNN subgroup of a v2 file — with a uniform read /
-    ## write surface. Georeference variables (altitude, latitude, longitude, ...)
-    ## live at root in v1 and in a /georeference sub-sub-group in v2; the
-    ## `georef` field routes accesses accordingly. Not exported.
-    struct SweepView
-        data::NCDataset                       # v1: root; v2: /sweep_NNNN subgroup
-        georef::Union{NCDataset, Nothing}     # v1: nothing (georef vars live in `data`); v2: data.group["georeference"]
-        sweep_name::String                    # ""  for v1, "sweep_NNNN" for v2
-    end
-
-    Base.getindex(v::SweepView, name) = v.data[name]
-    Base.haskey(v::SweepView, name)   = haskey(v.data, name)
-    Base.keys(v::SweepView)           = keys(v.data)
-    dim_size(v::SweepView, name)      = v.data.dim[name]
-
-    ## Read a georeference variable (altitude / latitude / longitude / ...)
-    ## from the correct location for this layout: root for v1, /georeference
-    ## subgroup for v2.
-    function georef(v::SweepView, name)
-        if v.georef === nothing
-            return v.data[name]
-        else
-            return v.georef[name]
-        end
-    end
+    ## SweepView struct + getindex/haskey/keys/dim_size/georef are defined at
+    ## the top of the module (above the includes), so methods dispatching on
+    ## SweepView in RoninFeatures.jl / RoninConvolutions.jl resolve correctly.
 
     ## Defensive subgroup helpers — NCDatasets exposes child groups via
     ## `f.group`, but some older versions or edge layouts can make naive
@@ -1432,19 +1441,23 @@ module Ronin
 
     Convolution-mode equivalent of `process_single_file`. Computes convolution features
     for a single sweep, builds the validity mask and INDEXER, and returns (X, Y, INDEXER).
+
+    Operates on a `SweepView` so CfRadial 2.0 sweep subgroups work the same as
+    v1 root datasets. The `NCDataset` method is a back-compat shim that wraps
+    the dataset as a v1 root view.
     """
-    function process_single_file_conv(cfrad::NCDataset, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
+    function process_single_file_conv(v::SweepView, config::ModelConfig, kernel_bank::Vector{ConvolutionKernel};
                                        feature_mask::AbstractMatrix{Bool}=placeholder_mask, mask_features::Bool=false)
 
-        cfrad_dims = (cfrad.dim["range"], cfrad.dim["time"])
+        cfrad_dims = (dim_size(v, "range"), dim_size(v, "time"))
         ngates = cfrad_dims[1] * cfrad_dims[2]
 
         # Build INDEXER: valid where remove_var is non-missing
-        VT = cfrad[config.remove_var][:]
+        VT = v[config.remove_var][:]
         INDEXER = [!ismissing(x) for x in VT]
 
         if length(VT) != ngates
-            fname = try; string(NCDatasets.path(cfrad)); catch; ""; end
+            fname = try; string(NCDatasets.path(v.data)); catch; ""; end
             throw(DimensionMismatch(
                 "remove_var '$(config.remove_var)' has $(length(VT)) gates but " *
                 "the sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
@@ -1453,7 +1466,7 @@ module Ronin
 
         if mask_features
             if length(feature_mask) != ngates
-                fname = try; string(NCDatasets.path(cfrad)); catch; ""; end
+                fname = try; string(NCDatasets.path(v.data)); catch; ""; end
                 throw(DimensionMismatch(
                     "QC feature mask has $(length(feature_mask)) gates but the " *
                     "sweep grid (range × time = $(cfrad_dims[1]) × $(cfrad_dims[2])) " *
@@ -1466,13 +1479,13 @@ module Ronin
         # PGG thresholding
         PGG = nothing
         if config.REMOVE_HIGH_PGG
-            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
+            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(v)[:]]
             INDEXER[INDEXER] = [x >= config.PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         end
 
         # Signal quality thresholding
         if config.REMOVE_LOW_SIG_QUALITY
-            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, config.SIG_QUALITY_VAR)[:]]
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(v, config.SIG_QUALITY_VAR)[:]]
             INDEXER[INDEXER] = [x <= config.SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
         end
 
@@ -1488,13 +1501,13 @@ module Ronin
         if !isempty(config.masked_conv_variables) && config.masked_conv_met_prob_field != ""
             masked_conv_kb = build_filtered_kernel_bank(config.masked_conv_kernel_types,
                                                          config.masked_conv_kernel_sizes)
-            if config.masked_conv_met_prob_field in keys(cfrad)
-                mp_raw = load_conv_variable(cfrad, config.masked_conv_met_prob_field,
+            if config.masked_conv_met_prob_field in keys(v)
+                mp_raw = load_conv_variable(v, config.masked_conv_met_prob_field,
                                              valid_mask, config.SIG_QUALITY_VAR)
                 mp_f32 = Matrix{Float32}(undef, cfrad_dims...)
                 for j in 1:cfrad_dims[2], i in 1:cfrad_dims[1]
-                    v = mp_raw[i, j]
-                    mp_f32[i, j] = (ismissing(v) || (v isa AbstractFloat && isnan(v))) ? 0.0f0 : Float32(v)
+                    val = mp_raw[i, j]
+                    mp_f32[i, j] = (ismissing(val) || (val isa AbstractFloat && isnan(val))) ? 0.0f0 : Float32(val)
                 end
                 met_prob_mask = mp_f32 .>= config.masked_conv_threshold
             else
@@ -1503,7 +1516,7 @@ module Ronin
         end
 
         # Compute convolution features
-        X_full, feature_names = compute_convolution_features(cfrad, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR;
+        X_full, feature_names = compute_convolution_features(v, conv_vars, kernel_bank, valid_mask, config.SIG_QUALITY_VAR;
             masked_conv_variables = config.masked_conv_variables,
             masked_conv_kernel_bank = masked_conv_kb,
             masked_conv_threshold = config.masked_conv_threshold,
@@ -1519,14 +1532,21 @@ module Ronin
 
         # Build Y if interactive QC
         if config.HAS_INTERACTIVE_QC
-            VG = cfrad[config.QC_var][:][INDEXER]
-            VV = cfrad[config.remove_var][:][INDEXER]
+            VG = v[config.QC_var][:][INDEXER]
+            VV = v[config.remove_var][:][INDEXER]
             Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
             return (X, Y, INDEXER, feature_names)
         else
             return (X, false, INDEXER, feature_names)
         end
     end
+
+    ## Back-compat shim: NCDataset → wrap as v1 root SweepView and delegate.
+    process_single_file_conv(cfrad::NCDataset, config::ModelConfig,
+                             kernel_bank::Vector{ConvolutionKernel};
+                             kwargs...) =
+        process_single_file_conv(SweepView(cfrad, nothing, ""), config,
+                                 kernel_bank; kwargs...)
 
 
     """

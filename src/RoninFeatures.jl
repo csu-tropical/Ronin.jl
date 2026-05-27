@@ -20,10 +20,14 @@ function missing_avg(data)
     mean(skipmissing(data))
 end 
 
-### Returns flattened version of signal quality variable
-function calc_sig(cfrad::NCDataset, varname::String)
-    return(cfrad[varname][:]) 
-end 
+### Returns flattened version of signal quality variable. Operates on a
+### SweepView (root for CfRadial 1.x, /sweep_NNNN subgroup for CfRadial 2.0);
+### the NCDataset method is a back-compat shim that treats the dataset as a
+### v1 root view.
+function calc_sig(v::SweepView, varname::String)
+    return(v[varname][:])
+end
+calc_sig(cfrad::NCDataset, varname::String) = calc_sig(SweepView(cfrad, nothing, ""), varname)
 
 # ##Returns flattened version of NCP 
 # function calc_ncp(data::NCDataset)
@@ -50,15 +54,17 @@ end
 #     error("Could not find NCP_L2, SQI_L2, NCP, or SQI in Dataset")
 # end
 
-function calc_rng(data::NCDataset)
-    return(repeat(data["range"][:], 1, length(data["time"])))
-end 
+function calc_rng(v::SweepView)
+    return(repeat(v["range"][:], 1, length(v["time"])))
+end
+calc_rng(data::NCDataset) = calc_rng(SweepView(data, nothing, ""))
 
-function calc_nrg(data::NCDataset)
-    rngs = calc_rng(data)
-    alts = repeat(transpose(data["altitude"][:]), length(data["range"]), 1)
+function calc_nrg(v::SweepView)
+    rngs = calc_rng(v)
+    alts = repeat(transpose(georef(v, "altitude")[:]), length(v["range"]), 1)
     return(rngs ./ alts)
-end 
+end
+calc_nrg(data::NCDataset) = calc_nrg(SweepView(data, nothing, ""))
 
 
 function _weighted_func(var, weights, func)
@@ -259,47 +265,50 @@ function calc_avg(var::Matrix{}; weights = avg_weights, window = avg_window)
     @inbounds mapwindow((x) -> _weighted_func(x, weights, missing_avg), var, window, border=Fill(missing))
 end
 
-function calc_pgg(cfrad::NCDataset)
+function calc_pgg(v::SweepView)
 
-    num_times = length(cfrad["time"])
-    num_ranges = length(cfrad["range"])
+    num_times = length(v["time"])
+    num_ranges = length(v["range"])
 
-    ranges = repeat(cfrad["range"][:], 1, num_times)
+    ranges = repeat(v["range"][:], 1, num_times)
     ##Height, elevation, and azimuth will be the same for every ray
-    heights = repeat(transpose(cfrad["altitude"][:]), num_ranges, 1)
-    elevs = repeat(transpose(cfrad["elevation"][:]), num_ranges, 1)
-    azimuths = repeat(transpose(cfrad["azimuth"][:]), num_ranges, 1)
-    
-    ##This would return 
+    heights = repeat(transpose(georef(v, "altitude")[:]), num_ranges, 1)
+    elevs = repeat(transpose(v["elevation"][:]), num_ranges, 1)
+    azimuths = repeat(transpose(v["azimuth"][:]), num_ranges, 1)
+
+    ##This would return
     @inbounds return(map((w,x,y,z) -> prob_groundgate(w,x,y,z), elevs, ranges, heights, azimuths))
-end 
+end
+calc_pgg(cfrad::NCDataset) = calc_pgg(SweepView(cfrad, nothing, ""))
 
 """
-Function used for calculating grid of radar gate heights. 
+Function used for calculating grid of radar gate heights.
 """
-function calc_aht(cfrad::NCDataset)
+function calc_aht(v::SweepView)
 
-    num_times = length(cfrad["time"])
-    num_ranges = length(cfrad["range"])
-    
-    elevs = repeat(transpose(cfrad["elevation"][:]), num_ranges, 1)
-    ranges = repeat(cfrad["range"][:], 1, num_times)
-    heights = repeat(transpose(cfrad["altitude"][:]), num_ranges, 1)
+    num_times = length(v["time"])
+    num_ranges = length(v["range"])
+
+    elevs = repeat(transpose(v["elevation"][:]), num_ranges, 1)
+    ranges = repeat(v["range"][:], 1, num_times)
+    heights = repeat(transpose(georef(v, "altitude")[:]), num_ranges, 1)
 
     @inbounds return(map((x,y,z) -> airborne_ht(Float32(x),Float32(y),Float32(z)), elevs, ranges, heights))
 
-end 
+end
+calc_aht(cfrad::NCDataset) = calc_aht(SweepView(cfrad, nothing, ""))
 
 """
 Function used for mapping elevation angle onto a grid
 """ 
-function calc_elv(cfrad::NCDataset)
+function calc_elv(v::SweepView)
 
-    num_times = length(cfrad["time"])
-    num_ranges = length(cfrad["range"])
-    repeat(transpose(cfrad["elevation"][:]), num_ranges, 1)
+    num_times = length(v["time"])
+    num_ranges = length(v["range"])
+    repeat(transpose(v["elevation"][:]), num_ranges, 1)
 
-end 
+end
+calc_elv(cfrad::NCDataset) = calc_elv(SweepView(cfrad, nothing, ""))
 
 """
     get_num_tasks(params_file; delimeter = ",")
@@ -609,7 +618,7 @@ For spatial parameters, whether or not to replace `missings` values with `FILL_V
                 where in the scan features valid data and where does not. Will also contain `false` where 
                 values in `feature_mask` are false. 
 """
-function process_single_file(cfrad::NCDataset, tasks::Vector{String};
+function process_single_file(v::SweepView, tasks::Vector{String};
     HAS_INTERACTIVE_QC::Bool = false,
     REMOVE_LOW_SIG_QUALITY::Bool = false, SIG_QUALITY_THRESHOLD::Float32 = .2f0, SIG_QUALITY_VAR = "NCP",
     REMOVE_HIGH_PGG::Bool = false, PGG_THRESHOLD::Float32 = 1.f0,
@@ -624,22 +633,24 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
         REMOVE_LOW_SIG_QUALITY = REMOVE_LOW_NCP
     end
 
-    cfrad_dims = (cfrad.dim["range"], cfrad.dim["time"])
+    nrange = dim_size(v, "range")
+    ntime  = dim_size(v, "time")
+    cfrad_dims = (nrange, ntime)
     #println("\r\nDIMENSIONS: $(cfrad_dims[1]) times x $(cfrad_dims[2]) ranges\n")
-    
+
     if replace_missing
-        global REPLACE_MISSING_WITH_FILL = true 
-    else 
-        global REPLACE_MISSING_WITH_FILL = false 
-    end 
+        global REPLACE_MISSING_WITH_FILL = true
+    else
+        global REPLACE_MISSING_WITH_FILL = false
+    end
 
-    valid_vars = keys(cfrad) 
-    ###Features array 
-    X = Matrix{Float32}(undef,cfrad.dim["time"] * cfrad.dim["range"], length(tasks))
+    valid_vars = keys(v)
+    ###Features array
+    X = Matrix{Float32}(undef, ntime * nrange, length(tasks))
 
-    ###Array to hold PGG for indexing  
-    PGG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
-    SIG = Matrix{Float32}(undef, cfrad.dim["time"]*cfrad.dim["range"], 1)
+    ###Array to hold PGG for indexing
+    PGG = Matrix{Float32}(undef, ntime * nrange, 1)
+    SIG = Matrix{Float32}(undef, ntime * nrange, 1)
 
     PGG_Completed_Flag = false 
     SIG_Completed_Flag = false 
@@ -687,19 +698,19 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
                 window_size = size(weight_matrix)
             end 
 
-            currdat = cfrad[var][:,:]
+            currdat = v[var][:,:]
 
             if mask_features
-                ##Set invalid data to missing for spatial parameter calculations. This way, they 
-                ##will be ignored. 
-                currdat[.! feature_mask] .= missing 
+                ##Set invalid data to missing for spatial parameter calculations. This way, they
+                ##will be ignored.
+                currdat[.! feature_mask] .= missing
 
                 raw = @eval $func($currdat)[:]
-                
+
             else
                 #raw = @eval slide_window(currdat, weight_matrix, $func)[:]
-                raw = @eval $func($cfrad[$var][:,:]; weights=$weight_matrix, window = $window_size )[:]
-            end 
+                raw = @eval $func($v[$var][:,:]; weights=$weight_matrix, window = $window_size )[:]
+            end
 
             filled = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
         
@@ -718,12 +729,12 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
             ###bona-fide derived parameter but wiht the way the files are setup wanted to
             ###include it in the list of derived parameters. 
             if (task == "SIG")
-                SIG = calc_sig(cfrad, SIG_QUALITY_VAR)
+                SIG = calc_sig(v, SIG_QUALITY_VAR)
                 SIG_Completed_Flag = true
                 X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in SIG[:]]
             else
                 func = Symbol(func_prefix * lowercase(task))
-                raw = @eval $func($cfrad)[:]
+                raw = @eval $func($v)[:]
                 X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in raw]
 
                 if (task == "PGG")
@@ -735,11 +746,11 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
 
             calc_length = time() - startTime
         ###Otherwise it's just a variable from the cfrad 
-        else 
-            startTime = time() 
-            X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in cfrad[task][:]]
+        else
+            startTime = time()
+            X[:, i] = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in v[task][:]]
             calc_length = time() - startTime
-        end 
+        end
     end
 
 
@@ -751,7 +762,7 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
 
     starttime = time() 
 
-    VT = cfrad[remove_variable][:]
+    VT = v[remove_variable][:]
     INDEXER = [ismissing(x) for x in VT]
     ##Initial gates to focus on 
   
@@ -780,12 +791,12 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
     	println("DATAPOINTS BEFORE SIGNAL QUALITY THRESHOLDING APPLIED: $(sum(INDEXER))") 
         ###Remove data that does not equal or exceed minimum NCP threshold 
         ###Only need to do this for indicies that are true in INDEXER, as this is only remaining valid data
-        if (SIG_Completed_Flag) 
+        if (SIG_Completed_Flag)
             INDEXER[INDEXER] = [x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
-        else 
-            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(cfrad, SIG_QUALITY_VAR)[:]]
+        else
+            SIG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_sig(v, SIG_QUALITY_VAR)[:]]
             INDEXER[INDEXER] = [ x <= SIG_QUALITY_THRESHOLD ? false : true for x in SIG[INDEXER]]
-        end 
+        end
 	println("DATAPOINTS AFTER SIGNAL QUALITY THRESHOLD APPLIED: $(sum(INDEXER))") 
     end
 
@@ -796,7 +807,7 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
         if (PGG_Completed_Flag)
             INDEXER[INDEXER] = [x >= PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         else
-            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(cfrad)[:]]
+            PGG = [ismissing(x) || isnan(x) ? Float32(FILL_VAL) : Float32(x) for x in calc_pgg(v)[:]]
             INDEXER[INDEXER] = [x >= PGG_THRESHOLD ? false : true for x in PGG[INDEXER]]
         end
 	println("DATAPIONTS AFTER PGG REMOVAL $(sum(INDEXER))") 
@@ -815,8 +826,8 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
         startTime = time() 
         ###try catch block here to see if the scan has interactive QC
         ###Filter the input arrays first 
-        VG = cfrad[QC_variable][:][INDEXER]
-        VV = cfrad[remove_variable][:][INDEXER]
+        VG = v[QC_variable][:][INDEXER]
+        VV = v[remove_variable][:][INDEXER]
 
         Y = reshape([ismissing(x) ? 0 : 1 for x in VG .- VV][:], (:, 1))
         calc_length = time() - startTime
@@ -824,5 +835,11 @@ function process_single_file(cfrad::NCDataset, tasks::Vector{String};
         return(X, Y, INDEXER)
     else
         return(X, false, INDEXER)
-    end 
-end 
+    end
+end
+
+## Back-compat shim: accept an NCDataset (treated as a v1 root view) and
+## delegate to the SweepView method. Keeps the exported process_single_file
+## signature stable.
+process_single_file(cfrad::NCDataset, tasks::Vector{String}; kwargs...) =
+    process_single_file(SweepView(cfrad, nothing, ""), tasks; kwargs...)
