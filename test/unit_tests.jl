@@ -1978,6 +1978,87 @@ end
         rm(workdir; recursive=true)
     end
 
+    @testset "composite_QC 4-arg ≡ 3-arg (convolution)" begin
+        ## Equivalence guard for the v1.2.0 perf-branch addition: the new 4-arg
+        ## form (caller-provided pre-loaded metadata) must produce byte-identical
+        ## CfRadial outputs to the 3-arg form (metadata loaded internally) on
+        ## the same input and same models.
+        workdir = _orch_workdir("orch_compositeqc4_equiv_conv")
+        config, cfrad_a = _train_smoke_conv_model(workdir)
+        cfrad_b = joinpath(workdir, "smoke_b.nc")
+        cp(cfrad_a, cfrad_b)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        metadata = [Ronin.load_model_with_metadata(p, "convolution")
+                    for p in config.model_output_paths]
+
+        Ronin.composite_QC(config, [cfrad_a], models)
+        Ronin.composite_QC(config, [cfrad_b], models, metadata)
+
+        NCDataset(cfrad_a) do da
+            NCDataset(cfrad_b) do db
+                for field in ("VV_QC", "ZZ_QC", "met_prob_pass_1")
+                    @test haskey(da, field)
+                    @test haskey(db, field)
+                    @test isequal(da[field][:, :], db[field][:, :])
+                end
+            end
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 4-arg ≡ 3-arg (hand-tuned) — back-compat" begin
+        workdir = _orch_workdir("orch_compositeqc4_equiv_ht")
+        config, cfrad_a = _train_smoke_handtuned_model(workdir)
+        cfrad_b = joinpath(workdir, "smoke_ht_b.nc")
+        cp(cfrad_a, cfrad_b)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "") for p in config.model_output_paths
+        ]
+        metadata = [Ronin.load_model_with_metadata(p, "")
+                    for p in config.model_output_paths]
+
+        Ronin.composite_QC(config, [cfrad_a], models)
+        Ronin.composite_QC(config, [cfrad_b], models, metadata)
+
+        NCDataset(cfrad_a) do da
+            NCDataset(cfrad_b) do db
+                for field in ("VV_QC", "ZZ_QC", "met_prob_pass_1")
+                    @test haskey(da, field)
+                    @test haskey(db, field)
+                    @test isequal(da[field][:, :], db[field][:, :])
+                end
+            end
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 4-arg — ArgumentError on length mismatch" begin
+        workdir = _orch_workdir("orch_compositeqc4_argerr")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        good_metadata = [Ronin.load_model_with_metadata(p, "convolution")
+                         for p in config.model_output_paths]
+
+        ## metadata too long
+        bad_metadata = vcat(good_metadata, good_metadata)
+        @test_throws ArgumentError Ronin.composite_QC(config, [cfrad_path], models, bad_metadata)
+
+        ## models too short
+        short_models = empty(models)
+        @test_throws ArgumentError Ronin.composite_QC(config, [cfrad_path], short_models, good_metadata)
+
+        rm(workdir; recursive=true)
+    end
+
     @testset "QC_scan(config) (hand-tuned) — back-compat" begin
         workdir = _orch_workdir("orch_qcscan_ht")
         config, cfrad_path = _train_smoke_handtuned_model(workdir)
