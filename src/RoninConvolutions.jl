@@ -171,6 +171,17 @@ Returns `(result, valid_fraction)` where:
 - `valid_fraction[i,j]` = fraction of kernel footprint that had valid data (ISO equivalent)
 
 Missing/invalid gates contribute nothing. Edges are zero-padded (treated as invalid).
+
+NOTE: the `weighted_sum / weight_sum` normalization (where `weight_sum` is the sum
+of *absolute* kernel weights over valid neighbors) is applied uniformly to every
+kernel, including the zero-sum differential kernels (`laplacian`, `sobel_*`). This
+is intentional and is the behavior validated against real-world data for v1.2.0:
+for interior gates with a full neighborhood it scales the differential response by
+`sum(abs.(kernel))`, and near edges / missing gates it renormalizes by the valid
+footprint. Changing this normalization would alter every edge/texture feature fed
+to the classifier, so it must not be "fixed" without re-validation. See the v1.2.1
+backlog (docs/KNOWN_ISSUES.md) for the open question of separate smoothing vs. differential
+normalization.
 """
 function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::AbstractMatrix{Bool};
                          neighbor_mask::AbstractMatrix{Bool}=valid)
@@ -183,6 +194,10 @@ function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::
     valid_frac = Matrix{Float32}(undef, nrows, ncols)
 
     abs_kernel = abs.(kernel)
+    # `total_abs_weight` is the sum over the full kernel footprint and is
+    # independent of gate position (the abs weight is added for every kernel
+    # tap regardless of bounds/mask), so hoist it out of the hot loop.
+    total_abs_weight = sum(abs_kernel)
 
     @inbounds for j in 1:ncols, i in 1:nrows
         if !valid[i, j]
@@ -193,7 +208,6 @@ function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::
 
         weighted_sum = 0.0f0
         weight_sum = 0.0f0
-        total_abs_weight = 0.0f0
 
         for dj in -hc:hc, di in -hr:hr
             ni = i + di
@@ -201,13 +215,10 @@ function masked_convolve(data::Matrix{Float32}, kernel::Matrix{Float32}, valid::
             ki = di + hr + 1
             kj = dj + hc + 1
             kw = kernel[ki, kj]
-            akw = abs_kernel[ki, kj]
-
-            total_abs_weight += akw
 
             if ni >= 1 && ni <= nrows && nj >= 1 && nj <= ncols && neighbor_mask[ni, nj]
                 weighted_sum += kw * data[ni, nj]
-                weight_sum += akw
+                weight_sum += abs_kernel[ki, kj]
             end
         end
 

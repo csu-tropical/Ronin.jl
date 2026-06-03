@@ -218,7 +218,7 @@ module Ronin
         elseif !has_root_range || !has_root_time
             return (:unsupported, (0, 0))
         else
-            return (:ok, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+            return (:ok, (0, 0))
         end
     end
 
@@ -4721,12 +4721,12 @@ module Ronin
 
                                 if i > 1
                                     mask_name = config.mask_names[i]
-                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
-                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                    feature_mask = vec(Matrix{Bool}(.! map(ismissing, v[mask_name])))
+                                    indexer = [indexer[j] ? feature_mask[j] : false for j in eachindex(indexer)]
                                 elseif config.QC_mask
                                     mask_name = config.mask_names[i]
-                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
-                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                    feature_mask = vec(Matrix{Bool}(.! map(ismissing, v[mask_name])))
+                                    indexer = [indexer[j] ? feature_mask[j] : false for j in eachindex(indexer)]
                                 end
 
                                 if config.REMOVE_HIGH_PGG
