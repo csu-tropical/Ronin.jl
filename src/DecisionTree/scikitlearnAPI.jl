@@ -72,7 +72,7 @@ predict_proba(dt::DecisionTreeClassifier, X) =
     apply_tree_proba(dt.root, X, dt.classes)
 
 predict_log_proba(dt::DecisionTreeClassifier, X) =
-    log(predict_proba(dt, X)) # this will yield -Inf when p=0. Hmmm...
+    log.(predict_proba(dt, X)) # elementwise; yields -Inf when p=0. Hmmm...
 
 function show(io::IO, dt::DecisionTreeClassifier)
     println(io, "DecisionTreeClassifier")

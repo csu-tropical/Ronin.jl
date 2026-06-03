@@ -389,16 +389,16 @@ function get_task_params(params_file, variablelist; delimiter=",")
 
     full_tasks = ""
     for itm in tasks
-        if (itm != "") && (itm[1] != "#")
+        if (itm != "") && (itm[1] != '#')
             if full_tasks == ""
                 full_tasks = strip(itm, ',')
-            else 
+            else
                 full_tasks = full_tasks * "," * strip(itm, ',')
-            end 
-        end 
-    end 
+            end
+        end
+    end
 
-    
+
     delimited = split(full_tasks, delimiter)
     for token in delimited
         ###Remove whitespace and see if the token is of the form ABC(DEF)
@@ -445,13 +445,13 @@ function get_task_params(params_file; delimiter = ',')
 
     full_tasks = ""
     for itm in tasks
-        if (itm != "") && (itm[1] != "#")
+        if (itm != "") && (itm[1] != '#')
             if full_tasks == ""
                 full_tasks = strip(itm, ',')
-            else 
+            else
                 full_tasks = full_tasks * "," * strip(itm, ',')
-            end 
-        end 
+            end
+        end
     end 
 
 
@@ -731,7 +731,10 @@ function process_single_file(v::SweepView, tasks::Vector{String};
                 ##will be ignored.
                 currdat[.! feature_mask] .= missing
 
-                raw = @eval $func($currdat)[:]
+                ##Honor custom weights/window here too. When add_weight_matrix is false these
+                ##default to the canonical *_weights / size(*_weights), which equals the function
+                ##defaults, so this is bit-identical to the bare call for the default path.
+                raw = @eval $func($currdat; weights=$weight_matrix, window=$window_size)[:]
 
             else
                 #raw = @eval slide_window(currdat, weight_matrix, $func)[:]

@@ -379,6 +379,34 @@ end
         rm(config_path2)
     end
 
+    @testset "get_task_params skips comment lines" begin
+        # Lines beginning with '#' must be ignored. Regression guard for the
+        # Char-vs-String comparison bug (`itm[1] != "#"` was always true), which
+        # let a comment line's comma-separated tokens leak into the task list.
+        varlist = ["NCP", "DBZ", "VV"]
+
+        # With variablelist: "AHT" sits after a comma on a commented line and
+        # would be picked up if the comment were not skipped.
+        config_path = joinpath(test_scratchspace, "test_tasks_comment.txt")
+        create_test_config(config_path, "NCP, DBZ\n# STD(VV), AHT")
+        tasks = Ronin.get_task_params(config_path, varlist)
+        @test length(tasks) == 2
+        @test "NCP" in tasks
+        @test "DBZ" in tasks
+        @test !any(t -> occursin("AHT", t), tasks)
+        @test !any(t -> occursin("#", t), tasks)
+        rm(config_path)
+
+        # Without variablelist: "ELV" trails a comma on a commented line.
+        config_path2 = joinpath(test_scratchspace, "test_tasks_comment2.txt")
+        create_test_config(config_path2, "AHT\n#PGG, ELV")
+        tasks2 = Ronin.get_task_params(config_path2)
+        @test "AHT" in tasks2
+        @test !("ELV" in tasks2)
+        @test length(tasks2) == 1
+        rm(config_path2)
+    end
+
     @testset "parse_directory" begin
         test_dir = joinpath(test_scratchspace, "test_parse_dir")
         mkpath(test_dir)
@@ -867,6 +895,9 @@ end
         n = 100
         n_features = 3
         X = randn(Float32, n, n_features)
+        # Tag each row with its 1-based index in column 1 so we can verify the
+        # exact partition (not just the counts) survives the split.
+        X[:, 1] .= Float32.(1:n)
         Y = reshape(rand([0, 1], n), :, 1)
 
         input_path = joinpath(test_scratchspace, "rv_input.h5")
@@ -892,10 +923,26 @@ end
         # Check sizes: every 10th row goes to validation
         h5open(train_path) do ft
             h5open(val_path) do fv
-                n_train = size(ft["X"][:,:])[1]
-                n_val = size(fv["X"][:,:])[1]
+                Xt = ft["X"][:,:]
+                Xv = fv["X"][:,:]
+                n_train = size(Xt)[1]
+                n_val = size(Xv)[1]
                 @test n_train + n_val == n
                 @test n_val == length(1:10:n)  # every 10th row
+
+                # Exact partition: validation rows are precisely 1,11,21,...,
+                # training is the complement, the two are disjoint, and together
+                # they reconstruct the original. Guards against a train/val swap
+                # or stride drift that count-only checks would miss.
+                val_ids = Int.(round.(Xv[:, 1]))
+                train_ids = Int.(round.(Xt[:, 1]))
+                @test sort(val_ids) == collect(1:10:n)
+                @test isempty(intersect(val_ids, train_ids))
+                @test sort(vcat(val_ids, train_ids)) == collect(1:n)
+
+                # Attributes round-trip to both outputs.
+                @test read(attributes(ft)["Parameters"]) == ["F1", "F2", "F3"]
+                @test read(attributes(fv)["Parameters"]) == ["F1", "F2", "F3"]
             end
         end
 
@@ -1978,6 +2025,87 @@ end
         rm(workdir; recursive=true)
     end
 
+    @testset "composite_QC 4-arg ≡ 3-arg (convolution)" begin
+        ## Equivalence guard for the v1.2.0 perf-branch addition: the new 4-arg
+        ## form (caller-provided pre-loaded metadata) must produce byte-identical
+        ## CfRadial outputs to the 3-arg form (metadata loaded internally) on
+        ## the same input and same models.
+        workdir = _orch_workdir("orch_compositeqc4_equiv_conv")
+        config, cfrad_a = _train_smoke_conv_model(workdir)
+        cfrad_b = joinpath(workdir, "smoke_b.nc")
+        cp(cfrad_a, cfrad_b)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        metadata = [Ronin.load_model_with_metadata(p, "convolution")
+                    for p in config.model_output_paths]
+
+        Ronin.composite_QC(config, [cfrad_a], models)
+        Ronin.composite_QC(config, [cfrad_b], models, metadata)
+
+        NCDataset(cfrad_a) do da
+            NCDataset(cfrad_b) do db
+                for field in ("VV_QC", "ZZ_QC", "met_prob_pass_1")
+                    @test haskey(da, field)
+                    @test haskey(db, field)
+                    @test isequal(da[field][:, :], db[field][:, :])
+                end
+            end
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 4-arg ≡ 3-arg (hand-tuned) — back-compat" begin
+        workdir = _orch_workdir("orch_compositeqc4_equiv_ht")
+        config, cfrad_a = _train_smoke_handtuned_model(workdir)
+        cfrad_b = joinpath(workdir, "smoke_ht_b.nc")
+        cp(cfrad_a, cfrad_b)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "") for p in config.model_output_paths
+        ]
+        metadata = [Ronin.load_model_with_metadata(p, "")
+                    for p in config.model_output_paths]
+
+        Ronin.composite_QC(config, [cfrad_a], models)
+        Ronin.composite_QC(config, [cfrad_b], models, metadata)
+
+        NCDataset(cfrad_a) do da
+            NCDataset(cfrad_b) do db
+                for field in ("VV_QC", "ZZ_QC", "met_prob_pass_1")
+                    @test haskey(da, field)
+                    @test haskey(db, field)
+                    @test isequal(da[field][:, :], db[field][:, :])
+                end
+            end
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "composite_QC 4-arg — ArgumentError on length mismatch" begin
+        workdir = _orch_workdir("orch_compositeqc4_argerr")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        models = Ronin.DecisionTree.RandomForestClassifier[
+            Ronin.load_model(p, "convolution") for p in config.model_output_paths
+        ]
+        good_metadata = [Ronin.load_model_with_metadata(p, "convolution")
+                         for p in config.model_output_paths]
+
+        ## metadata too long
+        bad_metadata = vcat(good_metadata, good_metadata)
+        @test_throws ArgumentError Ronin.composite_QC(config, [cfrad_path], models, bad_metadata)
+
+        ## models too short
+        short_models = empty(models)
+        @test_throws ArgumentError Ronin.composite_QC(config, [cfrad_path], short_models, good_metadata)
+
+        rm(workdir; recursive=true)
+    end
+
     @testset "QC_scan(config) (hand-tuned) — back-compat" begin
         workdir = _orch_workdir("orch_qcscan_ht")
         config, cfrad_path = _train_smoke_handtuned_model(workdir)
@@ -2224,6 +2352,105 @@ end
             @test haskey(ds, "mask_pass_1")
             @test haskey(ds, "VV" * config.QC_SUFFIX)
             @test haskey(ds, "ZZ" * config.QC_SUFFIX)
+        end
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "skip_existing_met_probs equivalence (run_evaluation)" begin
+        ## Test A: the skip_existing_met_probs fast path reconstructs the QC
+        ## indexer independently of process_single_file_conv and reads the saved
+        ## met_prob_pass_<i> field instead of recomputing features+predict. Under
+        ## a matched config it MUST yield identical predictions/metrics to the
+        ## full computation. A divergence here (e.g. an indexer mismatch turning a
+        ## valid gate into the -1.0 sentinel) would silently corrupt evaluation
+        ## metrics, so pin the equivalence.
+        workdir = _orch_workdir("orch_skip_equiv_conv")
+        config, cfrad_path = _train_smoke_conv_model(workdir)
+
+        ## Populate met_prob_pass_1 in the CfRadial so the skip path has a field
+        ## to read; composite_QC writes it from the same model + same features.
+        Ronin.composite_QC(config, [cfrad_path])
+
+        probs = [(0.1f0, 0.9f0)]
+        r_full = Ronin.run_evaluation(config, "full", cfrad_path, probs;
+                                      skip_existing_met_probs=false, verbose=false)
+        r_skip = Ronin.run_evaluation(config, "skip", cfrad_path, probs;
+                                      skip_existing_met_probs=true, verbose=false)
+
+        @test r_full.predictions == r_skip.predictions
+        @test r_full.targets == r_skip.targets
+        @test r_full.tp == r_skip.tp
+        @test r_full.fp == r_skip.fp
+        @test r_full.tn == r_skip.tn
+        @test r_full.fn == r_skip.fn
+        @test r_full.n  == r_skip.n
+        @test r_full.f1 == r_skip.f1
+
+        ## Sanity: metrics are well-formed probabilities / counts.
+        @test 0.0 <= r_full.precision <= 1.0
+        @test 0.0 <= r_full.recall <= 1.0
+        @test 0.0 <= r_full.f1 <= 1.0
+        @test r_full.tp + r_full.fp + r_full.tn + r_full.fn == r_full.n
+
+        rm(workdir; recursive=true)
+    end
+
+    @testset "regenerate_masks applies thresholds exactly (met_prob classification)" begin
+        ## Test B: numerically pin the met_prob threshold -> mask decision.
+        ## regenerate_masks reads a saved met_prob_pass_<pass> field and marks a
+        ## gate (1.0f0) iff threshold_low <= p <= threshold_high (inclusive both
+        ## ends), leaving everything else missing. This is the one place the
+        ## threshold arithmetic is exercised on fully controllable inputs, so we
+        ## assert the exact mask on a hand-built probability field that straddles
+        ## both boundaries and includes a missing gate.
+        workdir = _orch_workdir("orch_regen_masks")
+        cfrad_path = joinpath(workdir, "regen.nc")
+        create_test_cfrad(cfrad_path; range_dim=2, time_dim=4, seed=3)
+
+        ## Probabilities chosen to exercise: below-low, exactly-low (included),
+        ## middle, exactly-high (included), above-high, and a missing gate.
+        ## Layout is (range=2, time=4).
+        probs = Union{Missing,Float32}[
+            0.05f0  0.50f0  0.95f0  missing ;
+            0.10f0  0.90f0  0.00f0  1.00f0
+        ]
+        NCDataset(cfrad_path, "a") do f
+            defVar(f, "met_prob_pass_1", probs, ("range", "time"))
+        end
+
+        config = Ronin.make_config(;
+            num_models = 2,
+            input_path = cfrad_path,
+            experiment_name = "regen",
+            mask_names = ["mask_pass_0", "mask_pass_1"],
+            met_probs = [(0.1f0, 0.9f0), (0.1f0, 0.9f0)],
+            task_mode = "convolution",
+            conv_variables = ["DBZ"],
+            conv_kernel_sizes = [3],
+            verbose = false,
+        )
+
+        ## Regenerate the pass-2 mask (writes config.mask_names[2] = "mask_pass_1")
+        ## from met_prob_pass_1 using the inclusive band [0.1, 0.9].
+        Ronin.regenerate_masks(config, 1, (0.1f0, 0.9f0))
+
+        ## Expected: 1.0 where 0.1 <= p <= 0.9, missing otherwise (incl. the
+        ## missing input gate). Boundary values 0.1 and 0.9 are INCLUDED.
+        expected_masked = Bool[
+            false  true   false  false ;   # 0.05 no, 0.50 yes, 0.95 no, missing no
+            true   true   false  false     # 0.10 yes, 0.90 yes, 0.00 no, 1.00 no
+        ]
+
+        NCDataset(cfrad_path) do f
+            mask = f["mask_pass_1"][:, :]
+            for idx in eachindex(mask)
+                if expected_masked[idx]
+                    @test mask[idx] == 1.0f0
+                else
+                    @test ismissing(mask[idx])
+                end
+            end
         end
 
         rm(workdir; recursive=true)

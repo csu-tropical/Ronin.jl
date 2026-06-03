@@ -23,9 +23,16 @@ validation_output::String = "validation.h5"
 Path to output validation features to
 
 ```julia
-remove_original::Bool = true 
+remove_original::Bool = true
 ```
-Whether or not to remove the original file described by the `input_dataset` path. 
+Whether or not to remove the original file described by the `input_dataset` path.
+
+NOTE: the split is a *deterministic* stride — every 10th row (indices 1, 11, 21, …)
+goes to the validation set and the remainder to training. This is not a randomized
+split; if the feature matrix is ordered (e.g. grouped by sweep/time), the validation
+set inherits that structure. `remove_original=true` (the default) deletes the input
+file after writing the outputs, so pass distinct output paths. See docs/KNOWN_ISSUES.md
+for the v1.2.1 follow-up (optional seeded random split + path-collision guard).
 """
 function remove_validation(input_dataset::String; training_output::String="train_no_validation_set.h5", 
                             validation_output::String = "validation.h5", remove_original::Bool=true)

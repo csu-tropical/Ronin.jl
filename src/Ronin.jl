@@ -145,6 +145,15 @@ module Ronin
         end
     end
 
+    ## Internal: load `load_model_with_metadata` for every entry in
+    ## `config.model_output_paths`. Used by the 2-arg/3-arg `composite_QC`
+    ## wrappers and `composite_prediction` so the load loop lives in one place.
+    ## No `::ModelConfig` annotation — `ModelConfig` is defined later in the file.
+    function _load_composite_metadata(config)
+        return [load_model_with_metadata(p, config.task_mode)
+                for p in config.model_output_paths]
+    end
+
     ## Internal: the number of feature columns a trained model expects.
     ## A model trained on a `selected_features` subset expects that many columns;
     ## otherwise it expects the full saved `feature_names` width. Returns 0 when
@@ -209,7 +218,7 @@ module Ronin
         elseif !has_root_range || !has_root_time
             return (:unsupported, (0, 0))
         else
-            return (:ok, (dimsize(f["range"]).range, dimsize(f["time"]).time))
+            return (:ok, (0, 0))
         end
     end
 
@@ -4631,28 +4640,19 @@ module Ronin
         values = BitVector(undef, 0)
         total_met_probs = Vector{Float32}(undef, 0)
         init_idxers = Vector{Vector{Float32}}(undef, 0)
-        models = []
-        model_selected_features = Vector{Vector{Int}}()
-
-        model_conv_variables = Vector{Vector{String}}()
-        model_feature_names = Vector{Vector{String}}()
-        model_masked_conv_variables = Vector{Vector{String}}()
-        model_masked_conv_kernel_types = Vector{Vector{String}}()
-        model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
-        model_masked_conv_thresholds = Vector{Float32}()
-        model_masked_conv_met_prob_fields = Vector{String}()
-        for path in config.model_output_paths
-            md = load_model_with_metadata(path, config.task_mode)
-            push!(models, md.model)
-            push!(model_selected_features, md.selected_features)
-            push!(model_feature_names, md.feature_names)
-            push!(model_conv_variables, md.conv_variables)
-            push!(model_masked_conv_variables, md.masked_conv_variables)
-            push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
-            push!(model_masked_conv_kernel_sizes, md.masked_conv_kernel_sizes)
-            push!(model_masked_conv_thresholds, md.masked_conv_threshold)
-            push!(model_masked_conv_met_prob_fields, md.masked_conv_met_prob_field)
-        end
+        ## Single JLD2 read per model — `_load_composite_metadata` returns a
+        ## Vector of NamedTuples from `load_model_with_metadata`. We unpack into
+        ## the per-field vectors the existing pass loop expects.
+        _md_vec = _load_composite_metadata(config)
+        models = Any[md.model for md in _md_vec]
+        model_selected_features = Vector{Int}[md.selected_features for md in _md_vec]
+        model_feature_names = Vector{String}[md.feature_names for md in _md_vec]
+        model_conv_variables = Vector{String}[md.conv_variables for md in _md_vec]
+        model_masked_conv_variables = Vector{String}[md.masked_conv_variables for md in _md_vec]
+        model_masked_conv_kernel_types = Vector{String}[md.masked_conv_kernel_types for md in _md_vec]
+        model_masked_conv_kernel_sizes = Vector{Int}[md.masked_conv_kernel_sizes for md in _md_vec]
+        model_masked_conv_thresholds = Float32[md.masked_conv_threshold for md in _md_vec]
+        model_masked_conv_met_prob_fields = String[md.masked_conv_met_prob_field for md in _md_vec]
 
         ## Collect per-pass probabilities for summary histogram
         pass_probs = [Float32[] for _ in 1:config.num_models]
@@ -4721,12 +4721,12 @@ module Ronin
 
                                 if i > 1
                                     mask_name = config.mask_names[i]
-                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
-                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                    feature_mask = vec(Matrix{Bool}(.! map(ismissing, v[mask_name])))
+                                    indexer = [indexer[j] ? feature_mask[j] : false for j in eachindex(indexer)]
                                 elseif config.QC_mask
                                     mask_name = config.mask_names[i]
-                                    feature_mask = Matrix{Bool}(.! map(ismissing, v[mask_name]))
-                                    indexer = [indexer[j] ? feature_mask[:][j] : false for j in eachindex(indexer)]
+                                    feature_mask = vec(Matrix{Bool}(.! map(ismissing, v[mask_name])))
+                                    indexer = [indexer[j] ? feature_mask[j] : false for j in eachindex(indexer)]
                                 end
 
                                 if config.REMOVE_HIGH_PGG
@@ -5655,6 +5655,9 @@ module Ronin
 
     """
         composite_QC(config::ModelConfig, files::Vector{String},
+                     models::Vector{Ronin.DecisionTree.RandomForestClassifier},
+                     metadata::Vector{<:NamedTuple})
+        composite_QC(config::ModelConfig, files::Vector{String},
                      models::Vector{Ronin.DecisionTree.RandomForestClassifier})
         composite_QC(config::ModelConfig, files::Vector{String})
 
@@ -5665,39 +5668,47 @@ module Ronin
 
     Supports both `task_mode = ""` (hand-tuned `task_paths`) and
     `task_mode = "convolution"`. In convolution mode, per-model metadata
-    (`selected_features`, `conv_variables`, `masked_conv_*`) is loaded internally
-    from each `model_output_paths` JLD2 file; the supplied `models` vector is
-    used only for `predict_proba`.
+    (`selected_features`, `conv_variables`, `masked_conv_*`) is read from each
+    `model_output_paths` JLD2 file; the supplied `models` vector is used only
+    for `predict_proba`.
 
-    The 2-arg form omits `models` and loads the random forests internally as
-    well — convenient for operational pipelines where the snippet is just
-    `composite_QC(load_config(path), files)`.
+    The 4-arg form accepts pre-loaded `metadata` — a vector of NamedTuples as
+    returned by `load_model_with_metadata` — and is intended for chunked
+    pipelines (e.g. Sparrow.jl) that cache model and metadata per-worker so the
+    JLD2 reads are paid once rather than per call. The 3-arg form loads the
+    metadata internally and forwards; the 2-arg form loads both models and
+    metadata internally — convenient for operational pipelines where the snippet
+    is just `composite_QC(load_config(path), files)`.
+
+    Throws `ArgumentError` if `models` or `metadata` length does not match
+    `length(config.model_output_paths)`.
     """
     function composite_QC(config::ModelConfig,
-                                        files::Vector{String}, models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+                                        files::Vector{String},
+                                        models::Vector{Ronin.DecisionTree.RandomForestClassifier},
+                                        metadata::Vector{<:NamedTuple})
 
-        ## Load per-model metadata once (selected_features, conv_variables, masked_conv_*).
-        ## Same pattern as composite_prediction at :4209-4219. In hand-tuned mode the
-        ## returned vectors are empty defaults and aren't used.
-        model_selected_features = Vector{Vector{Int}}()
-        model_feature_names = Vector{Vector{String}}()
-        model_conv_variables = Vector{Vector{String}}()
-        model_masked_conv_variables = Vector{Vector{String}}()
-        model_masked_conv_kernel_types = Vector{Vector{String}}()
-        model_masked_conv_kernel_sizes = Vector{Vector{Int}}()
-        model_masked_conv_thresholds = Vector{Float32}()
-        model_masked_conv_met_prob_fields = Vector{String}()
-        for path in config.model_output_paths
-            md = load_model_with_metadata(path, config.task_mode)
-            push!(model_selected_features, md.selected_features)
-            push!(model_feature_names, md.feature_names)
-            push!(model_conv_variables, md.conv_variables)
-            push!(model_masked_conv_variables, md.masked_conv_variables)
-            push!(model_masked_conv_kernel_types, md.masked_conv_kernel_types)
-            push!(model_masked_conv_kernel_sizes, md.masked_conv_kernel_sizes)
-            push!(model_masked_conv_thresholds, md.masked_conv_threshold)
-            push!(model_masked_conv_met_prob_fields, md.masked_conv_met_prob_field)
-        end
+        n_models = length(config.model_output_paths)
+        length(models) == n_models ||
+            throw(ArgumentError("composite_QC: models length ($(length(models))) " *
+                                "must match config.model_output_paths length ($(n_models))"))
+        length(metadata) == n_models ||
+            throw(ArgumentError("composite_QC: metadata length ($(length(metadata))) " *
+                                "must match config.model_output_paths length ($(n_models))"))
+
+        ## Unpack the pre-loaded NamedTuples into the per-field vectors the pass
+        ## loop below consumes. Equivalent to the old in-function JLD2 harvest,
+        ## but reads from caller-provided metadata so chunked pipelines can amortize
+        ## load_model_with_metadata across many composite_QC calls. In hand-tuned
+        ## mode these fields are empty defaults and aren't used.
+        model_selected_features = Vector{Int}[md.selected_features for md in metadata]
+        model_feature_names = Vector{String}[md.feature_names for md in metadata]
+        model_conv_variables = Vector{String}[md.conv_variables for md in metadata]
+        model_masked_conv_variables = Vector{String}[md.masked_conv_variables for md in metadata]
+        model_masked_conv_kernel_types = Vector{String}[md.masked_conv_kernel_types for md in metadata]
+        model_masked_conv_kernel_sizes = Vector{Int}[md.masked_conv_kernel_sizes for md in metadata]
+        model_masked_conv_thresholds = Float32[md.masked_conv_threshold for md in metadata]
+        model_masked_conv_met_prob_fields = String[md.masked_conv_met_prob_field for md in metadata]
 
         ## Build the kernel bank once for the whole run (convolution mode only;
         ## cheap to construct unconditionally).
@@ -5905,20 +5916,35 @@ module Ronin
     end
 
     """
+        composite_QC(config::ModelConfig, files::Vector{String},
+                     models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+
+    Convenience 3-arg method that loads per-model metadata from
+    `config.model_output_paths` internally and forwards to the 4-arg form.
+    Preserves the v1.1 calling shape; equivalent to:
+
+        metadata = [load_model_with_metadata(p, config.task_mode) for p in config.model_output_paths]
+        composite_QC(config, files, models, metadata)
+    """
+    function composite_QC(config::ModelConfig,
+                          files::Vector{String},
+                          models::Vector{Ronin.DecisionTree.RandomForestClassifier})
+        metadata = _load_composite_metadata(config)
+        composite_QC(config, files, models, metadata)
+    end
+
+    """
         composite_QC(config::ModelConfig, files::Vector{String})
 
-    Convenience 2-arg method that loads the random forests from
-    `config.model_output_paths` internally and forwards to the 3-arg form.
-    Equivalent to:
-
-        models = [load_model(p, config.task_mode) for p in config.model_output_paths]
-        composite_QC(config, files, models)
+    Convenience 2-arg method that loads both the random forests and their
+    metadata from `config.model_output_paths` internally and forwards to the
+    4-arg form. Each JLD2 file is read once (not twice as the previous
+    `load_model` + `load_model_with_metadata` sequence did).
     """
     function composite_QC(config::ModelConfig, files::Vector{String})
-        models = Ronin.DecisionTree.RandomForestClassifier[
-            load_model(p, config.task_mode) for p in config.model_output_paths
-        ]
-        composite_QC(config, files, models)
+        metadata = _load_composite_metadata(config)
+        models = Ronin.DecisionTree.RandomForestClassifier[md.model for md in metadata]
+        composite_QC(config, files, models, metadata)
     end
 
 
