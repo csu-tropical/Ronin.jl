@@ -62,7 +62,7 @@ module Ronin
     export ConvolutionKernel, build_kernel_bank, masked_convolve, compute_convolution_features
     export select_features, compute_rf_feature_importance, get_convolution_feature_count
     export run_evaluation, sweep_pass2_met_probs, run_hypertuning, compute_auc_roc
-    export load_model_with_metadata, inspect_model_configuration
+    export load_model, load_model_with_metadata, inspect_model_configuration
     export compute_importance, generate_pass_masks, met_prob_histogram
     export save_config, load_config, migrate_model_config
 
@@ -76,6 +76,16 @@ module Ronin
     Returns the model object regardless of which format was used. The
     `task_mode` argument is accepted for API compatibility but ignored;
     layout is inferred from the file's keys.
+
+    The return is intentionally untyped: a model file may hold either a
+    `DecisionTree.RandomForestClassifier` (saved by `train_model`) or a raw
+    `DecisionTree.Ensemble` (e.g. built directly via `build_forest`), so this
+    is polymorphic over the saved representation. A comprehension over
+    `model_output_paths` therefore infers `Vector{Any}`; callers that need a
+    concrete `Vector{RandomForestClassifier}` (to match the `composite_QC` /
+    `composite_prediction` signatures) should annotate the comprehension's
+    element type, e.g.
+    `RandomForestClassifier[load_model(p, mode) for p in paths]`.
     """
     function load_model(path::String, task_mode::String)
         data = JLD2.load(path)
