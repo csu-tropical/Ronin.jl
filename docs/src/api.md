@@ -121,6 +121,7 @@ compute_auc_roc
 met_prob_histogram
 characterize_misclassified_gates
 inspect_model_configuration
+load_model
 load_model_with_metadata
 ```
 
