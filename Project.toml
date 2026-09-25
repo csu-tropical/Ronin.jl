@@ -1,7 +1,7 @@
 name = "Ronin"
 uuid = "905eca60-9fa9-4fb3-8835-f5cd63a3719c"
 authors = ["Alex DesRosiers", "Isaac Schluesche", "Michael Bell <mmbell@colostate.edu>", "Paul Reasor"]
-version = "1.2.0"
+version = "1.2.1"
 
 [deps]
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
@@ -28,7 +28,7 @@ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [compat]
 julia = "1.10"
-CategoricalArrays = "0.10"
+CategoricalArrays = "0.10, 1"
 CondaPkg = "0.2"
 DataFrames = "1"
 DataStructures = "0.18, 0.19"
@@ -39,13 +39,13 @@ ImageFiltering = "0.7"
 Images = "0.26"
 JLD2 = "0.5, 0.6"
 LinearAlgebra = "1"
-MLJ = "0.20, 0.21"
+MLJ = "0.20, 0.21, 0.22, 0.23"
 MLJLinearModels = "0.9, 0.10"
 Missings = "1"
 NCDatasets = "0.14"
 PlotlyJS = "0.18"
 Random = "1"
-ScikitLearnBase = "0.5, 0.6"
+ScikitLearnBase = "0.5"
 Scratch = "1.2"
 Statistics = "1"
 StatsBase = "0.34"

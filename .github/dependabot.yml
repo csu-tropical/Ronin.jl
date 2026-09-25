@@ -1,0 +1,21 @@
+## Dependabot opens PRs when a new release of a dependency falls outside the
+## [compat] bounds in Project.toml (Manifest.toml is not tracked, so it only
+## ever proposes compat widenings), and when GitHub Actions used in
+## .github/workflows have new versions. Each PR runs the full CI matrix.
+version: 2
+updates:
+  - package-ecosystem: "julia"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      julia-packages:
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
