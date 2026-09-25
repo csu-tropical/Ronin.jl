@@ -882,6 +882,44 @@ end
             rm(p)
         end
     end
+
+    @testset "get_feature_importance (MLJ logistic sweep)" begin
+        # Only consumer of MLJ / MLJLinearModels / CategoricalArrays — guards
+        # against regressions when those compat bounds move.
+        Random.seed!(42)
+        n = 400
+        X = randn(Float32, n, 3)
+        Y = reshape([x[1] + 0.1f0 * randn(Float32) > 0 ? 1 : 0 for x in eachrow(X)], :, 1)
+
+        h5_path = joinpath(test_scratchspace, "feature_importance.h5")
+        isfile(h5_path) && rm(h5_path)
+        h5open(h5_path, "w") do f
+            write_dataset(f, "X", X)
+            write_dataset(f, "Y", Y)
+            attributes(f)["Parameters"] = ["F1", "F2", "F3"]
+        end
+
+        df = get_feature_importance(h5_path, [0.001, 0.01])
+
+        @test size(df, 1) == 2
+        @test issubset(["F1", "F2", "F3", "λ", "rmse", "precision", "recall"], names(df))
+        @test df.λ == [0.001, 0.01]
+        for col in ("rmse", "precision", "recall")
+            @test all(v -> 0 <= v <= 1, df[!, col])
+        end
+        # F1 carries the signal; the noise features should be much weaker.
+        # (λ is scaled by n in MLJLinearModels, so λ ≳ 0.1 zeroes everything.)
+        for row in eachrow(df)
+            @test abs(row.F1) > abs(row.F2)
+            @test abs(row.F1) > abs(row.F3)
+        end
+        # Weakly penalized fit on a near-separable feature should classify well
+        @test df.precision[1] > 0.9
+        @test df.recall[1] > 0.9
+        @test df.rmse[1] < 0.35
+
+        rm(h5_path)
+    end
 end
 
 
