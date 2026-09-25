@@ -37,6 +37,10 @@ TRAINING_PATH   = "/Users/mmbell/Science/ronin_testing/aft_training/training/"
 TESTING_PATH    = "/Users/mmbell/Science/ronin_testing/aft_training/testing/"
 VALIDATION_PATH = "/Users/mmbell/Science/ronin_testing/aft_training/validation/"
 
+# Folder name used when DBZ offset correction is enabled.
+# Created as a sibling of DATA, leaving original CASE_PATHS unchanged.
+DBZ_OFFSET_FOLDER = "DATA_DBZOffsetCorrected"
+
 ##=============================================================================
 ## SECTION 3: MODEL PARAMETERS
 ##=============================================================================
