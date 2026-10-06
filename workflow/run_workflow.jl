@@ -33,6 +33,8 @@
 ##=============================================================================
 ## FULL PIPELINE FLAGS
 ##=============================================================================
+RUN_DBZ_OFFSET_CORRECTION = false
+USE_DBZ_OFFSET_CORRECTED_DATA = false
 
 RUN_SPLIT_DATA           = false   # One-time data split (run before anything else)
 RUN_FULL_TRAINING        = false   # Phase 1: train → evaluate → importance (all passes)
@@ -48,7 +50,7 @@ RUN_VALIDATION          = false
 
 RUN_CALCULATE_FEATURES  = false   # Calculate and save features (no training)
 RUN_TRAINING            = false   # Train all passes from scratch
-RUN_EVALUATION          = false   # Evaluate on testing set
+RUN_EVALUATION          = false  # Evaluate on testing set
 SKIP_EXISTING_MET_PROBS = false   # Skip re-writing met_prob_pass_N if already in CfRadial files
 RUN_IMPORTANCE          = false   # Compute feature importance for TRAIN_PASS
 RUN_RETRAIN             = false   # Retrain TRAIN_PASS with pruned features
@@ -62,14 +64,45 @@ RUN_QC                  = false   # Apply QC to write corrected fields
 
 ## For incremental steps: which pass to operate on
 MASK_PASS               = 1
-TRAIN_PASS              = 2
-
+TRAIN_PASS              = 1
 ##=============================================================================
 ## LOAD SHARED CONFIG
 ##=============================================================================
 
 # Default is 00_config.jl but you can change that here
 include("00_config.jl")
+
+function get_existing_dbz_offset_case_paths(case_paths)
+    if !@isdefined(DBZ_OFFSET_FOLDER)
+        error("DBZ_OFFSET_FOLDER must be defined in 00_config.jl")
+    end
+
+    marker = "/DATA/"
+    corrected_paths = String[]
+
+    for case_path in case_paths
+        r = findfirst(marker, case_path)
+
+        if r === nothing
+            error("Could not find /DATA/ in CASE_PATH: $case_path")
+        end
+
+        root = case_path[1:first(r)-1]
+        src_root = joinpath(root, "DATA")
+        dst_root = joinpath(root, DBZ_OFFSET_FOLDER)
+
+        rel_path = relpath(case_path, src_root)
+        corrected_path = joinpath(dst_root, rel_path)
+
+        if !isdir(corrected_path)
+            error("Corrected DBZ path does not exist: $corrected_path")
+        end
+
+        push!(corrected_paths, corrected_path)
+    end
+
+    return corrected_paths
+end
 
 ## --- Persist the ModelConfig to disk -----------------------------------------
 ## The *_config.jl scripts only build `config` in memory. Save it to JLD2 so
@@ -122,12 +155,43 @@ end
 ## FULL PIPELINE EXECUTION
 ##=============================================================================
 
+if RUN_DBZ_OFFSET_CORRECTION
+    println("Running DBZ offset correction preprocessing...")
+    include("00.5_dbzoffset.jl")
+end
+
 ## --- One-time data split ---
 if RUN_SPLIT_DATA
     println("\n", "="^70)
     println("SPLITTING DATA")
     println("="^70)
-    Ronin.split_training_testing_validation!(CASE_PATHS, TRAINING_PATH, TESTING_PATH, VALIDATION_PATH)
+
+    if RUN_DBZ_OFFSET_CORRECTION
+        if !@isdefined(DBZ_OFFSET_CASE_PATHS)
+            error("RUN_DBZ_OFFSET_CORRECTION is true, but DBZ_OFFSET_CASE_PATHS was not created. Check 00.5_dbzoffset.jl.")
+        end
+
+        paths_to_split = DBZ_OFFSET_CASE_PATHS
+        println("Using newly created DBZ-offset corrected case paths for split:")
+
+   elseif @isdefined(USE_DBZ_OFFSET_CORRECTED_DATA) && USE_DBZ_OFFSET_CORRECTED_DATA
+        paths_to_split = get_existing_dbz_offset_case_paths(CASE_PATHS)
+        println("Using existing DBZ-offset corrected case paths for split:")
+
+    else
+        paths_to_split = CASE_PATHS
+        println("Using original CASE_PATHS for split:")
+    end
+
+    for p in paths_to_split
+        println("  ", p)
+    end
+    
+    split_parent = dirname(rstrip(TRAINING_PATH, '/'))
+    mkpath(split_parent)
+    println("Ensured split parent directory exists: ", split_parent)
+
+    Ronin.split_training_testing_validation!(paths_to_split, TRAINING_PATH, TESTING_PATH, VALIDATION_PATH)
     println("Data split complete.")
 end
 
